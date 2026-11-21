@@ -495,10 +495,12 @@ export class Exporter {
       const newest = folded.turns.filter((turn) => turn.end !== null).at(-1);
       let point = this.resumePoint(folded, state, newest ? newest.index - 1 : null, NO_TURNS);
       // The read began with that turn and a later turn fills the rest of it:
-      // that later turn is the newest, so read on past this one.
+      // the later turn may be the newest, so try reading on past this one.
       const later = newest ? folded.turns.some((turn) => turn.index > newest.index) : false;
+      let past = false;
       if (newest && later && point.resumeSeq <= (state?.resumeSeq ?? 0)) {
         point = this.resumePoint(folded, state, newest.index, NO_TURNS);
+        past = true;
       }
       const next: ThreadState = {
         sentTurn: null,
@@ -510,13 +512,18 @@ export class Exporter {
       };
       // Held back by a turn or prompt it cannot read past: export from what was read.
       if (next.resumeSeq <= (state?.resumeSeq ?? 0)) break;
-      await this.kv.set(key, next);
-      state = next;
       if (reads >= MAX_CATCH_UP_READS) {
+        await this.kv.set(key, next);
         this.bb.log.debug(`Thread ${thread.id} has a long history; the next export reads on.`);
         return { kind: "nothing" };
       }
-      folded = await this.fold(thread.id, state, settings.captureContent);
+      const ahead = await this.fold(thread.id, next, settings.captureContent);
+      // The later turn has not finished, so the turn read past is still the
+      // newest finished one: export it from this read, which still has it.
+      if (past && !ahead.turns.some((turn) => turn.end !== null)) break;
+      await this.kv.set(key, next);
+      state = next;
+      folded = ahead;
     }
     if (folded.truncated) {
       this.bb.log.warn(`Thread ${thread.id} has more events than one export reads; its newest turns may wait.`);
@@ -551,6 +558,15 @@ export class Exporter {
     // A thread never sent before starts at its newest turn: the turns before
     // it count as done, so a first export that fails or waits keeps that turn.
     const baseline = sentTurn ?? due[0].index - 1;
+    // Without a noted starting total, the thread's total is known to be these
+    // turns' only when they are all the thread has. That is decided once, here,
+    // and remembered: a later export sees more turns and could not tell.
+    const seenWhole =
+      !state &&
+      !folded.truncated &&
+      folded.turns.length === due.length &&
+      (folded.turns[0]?.index ?? 1) === 1;
+    const usageKnown = state ? state.usageKnown : seenWhole;
     // A turn whose background subagent still works waits for it; the turns
     // after it go on without it.
     const waits = (turn: Turn) =>
@@ -572,7 +588,7 @@ export class Exporter {
         // later, from where this export would have started.
         this.bb.log.debug(`A trace provider did not answer for ${thread.id}; its export waits.`);
         await this.kv.set(key, {
-          ...(state ?? newThreadState(now)),
+          ...(state ?? { ...newThreadState(now), usageKnown }),
           sentTurn: baseline,
           waiting: state?.waiting ?? null,
           ...this.resumePoint(folded, state, baseline, waitedBefore),
@@ -591,15 +607,7 @@ export class Exporter {
     const usageTurns = state?.usageTurns ?? 0;
     const current = pending.length > 0 ? await this.readUsage(thread.id) : null;
     const usage = new Map<string, TurnUsage>();
-    // Without a known starting total, the total is this turn's only when the
-    // thread has no other turns.
-    const wholeThread =
-      !state?.usageKnown &&
-      (state?.resumeSeq ?? 0) === 0 &&
-      usageTurns === 0 &&
-      folded.turns.length === pending.length &&
-      (folded.turns[0]?.index ?? 1) === 1;
-    if (pending.length > 0 && !usageWaitsForTurn && current && (state?.usageKnown || wholeThread)) {
+    if (pending.length > 0 && !usageWaitsForTurn && current && usageKnown) {
       const delta = usageDelta(current, state?.usage ?? null);
       if (delta && !isEmptyUsage(delta)) {
         // One span of one turn carries it, so cost is never counted twice.
@@ -684,7 +692,7 @@ export class Exporter {
       waiting: waiting.length > 0 ? waiting : null,
       ...this.resumePoint(folded, state, lastDone, new Set(waiting)),
       usage: usageStays ? (state?.usage ?? null) : (current ?? state?.usage ?? null),
-      usageKnown: usageStays ? (state?.usageKnown ?? false) : true,
+      usageKnown: usageStays ? usageKnown : true,
       usageTurns: usageStays ? usageTurns + done.size : 0,
       partial: cut && cut.spanIds.length > 0 ? cut : null,
       updatedAt: now,

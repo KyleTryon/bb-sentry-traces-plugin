@@ -542,3 +542,50 @@ describe("follow-up review fixes", () => {
     expect(rescrub("short", 4_000)).toBe("short");
   });
 });
+
+describe("third review fixes", () => {
+  const BODY = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7";
+  const BEGIN = "-----BEGIN PRIVATE KEY-----";
+
+  it("redacts a cut-off key whose lines end in spaces, or that sits on one line", () => {
+    expect(scrubSecrets(`${BEGIN}\n${BODY} \n${BODY}\t\n${BODY} `)).toBe("[redacted] ");
+    expect(scrubSecrets(`${BEGIN} ${BODY} ${BODY}`)).toBe("[redacted]");
+    expect(scrubSecrets(`${BODY} ${BODY} Q2== -----END PRIVATE KEY-----`)).toBe("[redacted]");
+  });
+
+  it("keeps the text that follows a cut-off key", () => {
+    expect(scrubSecrets(`${BEGIN}\n${BODY}\nexit code 0\nnext`)).toBe("[redacted]\nexit code 0\nnext");
+    expect(scrubSecrets(`key: |\n  ${BEGIN}\n  ${BODY}\nnext: 1`)).toBe("key: |\n  [redacted]\nnext: 1");
+    expect(scrubSecrets(`${BEGIN}\n${BODY}\ndone\nok\nfine\nreally fine`)).toBe(
+      "[redacted]\ndone\nok\nfine\nreally fine",
+    );
+    // The short last line of a key is still part of it.
+    expect(scrubSecrets(`${BEGIN}\n${BODY}\nQ2==\nexit`)).toBe("[redacted]\nexit");
+  });
+
+  it("leaves a credential name alone when the quote after it closes a string", () => {
+    for (const text of [
+      "grep -rn 'API_KEY=' src && echo done",
+      `{"command":"grep -rn 'API_KEY=' . && echo 'ok'","timeout":5000}`,
+      "if (arg.startsWith('--password=')) { run(arg); }",
+      JSON.stringify({ command: 'grep "TOKEN=" . && echo "ok"' }),
+    ]) {
+      expect(scrubSecrets(text)).toBe(text);
+    }
+    // A quote that opens a value still has its value redacted, an apostrophe before it or not.
+    expect(scrubSecrets("Here's how: TOKEN='abc def' then run")).toBe("Here's how: TOKEN=[redacted] then run");
+    expect(scrubSecrets(`echo "x" && TOKEN="a b" run`)).toBe(`echo "x" && TOKEN=[redacted] run`);
+    expect(scrubSecrets(JSON.stringify({ command: 'DB_PASSWORD="hunter two" psql' }))).toBe(
+      '{"command":"DB_PASSWORD=[redacted] psql"}',
+    );
+  });
+
+  it("scrubs output of one long token per line without slowing down", () => {
+    const text = Array.from({ length: 2_000 }, (_, index) =>
+      (index.toString(16).padStart(8, "0") + "0123456789abcdef").repeat(2).slice(0, 40),
+    ).join("\n");
+    const started = performance.now();
+    for (let run = 0; run < 5; run++) scrub(text, 16_000);
+    expect(performance.now() - started).toBeLessThan(150);
+  });
+});

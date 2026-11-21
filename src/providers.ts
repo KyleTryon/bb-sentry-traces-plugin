@@ -32,8 +32,13 @@ const MAX_ATTRIBUTES = 64;
 const MAX_ATTRIBUTE_CHARS = 2_000;
 const MAX_CONTENT_CHARS = 8_000;
 const MAX_KEY_CHARS = 200;
-/** How long to stop asking a provider after it failed to answer. */
+/**
+ * How long to stop asking a provider after it failed to answer, or to stop
+ * asking one question after its answer could not be read.
+ */
 export const UNAVAILABLE_MS = 5 * 60 * 1_000;
+/** At most this many unreadable questions are remembered per provider. */
+const MAX_UNREADABLE = 200;
 /**
  * How long a provider that answered before may fail before it is taken to be
  * gone. Until then, which trace its threads belong to is unknown.
@@ -215,8 +220,13 @@ interface Availability {
   unavailableUntil: number;
   available: boolean | null;
   error: string | null;
-  /** Whether it has ever answered, since this plugin loaded. */
+  /** Whether it has ever given an answer this plugin could read, since this plugin loaded. */
   answered: boolean;
+  /**
+   * Questions it answered with something unreadable, and until when each is
+   * not asked again. Its other questions are still asked.
+   */
+  unreadable: Map<string, number>;
   /** When its current run of failures began; null while it answers. */
   failingSince: number | null;
 }
@@ -246,18 +256,26 @@ export class TraceProviders {
       error: null,
       answered: false,
       failingSince: null,
+      unreadable: new Map(),
     };
     this.state.set(provider, state);
-    if (state.unavailableUntil > this.now()) return undefined;
+    const now = this.now();
+    if (state.unavailableUntil > now) return undefined;
+    const question = `${method} ${JSON.stringify(input)}`;
+    for (const [asked, until] of state.unreadable) if (until <= now) state.unreadable.delete(asked);
+    if (state.unreadable.has(question)) return undefined;
     const unavailable = (message: string, reached: boolean) => {
       // Missing, disabled, older than the contract, or answering nonsense: not an error for us.
-      state.unavailableUntil = this.now() + UNAVAILABLE_MS;
       if (reached) {
-        // It is there and said nothing this plugin can use: that is an answer, not an outage.
-        state.answered = true;
+        // It is there and said nothing this plugin can use: an answer, not an
+        // outage. Only this question waits; a trace too large to read must not
+        // stop its threads from being placed.
         state.failingSince = null;
+        if (state.unreadable.size >= MAX_UNREADABLE) state.unreadable.clear();
+        state.unreadable.set(question, now + UNAVAILABLE_MS);
       } else {
-        state.failingSince ??= this.now();
+        state.unavailableUntil = now + UNAVAILABLE_MS;
+        state.failingSince ??= now;
       }
       const text = message.slice(0, 300);
       if (text !== state.error) {

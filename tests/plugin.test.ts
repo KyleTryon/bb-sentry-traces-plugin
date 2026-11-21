@@ -1898,3 +1898,75 @@ describe("follow-up review fixes", () => {
     expect(() => JSON.parse(json.stdout)).not.toThrow();
   });
 });
+
+describe("third review fixes", () => {
+  const P = "orchestrator";
+  const KEY = "run_42";
+  const inTrace = (span: { traceId: string }) => span.traceId === providerTraceId(P, KEY);
+
+  it("keeps placing a provider's threads after one of its answers cannot be read", async () => {
+    const { history, emit, tick, spans } = await setup({
+      providers: {
+        [P]: {
+          contexts: { [THREAD]: { trace: { key: KEY } } },
+          // Not a list of spans: an answer this plugin cannot read.
+          trace: () => ({ key: KEY, ended: true, spans: "too many" }),
+        },
+      },
+    });
+    history.turn();
+    await emit("thread.idle");
+    await tick();
+    const before = spans().length;
+    history.turn();
+    await emit("thread.idle");
+    const later = spans().slice(before);
+    expect(later.length).toBeGreaterThan(0);
+    expect(later.every(inTrace)).toBe(true);
+  });
+
+  it("does not wait for a provider that never gave a readable answer", async () => {
+    const orchestrator = { contract: 2, contexts: { [THREAD]: { trace: { key: KEY } } } };
+    const providers: Record<string, typeof orchestrator> = { [P]: orchestrator };
+    const { history, emit, clock, spans } = await setup({ providers });
+    history.turn();
+    await emit("thread.idle");
+    expect(spans().some(inTrace)).toBe(false);
+    const before = spans().length;
+
+    delete providers[P];
+    clock.now += 6 * 60_000;
+    history.turn();
+    await emit("thread.idle");
+    expect(spans().length).toBeGreaterThan(before);
+  });
+
+  it("sends a new thread's first usage when its first export has to be retried", async () => {
+    let status = 503;
+    const { history, emit, tick, clock, spans } = await setup({ respond: () => status });
+    // The thread was never seen starting, and its first prompt is not its first event.
+    history.push("thread/started", {});
+    history.turn();
+    history.usage(CLAUDE_TOTAL);
+    await emit("thread.idle");
+    expect(spans()).toHaveLength(0);
+    status = 200;
+    clock.now += 2 * 60_000;
+    await tick();
+    const withUsage = spans().filter((span) => attr(span, "gen_ai.usage.input_tokens") !== undefined);
+    expect(withUsage).toHaveLength(1);
+    expect(attr(withUsage[0], "gen_ai.usage.input_tokens")).toBe(10_100);
+  });
+
+  it("sends a long thread's newest finished turn when the turn after it never finishes", async () => {
+    const { history: h, emit, spans } = await setup();
+    h.turn();
+    h.request("req-open").start("open", "req-open");
+    for (let index = 0; index < 20_000; index++) {
+      h.item("open", { type: "commandExecution", id: `o${index}`, command: "ls" }, 1);
+    }
+    await emit("thread.failed");
+    const agents = spans().filter((span) => span.name.startsWith("invoke_agent"));
+    expect(agents.map((span) => attr(span, "bb.turn.id"))).toEqual(["turn-1"]);
+  }, 30_000);
+});

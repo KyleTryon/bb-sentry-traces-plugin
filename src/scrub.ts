@@ -23,23 +23,43 @@ const ENV_LINE = new RegExp(
 /**
  * Credential-like assignments anywhere in a line, as in `cd app && API_KEY=… npm
  * start` or a command inside one-line JSON. A quoted value (escaped quotes
- * too, as inside JSON) runs to its closing quote, or to the end of the line
- * when it has none. An unquoted value runs to whitespace, a quote or a shell
- * separator; a backslash in it is part of it unless it escapes a quote or is
- * JSON's `\n`.
+ * too, as inside JSON) runs to its closing quote. An unquoted value runs to
+ * whitespace, a quote or a shell separator; a backslash in it is part of it
+ * unless it escapes a quote or is JSON's `\n`.
  */
 const INLINE_ASSIGNMENT = new RegExp(
   String.raw`((?<![A-Za-z0-9_])(?:export\s+)?[A-Za-z0-9_]*${CREDENTIAL_NAME}[A-Za-z0-9_]*=)(?!=)` +
-    "(?:" +
-    [
-      String.raw`\\?"[^"\n]*?\\?"`,
-      String.raw`\\?'[^'\n]*?\\?'`,
-      String.raw`\\?["'][^\n]*`,
-      String.raw`(?:[^\s"'\\&;|]|\\(?!["'nrt]))+`,
-    ].join("|") +
-    ")",
+    String.raw`(?:(\\?"[^"\n]*?\\?"|\\?'[^'\n]*?\\?')|(?:[^\s"'\\&;|]|\\(?!["'nrt]))+)`,
   "gi",
 );
+
+/** What follows a quote that closed a string: a gap, the end, or punctuation, never a value. */
+const AFTER_CLOSING_QUOTE = /^(?:\s|$|\\[nrt]|[)\]},;:|&<>])/;
+
+/**
+ * Whether the quote that starts `quoted` opens a value. In `grep 'API_KEY=' src`
+ * the quote after the `=` closes a string instead. It is taken to close one
+ * only when both signs agree, so that a doubt redacts: an odd number of the
+ * same kind of quote (escaped or not) comes before it on its line, and no
+ * value starts right after it.
+ */
+function opensValue(text: string, at: number, quoted: string): boolean {
+  const escaped = quoted.startsWith("\\");
+  const quote = quoted[escaped ? 1 : 0];
+  if (!AFTER_CLOSING_QUOTE.test(text.slice(at + (escaped ? 2 : 1), at + (escaped ? 4 : 3)))) return true;
+  let count = 0;
+  for (let index = text.lastIndexOf("\n", at - 1) + 1; index < at; index++) {
+    if (text[index] !== quote) continue;
+    if ((text[index - 1] === "\\") === escaped) count++;
+  }
+  return count % 2 === 0;
+}
+
+function scrubInlineAssignments(text: string): string {
+  return text.replace(INLINE_ASSIGNMENT, (match, name: string, quoted: string | undefined, at: number) =>
+    quoted !== undefined && !opensValue(text, at + name.length, quoted) ? match : `${name}${REDACTED}`,
+  );
+}
 
 /** Quoted credential-like keys with quoted values, as in JSON, YAML or code: `"apiKey": "…"`. */
 const QUOTED_PAIR = new RegExp(
@@ -53,31 +73,119 @@ const PEM_BLOCK =
 const PEM_UNTERMINATED = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*$/;
 /** In text cut short here: a key whose start was cut off runs from the start. */
 const PEM_UNSTARTED = /^[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/;
-/*
- * In any other text, a lone marker is a key cut off elsewhere (by a tool, by
- * bb) only when key body sits next to it: the marker and the body lines are
- * redacted, through the last body line, and whatever follows them is kept.
- * Code or prose that only mentions a marker keeps all its text. Lines break
- * on real newlines or on JSON's `\n`, and encrypted keys' header lines count
- * as body.
+
+/** Every key marker ends with this; text without it has no key to look for. */
+const KEY_MARKER = "PRIVATE KEY-----";
+const BEGIN_MARKER = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/g;
+const END_MARKER = /-----END [A-Z0-9 ]*PRIVATE KEY-----/g;
+/** The header lines of an encrypted key, which sit between its marker and its body. */
+const KEY_HEADER = /(?:Proc-Type|DEK-Info|Comment):[^\r\n\\]*/y;
+const KEY_CHAR = /[A-Za-z0-9+/=]/;
+/** A piece of key body this long is taken to be one whatever it looks like. */
+const LONG_KEY_PIECE = 16;
+
+/**
+ * Whether a run of key characters is key body and not a word of the text
+ * around the key. A short run is body only when it could not be a plain word:
+ * it has a digit, `+`, `/` or `=`, or mixes cases past its first letter.
  */
-const PEM_LINE_BREAK = String.raw`(?:\r?\n|(?:\\r)?\\n)`;
-const PEM_HEADER = String.raw`(?:Proc-Type|DEK-Info|Comment):[^\r\n\\]*`;
-const PEM_LONG_LINE = String.raw`[A-Za-z0-9+/=]{16,}(?![A-Za-z0-9+/=])`;
-const PEM_ANY_LINE = String.raw`[A-Za-z0-9+/=]+(?![A-Za-z0-9+/=])`;
-const PEM_BODY_AFTER_BEGIN = new RegExp(
-  String.raw`-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[ \t]*` +
-    String.raw`(?:${PEM_LINE_BREAK}[ \t]*(?:${PEM_HEADER})?)*?` +
-    String.raw`${PEM_LINE_BREAK}[ \t]*${PEM_LONG_LINE}` +
-    String.raw`(?:${PEM_LINE_BREAK}[ \t]*${PEM_ANY_LINE})*`,
-  "g",
-);
-const PEM_BODY_BEFORE_END = new RegExp(
-  String.raw`(?<![A-Za-z0-9+/=])${PEM_LONG_LINE}[ \t]*` +
-    String.raw`(?:${PEM_LINE_BREAK}[ \t]*${PEM_ANY_LINE}[ \t]*)*` +
-    String.raw`${PEM_LINE_BREAK}[ \t]*-----END [A-Z0-9 ]*PRIVATE KEY-----`,
-  "g",
-);
+function isKeyBody(piece: string): boolean {
+  if (piece.length >= LONG_KEY_PIECE) return true;
+  return /[0-9+/=]/.test(piece) || (/[a-z]/.test(piece) && /[A-Z]/.test(piece.slice(1)));
+}
+
+/** The index after any spaces, tabs and line breaks at `at`; JSON's `\n`, `\r` and `\t` count. */
+function skipGap(text: string, at: number): number {
+  for (;;) {
+    const char = text[at];
+    if (char === " " || char === "\t" || char === "\r" || char === "\n") at++;
+    else if (char === "\\" && "nrt".includes(text[at + 1] ?? "x")) at += 2;
+    else return at;
+  }
+}
+
+function skipGapBack(text: string, at: number): number {
+  for (;;) {
+    const char = text[at - 1];
+    if (char === " " || char === "\t" || char === "\r" || char === "\n") at--;
+    else if (at >= 2 && text[at - 2] === "\\" && "nrt".includes(char ?? "x")) at -= 2;
+    else return at;
+  }
+}
+
+/** Where the key body that follows a BEGIN marker ends, or -1 when none follows. */
+function keyBodyEnd(text: string, from: number): number {
+  let at = from;
+  let end = -1;
+  let long = false;
+  for (;;) {
+    const start = skipGap(text, at);
+    if (start === at) break;
+    if (end === -1) {
+      KEY_HEADER.lastIndex = start;
+      if (KEY_HEADER.test(text)) {
+        at = KEY_HEADER.lastIndex;
+        continue;
+      }
+    }
+    let stop = start;
+    while (stop < text.length && KEY_CHAR.test(text[stop])) stop++;
+    const piece = text.slice(start, stop);
+    if (!piece || !isKeyBody(piece)) break;
+    long ||= piece.length >= LONG_KEY_PIECE;
+    end = at = stop;
+  }
+  return long ? end : -1;
+}
+
+/** Where the key body that leads up to an END marker starts, or -1 when none does. */
+function keyBodyStart(text: string, to: number): number {
+  let at = to;
+  let start = -1;
+  let long = false;
+  for (;;) {
+    const stop = skipGapBack(text, at);
+    if (stop === at) break;
+    let first = stop;
+    while (first > 0 && KEY_CHAR.test(text[first - 1])) first--;
+    // The `n` of a JSON `\n` is a line break, not the piece's first character.
+    if (first > 0 && first < stop && text[first - 1] === "\\" && "nrt".includes(text[first])) first++;
+    const piece = text.slice(first, stop);
+    if (!piece || !isKeyBody(piece)) break;
+    long ||= piece.length >= LONG_KEY_PIECE;
+    start = at = first;
+  }
+  return long ? start : -1;
+}
+
+/**
+ * Redacts keys with one marker missing: cut off by a tool or by bb before the
+ * text got here. A lone marker is such a key only when key body sits next to
+ * it. The marker and the body are redacted, and the text around them is kept;
+ * code or prose that only mentions a marker keeps all its text.
+ */
+function scrubCutOffKeys(text: string): string {
+  const ranges: Array<[number, number]> = [];
+  for (const marker of text.matchAll(BEGIN_MARKER)) {
+    const end = keyBodyEnd(text, marker.index + marker[0].length);
+    if (end !== -1) ranges.push([marker.index, end]);
+  }
+  for (const marker of text.matchAll(END_MARKER)) {
+    const start = keyBodyStart(text, marker.index);
+    if (start !== -1) ranges.push([start, marker.index + marker[0].length]);
+  }
+  if (ranges.length === 0) return text;
+  ranges.sort((a, b) => a[0] - b[0]);
+  let out = "";
+  let at = 0;
+  for (const [start, end] of ranges) {
+    if (end <= at) continue;
+    // A range that starts inside the last one only makes it longer.
+    if (start >= at) out += text.slice(at, start) + REDACTED;
+    at = end;
+  }
+  return out + text.slice(at);
+}
 
 /** Where a text was cut before it reached the scrubber. */
 export interface Cut {
@@ -115,15 +223,18 @@ const SCRUB_MARGIN = 16_384;
  * a lone key marker is taken to be a key that runs on past the cut.
  */
 export function scrubSecrets(value: string, cut: Cut = {}): string {
-  let out = value.replace(PEM_BLOCK, REDACTED);
-  if (cut.end) out = out.replace(PEM_UNTERMINATED, REDACTED);
-  if (cut.start) out = out.replace(PEM_UNSTARTED, REDACTED);
-  out = out.replace(PEM_BODY_AFTER_BEGIN, REDACTED).replace(PEM_BODY_BEFORE_END, REDACTED);
+  let out = value;
+  if (out.includes(KEY_MARKER)) {
+    out = out.replace(PEM_BLOCK, REDACTED);
+    if (cut.end) out = out.replace(PEM_UNTERMINATED, REDACTED);
+    if (cut.start) out = out.replace(PEM_UNSTARTED, REDACTED);
+    out = scrubCutOffKeys(out);
+  }
   out = out
     .split("\n")
     .map((line) => line.replace(ENV_LINE, `$1${REDACTED}`))
     .join("\n");
-  out = out.replace(INLINE_ASSIGNMENT, `$1${REDACTED}`);
+  out = scrubInlineAssignments(out);
   out = out.replace(QUOTED_PAIR, `$1$3${REDACTED}$3`);
   for (const pattern of TOKEN_PATTERNS) out = out.replace(pattern, REDACTED);
   return out;

@@ -215,9 +215,10 @@ and its threads export as one trace per turn.
 - **Background work that outlives its turn** is closed at the turn's end and
   marked `bb.span.running`. A turn with a background subagent still at work
   waits for it, up to two hours after the turn ends, so it usually goes out
-  with the subagent's real end. Later turns are sent as usual meanwhile; the
-  thread's token usage waits with the turn and is sent on it, counting the
-  turns it covers in `bb.usage.turns`.
+  with the subagent's real end. Later turns are sent as usual meanwhile,
+  without token usage: the usage waits until no turn of the thread is waiting,
+  then goes on the last turn sent, with the number of turns it covers in
+  `bb.usage.turns`.
 - Sentry's direct OTLP endpoint drops span events; this plugin sends none.
 - Spans take a few minutes to show in Sentry after they are sent.
 
