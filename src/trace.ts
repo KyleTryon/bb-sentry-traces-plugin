@@ -31,7 +31,7 @@
  * - A turn remembers when the turn before it ended even when that turn began
  *   before this fold did, so a queued prompt's wait is not counted as startup.
  */
-import { scrub, scrubLine, scrubTail } from "./scrub.js";
+import { scrub, scrubLine, scrubTail, scrubValue } from "./scrub.js";
 import { record, text, type Json } from "./util.js";
 
 /** The only event types the trace reads, so history can be filtered. */
@@ -242,7 +242,8 @@ type TurnState = Omit<Turn, "spans" | "activity"> & {
 
 /**
  * One line of text, scrubbed before it is cut so a cut cannot hide a secret's
- * shape. All kept text is scrubbed here, and again when it is sent.
+ * shape. All kept text is scrubbed here, where a structured value can still
+ * be scrubbed string by string.
  */
 function clip(value: string, max = MAX_TEXT): string {
   return scrubLine(value, max);
@@ -421,16 +422,6 @@ function agentKind(value: unknown): string {
   return /^[\w.:@/-]{1,64}$/.test(kind) ? kind : SUBAGENT;
 }
 
-function stringify(value: unknown): string {
-  if (typeof value === "string") return value;
-  if (value === undefined || value === null) return "";
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return "";
-  }
-}
-
 /**
  * Names a call. With `content` off, every field is fixed text or the tool's
  * own name: nothing the user or the model wrote.
@@ -462,7 +453,7 @@ function describe(item: Json, content: boolean): Description {
       const base = plain("read", "Read");
       if (!content) return base;
       const path = text(item.path);
-      return { ...base, detail: basename(path) || title, args: path || null };
+      return { ...base, detail: basename(path) || title, args: scrub(path, MAX_ARGS) || null };
     }
     case "fileChange": {
       const base = plain("edit", "Edit");
@@ -472,26 +463,26 @@ function describe(item: Json, content: boolean): Description {
       return {
         ...base,
         detail: clip(paths.map(basename).join(", ")) || title,
-        args: paths.length > 0 ? scrub(JSON.stringify(paths), MAX_ARGS) : null,
+        args: paths.length > 0 ? scrubValue(paths, MAX_ARGS) : null,
       };
     }
     case "search": {
       const base = plain("search", "Search");
       if (!content) return base;
       const query = text(item.query);
-      return { ...base, detail: clip(query || title), args: query || null };
+      return { ...base, detail: clip(query || title), args: scrub(query, MAX_ARGS) || null };
     }
     case "webSearch": {
       const base = plain("web", "WebSearch");
       if (!content) return base;
       const query = text(item.query);
-      return { ...base, detail: clip(query || title), args: query || null };
+      return { ...base, detail: clip(query || title), args: scrub(query, MAX_ARGS) || null };
     }
     case "webFetch": {
       const base = plain("web", "WebFetch");
       if (!content) return base;
       const url = text(item.url);
-      return { ...base, detail: clip(url || title), args: url || null };
+      return { ...base, detail: clip(url || title), args: scrub(url, MAX_ARGS) || null };
     }
     case "contextCompaction":
       return plain("compaction", "Compaction");
@@ -516,7 +507,7 @@ function describe(item: Json, content: boolean): Description {
         return {
           ...base,
           detail: clip(text(args.description) || title),
-          args: scrub(stringify(item.arguments), MAX_ARGS) || null,
+          args: scrubValue(item.arguments, MAX_ARGS) || null,
         };
       }
       const base = plain("tool", tool);
@@ -524,7 +515,7 @@ function describe(item: Json, content: boolean): Description {
       return {
         ...base,
         detail: clip(title || text(item.server)),
-        args: scrub(stringify(item.arguments), MAX_ARGS) || null,
+        args: scrubValue(item.arguments, MAX_ARGS) || null,
       };
     }
     default: {
@@ -1050,8 +1041,8 @@ export class TraceBuilder {
     if (!this.content) return;
     // A tool's error text and output are tool output.
     span.error = errorOf(item) ?? span.error;
-    const result = stringify(item.aggregatedOutput ?? item.result);
-    if (result) span.result = scrub(result, MAX_RESULT);
+    const result = scrubValue(item.aggregatedOutput ?? item.result, MAX_RESULT);
+    if (result) span.result = result;
   }
 
   private foldActivity(

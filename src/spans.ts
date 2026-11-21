@@ -19,7 +19,7 @@ import {
   traceAttributes,
   type TraceContext,
 } from "./providers.js";
-import { rescrub, scrub } from "./scrub.js";
+import { recap, rescrub, scrub } from "./scrub.js";
 import {
   MAX_ARGS,
   MAX_INPUT,
@@ -372,10 +372,12 @@ export function turnSpans(turn: Turn, options: TurnSpanOptions): OtlpSpan[] {
           "gen_ai.agent.name": isTool ? caller : undefined,
           "gen_ai.transfer.target.name": isAgent ? span.agent : undefined,
           "gen_ai.transfer.mode": isAgent ? "return_to_caller" : undefined,
+          // Scrubbed where the trace was built, string by string. Scrubbing
+          // their JSON again as text would mistake its quotes for a command's.
           "gen_ai.tool.call.arguments":
-            captureContent && isTool && span.args ? rescrub(span.args, MAX_ARGS) : undefined,
+            captureContent && isTool && span.args ? recap(span.args, MAX_ARGS) : undefined,
           "gen_ai.tool.call.result":
-            captureContent && isTool && span.result ? rescrub(span.result, MAX_RESULT) : undefined,
+            captureContent && isTool && span.result ? recap(span.result, MAX_RESULT) : undefined,
           "process.exit.code": span.exitCode ?? undefined,
           "bb.span.detail": captureContent && span.detail ? scrub(span.detail, 300) : undefined,
         },

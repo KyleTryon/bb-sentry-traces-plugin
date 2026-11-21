@@ -19,7 +19,7 @@
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { span as otlpSpan, spanIdFor, traceIdFor, type AttributeValue, type OtlpSpan } from "./otlp.js";
-import { scrub } from "./scrub.js";
+import { scrub, scrubText } from "./scrub.js";
 import { errorMessage } from "./util.js";
 
 export const CONTRACT_VERSION = 1;
@@ -179,7 +179,7 @@ export function sanitizeAttributes(
 function sanitizeContent(values: Record<string, unknown> | null | undefined) {
   const kept: Record<string, AttributeValue> = {};
   for (const [name, value] of Object.entries(sanitizeAttributes(values))) {
-    if (typeof value === "string") kept[name] = scrub(value, MAX_CONTENT_CHARS);
+    if (typeof value === "string") kept[name] = scrubText(value, MAX_CONTENT_CHARS);
   }
   return kept;
 }
@@ -310,10 +310,12 @@ export class TraceProviders {
     }
     const parsed = schema.safeParse(output);
     if (!parsed.success) {
+      // Only an answer that names another version is one: an answer with no
+      // version at all is a broken answer to this one question.
       const contract = (output as { contract?: unknown } | null | undefined)?.contract;
-      return contract === CONTRACT_VERSION
+      return contract === undefined || contract === null || contract === CONTRACT_VERSION
         ? unavailable(`unreadable answer: ${parsed.error.message}`, "unreadable")
-        : unavailable(`answered with contract ${JSON.stringify(contract) ?? "undefined"}`, "other-contract");
+        : unavailable(`answered with contract ${JSON.stringify(contract)}`, "other-contract");
     }
     state.available = true;
     state.error = null;

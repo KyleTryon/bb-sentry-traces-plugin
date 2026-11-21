@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { modelStretches } from "../src/breakdown.js";
 import { attributes, hexId, span as otlpSpan, spanIdFor, traceIdFor } from "../src/otlp.js";
 import { Exporter } from "../src/exporter.js";
-import { rescrub, scrub, scrubLine, scrubSecrets, scrubTail } from "../src/scrub.js";
+import { recap, rescrub, scrub, scrubLine, scrubSecrets, scrubTail, scrubText, scrubValue } from "../src/scrub.js";
 import { batches, MAX_REQUEST_BYTES, MAX_SPANS_PER_REQUEST, parseDsn, sendSpans } from "../src/sentry.js";
 import { syntheticSpans } from "../src/cli.js";
 import { TraceBuilder } from "../src/trace.js";
@@ -564,16 +564,17 @@ describe("third review fixes", () => {
     expect(scrubSecrets(`${BEGIN}\n${BODY}\nQ2==\nexit`)).toBe("[redacted]\nexit");
   });
 
-  it("leaves a credential name alone when the quote after it closes a string", () => {
-    for (const text of [
-      "grep -rn 'API_KEY=' src && echo done",
-      `{"command":"grep -rn 'API_KEY=' .","timeout":5000}`,
-      "if (arg.startsWith('--password=')) { run(arg); }",
-      JSON.stringify({ command: 'grep "TOKEN=" .' }),
-    ]) {
-      expect(scrubSecrets(text)).toBe(text);
-    }
-    // A quote that opens a value still has its value redacted, an apostrophe before it or not.
+  it("redacts the rest of the line when a quote after a credential name may open a value", () => {
+    // Nothing says for certain that these quotes close a string, so the doubt redacts.
+    expect(scrubSecrets("grep -rn 'API_KEY=' src && echo done")).toBe("grep -rn 'API_KEY=[redacted]");
+    expect(scrubSecrets("if (arg.startsWith('--password=')) { run(arg); }")).toBe(
+      "if (arg.startsWith('--password=[redacted]",
+    );
+    // In a structured value the loss stays inside the one string.
+    expect(scrubValue({ command: "grep -rn 'API_KEY=' .", timeout: 5000 }, 4_000)).toBe(
+      `{"command":"grep -rn 'API_KEY=[redacted]","timeout":5000}`,
+    );
+    // A quote that clearly opens a value has just that value redacted, an apostrophe before it or not.
     expect(scrubSecrets("Here's how: TOKEN='abc def' then run")).toBe("Here's how: TOKEN=[redacted] then run");
     expect(scrubSecrets(`echo "x" && TOKEN="a b" run`)).toBe(`echo "x" && TOKEN=[redacted] run`);
     expect(scrubSecrets(JSON.stringify({ command: 'DB_PASSWORD="hunter two" psql' }))).toBe(
@@ -598,10 +599,7 @@ describe("fourth review fixes", () => {
   it("redacts a credential that follows a quoted credential name on the same line", () => {
     expect(scrubSecrets('grep "API_KEY=" .env && PASSWORD=hunter2 psql -c "select 1"')).not.toContain("hunter2");
     expect(scrubSecrets("grep 'API_KEY=' .env; SECRET=abc123 run 'x'")).not.toContain("abc123");
-    // With no later quote the name is left alone, and the scan goes on right after it.
-    expect(scrubSecrets("grep 'API_KEY=' .env && SECRET=abc123 run")).toBe(
-      "grep 'API_KEY=' .env && SECRET=[redacted] run",
-    );
+    expect(scrubSecrets("grep 'API_KEY=' .env && SECRET=abc123 run")).toBe("grep 'API_KEY=[redacted]");
   });
 
   it("redacts a quoted value that is not closed on its line", () => {
@@ -610,7 +608,7 @@ describe("fourth review fixes", () => {
     expect(scrubSecrets('cd app && SECRET="line one\nline two" npm start')).toBe(
       "cd app && SECRET=[redacted] npm start",
     );
-    expect(scrubSecrets(JSON.stringify({ command: 'cd app && API_KEY="sk_live_abc def' }))).toBe(
+    expect(scrubValue({ command: 'cd app && API_KEY="sk_live_abc def' }, 4_000)).toBe(
       '{"command":"cd app && API_KEY=[redacted]"}',
     );
   });
@@ -634,5 +632,74 @@ describe("fourth review fixes", () => {
     const started = performance.now();
     for (let run = 0; run < 3; run++) scrubSecrets(command);
     expect(performance.now() - started).toBeLessThan(100);
+  });
+});
+
+describe("fifth review fixes", () => {
+  const BODY = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7";
+  const BEGIN = "-----BEGIN PRIVATE KEY-----";
+
+  it("redacts a quoted secret that follows a quoted credential name on the same line", () => {
+    expect(scrubSecrets("grep 'API_KEY=' .env; SECRET='abc123'")).toBe("grep 'API_KEY=[redacted]");
+    expect(scrubSecrets('echo "PASSWORD=" && TOKEN="abc def" run')).toBe('echo "PASSWORD=[redacted]');
+    expect(scrubSecrets("grep 'API_KEY=' x; SECRET='abc' # don't")).toBe("grep 'API_KEY=[redacted]");
+    // A later apostrophe does not make the value's own quotes look like a closed string.
+    expect(scrubSecrets(`TOKEN='abc' git commit -m "don't break"`)).toBe("TOKEN=[redacted]");
+    expect(scrubSecrets(`cd x && TOKEN='abc' git commit -m "don't break"`)).toBe("cd x && TOKEN=[redacted]");
+    const args = scrubValue({ command: "grep 'API_KEY=' . && PASSWORD='hunter2' run", cwd: "/app" }, 4_000);
+    expect(args).toBe(`{"command":"grep 'API_KEY=[redacted]","cwd":"/app"}`);
+  });
+
+  it("scrubs each string of a structured value on its own, so JSON's quotes are never a command's", () => {
+    for (const value of [
+      { command: "grep -r TOKEN=", description: "find tokens" },
+      { pattern: "API_KEY=", path: "src" },
+      ["--password=", "next"],
+    ]) {
+      expect(scrubValue(value, 4_000)).toBe(JSON.stringify(value));
+    }
+    expect(scrubValue({ api_key: "abcd1234", name: "x", nested: { clientSecret: "hunter2" } }, 4_000)).toBe(
+      '{"api_key":"[redacted]","name":"x","nested":{"clientSecret":"[redacted]"}}',
+    );
+    expect(scrubValue({ author: "Ada", max_tokens: "100", n: 3, ok: true, none: null }, 4_000)).toBe(
+      '{"author":"Ada","max_tokens":"100","n":3,"ok":true,"none":null}',
+    );
+    expect(scrubValue("plain TOKEN=abc text", 4_000)).toBe("plain TOKEN=[redacted] text");
+    expect(scrubValue(undefined, 4_000)).toBe("");
+    // The same rule for text that is JSON, as a provider's message content is.
+    const messages = JSON.stringify([{ role: "user", content: "run grep 'API_KEY=' src", id: 7 }]);
+    expect(scrubText(messages, 8_000)).toBe(
+      `[{"role":"user","content":"run grep 'API_KEY=[redacted]","id":7}]`,
+    );
+    expect(scrubText("{not json TOKEN=abc", 8_000)).toBe("{not json TOKEN=[redacted]");
+  });
+
+  it("caps a structured value with the true size of the cut, and leaves it alone on its way out", () => {
+    const args = scrubValue({ query: "q".repeat(6_000) }, 4_000);
+    expect(args).toMatch(/\[… 2012 more characters cut\]$/);
+    expect(recap(args, 4_000)).toBe(args);
+    const json = `{"pattern":"API_KEY=","path":"src"}`;
+    expect(recap(json, 4_000)).toBe(json);
+    expect(recap("x".repeat(4_010), 4_000)).toBe(`${"x".repeat(4_000)}\n[… 10 more characters cut]`);
+    // A secret past the cut is scrubbed before the cut, not split by it.
+    const token = `ghp_${"a".repeat(36)}`;
+    expect(scrubValue({ a: "x".repeat(3_980), b: token }, 4_000)).not.toContain("ghp_aaaa");
+  });
+
+  it("redacts a quoted value that runs over several lines or starts with a space", () => {
+    expect(scrubSecrets('PASSWORD=" leading space\nmore" x')).toBe("PASSWORD=[redacted]");
+    expect(scrubSecrets('x && PASSWORD=" spacey secret')).toBe("x && PASSWORD=[redacted]");
+    expect(scrubSecrets("run && SECRET='\nline two\nline three' && next")).toBe("run && SECRET=[redacted] && next");
+  });
+
+  it("keeps a word after a cut-off key that is not alone on its line", () => {
+    expect(scrubSecrets(`${BEGIN}\n${BODY}\nok!\nnext`)).toBe("[redacted]\nok!\nnext");
+    expect(scrubSecrets(`${BEGIN}\n${BODY}\ndone.\nnext`)).toBe("[redacted]\ndone.\nnext");
+  });
+
+  it("redacts a cut-off key's short last line at the end of a JSON string", () => {
+    const output = `${BEGIN}\n${BODY}\nabcdefgh`;
+    expect(scrubValue({ output }, 4_000)).toBe('{"output":"[redacted]"}');
+    expect(scrubSecrets(JSON.stringify({ output }))).toBe('{"output":"[redacted]"}');
   });
 });

@@ -22,7 +22,7 @@ const ENV_LINE = new RegExp(
 
 /**
  * The name and `=` of a credential-like assignment anywhere in a line, as in
- * `cd app && API_KEY=… npm start` or a command inside one-line JSON.
+ * `cd app && API_KEY=… npm start`.
  */
 const INLINE_NAME = new RegExp(
   String.raw`(?<![A-Za-z0-9_])(?:export\s+)?[A-Za-z0-9_]*${CREDENTIAL_NAME}[A-Za-z0-9_]*=(?!=)`,
@@ -33,38 +33,63 @@ const INLINE_NAME = new RegExp(
  * backslash is part of it unless it escapes a quote or is JSON's `\n`.
  */
 const UNQUOTED_VALUE = /(?:[^\s"'\\&;|]|\\(?!["'nrt]))+/y;
-/** What follows a quote that closed a string: a gap, the end, or punctuation, never a value. */
-const AFTER_CLOSING_QUOTE = /^(?:\s|$|\\[nrt]|[)\]},;:|&<>])/;
 /** How far past its line a quoted value with no closing quote on that line is followed. */
 const MAX_VALUE_LINES_CHARS = 4_096;
 
-/**
- * Where the quote at `from` is closed before `limit`, as the index after the
- * closing quote, or -1. An escaped quote (`\"`, as inside JSON) is closed by
- * an escaped one; a plain quote by a plain one.
- */
-function closingQuote(text: string, from: number, limit: number, quote: string, escaped: boolean): number {
-  for (let index = from; index < limit; index++) {
-    if (text[index] !== quote) continue;
-    const afterBackslash = text[index - 1] === "\\" && text[index - 2] !== "\\";
-    if (afterBackslash === escaped) return index + 1;
+/** Whether the character at `index` is a quote of the kind asked for: escaped (`\"`) or plain. */
+function isQuote(text: string, index: number, quote: string, escaped: boolean): boolean {
+  if (text[index] !== quote) return false;
+  return (text[index - 1] === "\\" && text[index - 2] !== "\\") === escaped;
+}
+
+/** Where every quote of one kind sits on one line. Built once per line and kind. */
+class LineQuotes {
+  private readonly found = new Map<string, number[]>();
+
+  constructor(
+    private readonly text: string,
+    private readonly start: number,
+    readonly end: number,
+  ) {}
+
+  /** The quotes of this kind from `from` to the end of the line. */
+  after(from: number, quote: string, escaped: boolean): number[] {
+    const kind = `${escaped ? "\\" : ""}${quote}`;
+    let all = this.found.get(kind);
+    if (!all) {
+      all = [];
+      for (let index = this.start; index < this.end; index++) {
+        if (isQuote(this.text, index, quote, escaped)) all.push(index);
+      }
+      this.found.set(kind, all);
+    }
+    let low = 0;
+    let high = all.length;
+    while (low < high) {
+      const middle = (low + high) >> 1;
+      if (all[middle] < from) low = middle + 1;
+      else high = middle;
+    }
+    return low === 0 ? all : all.slice(low);
   }
-  return -1;
 }
 
 /**
- * Where the value that starts at `at` ends, or `at` when there is none to
- * redact. Nothing here guesses that a secret is not one:
+ * Where the value that starts at `at` ends, or `at` when there is none.
  *
- * - a quote closed later on the line: the value runs through that quote,
- *   whatever is between them. In `grep "KEY=" x && PASSWORD=p run "y"` that
- *   takes too much, and takes the password with it;
- * - a quote never closed on its line: a value that starts right after it runs
- *   to its closing quote on a later line, or else to the end of its line;
- * - a quote never closed with nothing after it, as in `grep 'API_KEY=' src`:
- *   that quote closed a string, and there is no value.
+ * A quote right after the `=` may open a value (`TOKEN="a b"`) or close a
+ * string that ends in the name (`grep 'API_KEY=' src`), and nothing in the
+ * text says which for certain. So a doubt redacts, by how many more quotes of
+ * its kind the line has:
+ *
+ * - an odd number: the next one closes the value, unless another credential
+ *   name sits before it, and then the rest of the line goes;
+ * - an even number: the quotes do not pair up from here, and the rest of the
+ *   line goes;
+ * - none: the value runs to its closing quote on a later line, or else to the
+ *   end of its line.
  */
-function inlineValueEnd(text: string, at: number, lineEnd: number): number {
+function inlineValueEnd(text: string, at: number, line: LineQuotes): number {
   const escaped = text[at] === "\\" && (text[at + 1] === '"' || text[at + 1] === "'");
   const quote = text[escaped ? at + 1 : at];
   if (quote !== '"' && quote !== "'") {
@@ -72,38 +97,40 @@ function inlineValueEnd(text: string, at: number, lineEnd: number): number {
     return UNQUOTED_VALUE.test(text) ? UNQUOTED_VALUE.lastIndex : at;
   }
   const open = at + (escaped ? 2 : 1);
-  const closed = closingQuote(text, open, lineEnd, quote, escaped);
-  if (closed !== -1) return closed;
-  if (AFTER_CLOSING_QUOTE.test(text.slice(open, open + 2))) return at;
-  if (escaped) {
-    // Inside a JSON string that ends before the value's quote does: up to that string's end.
-    const stringEnd = closingQuote(text, open, lineEnd, quote, false);
-    return stringEnd !== -1 ? stringEnd - 1 : lineEnd;
+  const more = line.after(open, quote, escaped);
+  if (more.length === 0) {
+    const limit = Math.min(text.length, line.end + MAX_VALUE_LINES_CHARS);
+    for (let index = line.end; index < limit; index++) {
+      if (isQuote(text, index, quote, escaped)) return index + 1;
+    }
+    return line.end;
   }
-  const later = closingQuote(text, lineEnd, Math.min(text.length, lineEnd + MAX_VALUE_LINES_CHARS), quote, false);
-  return later !== -1 ? later : lineEnd;
+  if (more.length % 2 === 0) return line.end;
+  INLINE_NAME.lastIndex = open;
+  const next = INLINE_NAME.exec(text);
+  return next && next.index < more[0] ? line.end : more[0] + 1;
 }
 
 function scrubInlineAssignments(text: string): string {
   let out = "";
   let done = 0;
-  let lineEnd = -1;
-  INLINE_NAME.lastIndex = 0;
-  for (let match = INLINE_NAME.exec(text); match; match = INLINE_NAME.exec(text)) {
+  let line = new LineQuotes(text, 0, -1);
+  let from = 0;
+  for (;;) {
+    INLINE_NAME.lastIndex = from;
+    const match = INLINE_NAME.exec(text);
+    if (!match) break;
     const at = match.index + match[0].length;
-    if (at > lineEnd) {
-      lineEnd = text.indexOf("\n", at);
-      if (lineEnd === -1) lineEnd = text.length;
+    if (at > line.end) {
+      const end = text.indexOf("\n", at);
+      line = new LineQuotes(text, text.lastIndexOf("\n", at - 1) + 1, end === -1 ? text.length : end);
     }
-    const end = inlineValueEnd(text, at, lineEnd);
-    if (end === at) {
-      // No value: go on right after any quote here, so nothing behind it is skipped.
-      INLINE_NAME.lastIndex = at;
-      continue;
+    const end = inlineValueEnd(text, at, line);
+    if (end > at) {
+      out += text.slice(done, at) + REDACTED;
+      done = end;
     }
-    out += text.slice(done, at) + REDACTED;
-    done = end;
-    INLINE_NAME.lastIndex = end;
+    from = Math.max(end, at);
   }
   return done === 0 ? text : out + text.slice(done);
 }
@@ -161,11 +188,13 @@ function skipGapBack(text: string, at: number): number {
 }
 
 const LINE_BREAK = /[\r\n]|\\[nr]/;
+/** A line break, or the quote that closes a string the key sits at the end of. */
+const LINE_END = /^(?:[\r\n"]|\\[nr"])/;
 
 /** Whether only spaces and tabs sit between `at` and the end of its line. */
 function endsLine(text: string, at: number): boolean {
   while (text[at] === " " || text[at] === "\t") at++;
-  return at >= text.length || LINE_BREAK.test(text.slice(at, at + 2));
+  return at >= text.length || LINE_END.test(text.slice(at, at + 2));
 }
 
 /** Whether only spaces and tabs sit between the start of its line and `at`. */
@@ -301,11 +330,13 @@ export function scrubSecrets(value: string, cut: Cut = {}): string {
     if (cut.start) out = out.replace(PEM_UNSTARTED, REDACTED);
     out = scrubCutOffKeys(out);
   }
+  // Inline assignments first: a quoted value can run over several lines, and
+  // the line-by-line pass after it would only see its first.
+  out = scrubInlineAssignments(out);
   out = out
     .split("\n")
     .map((line) => line.replace(ENV_LINE, `$1${REDACTED}`))
     .join("\n");
-  out = scrubInlineAssignments(out);
   out = out.replace(QUOTED_PAIR, `$1$3${REDACTED}$3`);
   for (const pattern of TOKEN_PATTERNS) out = out.replace(pattern, REDACTED);
   return out;
@@ -348,4 +379,76 @@ export function rescrub(value: string, max: number, keep: "start" | "end" = "sta
   const marked = (keep === "end" ? CUT_AT_START : CUT_AT_END).test(value);
   if (value.length <= max || (marked && value.length <= max + MARKER_ROOM)) return scrubSecrets(value);
   return keep === "end" ? scrubTail(value, max) : scrub(value, max);
+}
+
+/** Text that was scrubbed already, capped. Text `scrub` cut to `max` keeps its cut and marker. */
+export function recap(value: string, max: number): string {
+  if (value.length <= max || (CUT_AT_END.test(value) && value.length <= max + MARKER_ROOM)) return value;
+  return `${value.slice(0, Math.max(0, max))}\n[… ${value.length - max} more characters cut]`;
+}
+
+/** A field named like a credential, as in `{"apiKey": "…"}`. */
+const CREDENTIAL_KEY = new RegExp(`^[A-Za-z0-9_.-]*${CREDENTIAL_NAME}[A-Za-z0-9_.-]*$`, "i");
+const MAX_DEPTH = 64;
+
+/**
+ * A copy of a structured value with every string in it scrubbed on its own.
+ * `room` is how many characters of strings are still worth scrubbing: past
+ * it, everything is cut off anyway and is left out.
+ */
+function scrubStrings(value: unknown, room: { left: number }, depth = 0): unknown {
+  if (typeof value === "string") {
+    if (room.left <= 0) return "";
+    const head = value.slice(0, room.left);
+    room.left -= head.length;
+    return scrubSecrets(head, { end: head !== value });
+  }
+  if (value === null || typeof value !== "object") return value;
+  // Too deep to walk: scrubbed as the text it would become.
+  if (depth >= MAX_DEPTH) return scrubStrings(JSON.stringify(value) ?? "", room, depth);
+  if (Array.isArray(value)) return value.map((item) => scrubStrings(item, room, depth + 1));
+  const copy: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value)) {
+    copy[key] =
+      typeof item === "string" && item && CREDENTIAL_KEY.test(key)
+        ? REDACTED
+        : scrubStrings(item, room, depth + 1);
+  }
+  return copy;
+}
+
+/**
+ * Scrubs a value a tool was called with or returned, then caps it like
+ * `scrub`. Text is scrubbed as text. Anything structured has each of its
+ * strings scrubbed before it is written as JSON: in the JSON, the quotes of
+ * the format and the quotes inside a command cannot be told apart.
+ */
+export function scrubValue(value: unknown, max: number): string {
+  if (typeof value === "string") return scrub(value, max);
+  if (value === undefined || value === null) return "";
+  let full: string | undefined;
+  let clean: string | undefined;
+  try {
+    full = JSON.stringify(value);
+    clean = JSON.stringify(scrubStrings(value, { left: max + SCRUB_MARGIN }));
+  } catch {
+    return "";
+  }
+  if (full === undefined || clean === undefined) return "";
+  if (full.length <= max && clean.length <= max) return clean;
+  const over = Math.max(full.length, clean.length) - max;
+  return `${clean.slice(0, Math.max(0, max))}\n[… ${over} more characters cut]`;
+}
+
+/** Scrubs text that may itself be JSON, as a provider's message content is: then as `scrubValue` does. */
+export function scrubText(value: string, max: number): string {
+  const first = value.trimStart()[0];
+  if (first === "{" || first === "[") {
+    try {
+      return scrubValue(JSON.parse(value), max);
+    } catch {
+      // Not JSON after all.
+    }
+  }
+  return scrub(value, max);
 }

@@ -91,7 +91,10 @@ With `captureContent` on, spans also carry the prompt and replies
 result, and the thread title. That text first passes a scrubber that replaces
 common secret shapes (API keys, tokens, PEM keys, credentials in URLs, dotenv
 lines, quoted fields such as `"api_key": "…"`) and then caps each field, so a
-cut cannot split a secret into a piece that no longer looks like one. The scrubber is a best effort, not a guarantee:
+cut cannot split a secret into a piece that no longer looks like one. Where
+it cannot tell whether text is a secret it redacts: a command that only names
+a credential in quotes, such as `grep 'API_KEY=' src && echo done`, loses the
+rest of that line. The scrubber is a best effort, not a guarantee:
 only turn this on for a Sentry project you would trust with the transcript.
 
 Turning the plugin on sends turns that finish from then on. It does not send

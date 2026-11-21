@@ -2061,3 +2061,117 @@ describe("fourth review fixes", () => {
     expect(attr(withUsage[0], "gen_ai.usage.input_tokens")).toBe(10_100);
   });
 });
+
+describe("fifth review fixes", () => {
+  const P = "orchestrator";
+  const KEY = "run_42";
+  const inTrace = (span: { traceId: string }) => span.traceId === providerTraceId(P, KEY);
+  const turnIndexes = (spans: Array<{ name: string }>) =>
+    spans
+      .filter((span) => span.name.startsWith("invoke_agent"))
+      .map((span) => attr(span as never, "bb.turn.index"));
+
+  /** A finished turn of `items` commands. */
+  function turnOf(h: History, turnId: string, items: number) {
+    h.request(`${turnId}-req`).start(turnId, `${turnId}-req`);
+    for (let index = 0; index < items; index++) {
+      h.item(turnId, { type: "commandExecution", id: `${turnId}-${index}`, command: "ls" }, 1);
+    }
+    h.complete(turnId);
+  }
+
+  it("reads on after a turn longer than one read without waiting for the thread's next event", async () => {
+    const { bb, history: h, emit, tick, spans } = await setup();
+    h.turn();
+    await emit("thread.idle");
+    turnOf(h, "long", 20_000);
+    // Too long to end in the page the long turn ends in.
+    turnOf(h, "after", 150);
+    await emit("thread.idle");
+    expect(turnIndexes(spans())).toEqual([1, 2]);
+    await tick();
+    expect(turnIndexes(spans())).toEqual([1, 2, 3]);
+    expect(await bb.storage.kv.list("retry:")).toEqual([]);
+  }, 60_000);
+
+  it("starts a thread never sent before at its newest turn when a long turn ends its read exactly", async () => {
+    const { history: h, emit, spans } = await setup();
+    h.turn();
+    // 4 + 2 × 19,998 events: read from its own start, this turn ends on the read's last
+    // event, so the read shows no later turn although one has finished.
+    turnOf(h, "long", 19_998);
+    // Long enough that the first read, from the thread's start, is cut short too.
+    turnOf(h, "after", 150);
+    h.turn();
+    await emit("thread.idle");
+    expect(turnIndexes(spans())).toEqual([4]);
+  }, 60_000);
+
+  it("sends tool arguments scrubbed string by string, with their JSON whole", async () => {
+    const { history, emit, spans } = await setup({ settings: { captureContent: true } });
+    history.request("req-1").start("turn-1", "req-1");
+    history.item(
+      "turn-1",
+      {
+        type: "toolCall",
+        id: "t1",
+        tool: "Grep",
+        arguments: { pattern: "API_KEY=", path: "src", env: { GH_TOKEN: "ghs-not-a-known-shape" } },
+      },
+      100,
+      { result: { matches: ["src/a.ts: const x = 'API_KEY=' + key"], count: 1 } },
+    );
+    history.item("turn-1", { type: "fileRead", id: "f1", path: "/tmp/x?token=abc123" }, 100);
+    history.complete("turn-1");
+    await emit("thread.idle");
+    const tool = spans().find((span) => span.name === "execute_tool Grep")!;
+    expect(attr(tool, "gen_ai.tool.call.arguments")).toBe(
+      '{"pattern":"API_KEY=","path":"src","env":{"GH_TOKEN":"[redacted]"}}',
+    );
+    expect(attr(tool, "gen_ai.tool.call.result")).toBe(
+      `{"matches":["src/a.ts: const x = 'API_KEY=[redacted]"],"count":1}`,
+    );
+    const read = spans().find((span) => span.name === "execute_tool Read")!;
+    expect(attr(read, "gen_ai.tool.call.arguments")).toBe("/tmp/x?token=[redacted]");
+  });
+
+  it("keeps placing a provider's threads after an answer of its with no contract at all", async () => {
+    const { history, emit, tick, rpc, spans } = await setup({
+      providers: { [P]: { contexts: { [THREAD]: { trace: { key: KEY } } } } },
+    });
+    history.turn();
+    await emit("thread.idle");
+    // The trace's own spans are asked for at the tick: a broken answer to that one question.
+    rpc.mockImplementationOnce(async () => null as never);
+    await tick();
+    const before = spans().length;
+    history.turn();
+    await emit("thread.idle");
+    const later = spans().slice(before);
+    expect(later.length).toBeGreaterThan(0);
+    expect(later.every(inTrace)).toBe(true);
+  });
+
+  it("asks a provider again right after its back-off, however long its call took to fail", async () => {
+    const { bb, history, emit, tick, clock, rpc, spans } = await setup({
+      providers: { [P]: { contexts: { [THREAD]: { trace: { key: KEY } } } } },
+    });
+    history.turn();
+    await emit("thread.idle");
+    const before = spans().length;
+    rpc.mockImplementationOnce(async () => {
+      clock.now += 60_000;
+      throw new Error("timed out");
+    });
+    history.turn();
+    await emit("thread.idle");
+    expect(spans()).toHaveLength(before);
+    const retry = (await bb.storage.kv.get(`retry:${THREAD}`)) as { nextAt: number };
+    expect(retry.nextAt).toBeGreaterThan(clock.now + 5 * 60_000);
+    clock.now = retry.nextAt;
+    await tick();
+    const later = spans().slice(before);
+    expect(later.length).toBeGreaterThan(0);
+    expect(later.every(inTrace)).toBe(true);
+  });
+});

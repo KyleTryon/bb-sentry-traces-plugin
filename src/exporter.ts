@@ -408,6 +408,15 @@ export class Exporter {
     return { resumeSeq, turnsBefore };
   }
 
+  /**
+   * Whether an export should be followed by another without waiting for the
+   * thread's next event: its read left events unread and got somewhere, so the
+   * next read starts further on. A read that got nowhere would only repeat.
+   */
+  private readsOn(folded: Folded, state: ThreadState | undefined, point: { resumeSeq: number }): boolean {
+    return folded.truncated && point.resumeSeq > (state?.resumeSeq ?? 0);
+  }
+
   // ----------------------------------------------------------------- exporting
 
   /**
@@ -504,11 +513,10 @@ export class Exporter {
     for (let reads = 0; folded.truncated && (state?.sentTurn ?? null) === null; reads++) {
       const newest = folded.turns.filter((turn) => turn.end !== null).at(-1);
       let point = this.resumePoint(folded, state, newest ? newest.index - 1 : null, NO_TURNS);
-      // The read began with that turn and a later turn fills the rest of it:
-      // the later turn may be the newest, so try reading on past this one.
-      const later = newest ? folded.turns.some((turn) => turn.index > newest.index) : false;
+      // The read began with that turn, and there are more events than it took
+      // in: a later turn may have finished in them, so try reading on past it.
       let past = false;
-      if (newest && later && point.resumeSeq <= (state?.resumeSeq ?? 0)) {
+      if (newest && point.resumeSeq <= (state?.resumeSeq ?? 0)) {
         point = this.resumePoint(folded, state, newest.index, NO_TURNS);
         past = true;
       }
@@ -530,8 +538,8 @@ export class Exporter {
         return { kind: "nothing" };
       }
       const ahead = await this.fold(thread.id, next, settings.captureContent);
-      // The later turn has not finished, so the turn read past is still the
-      // newest finished one: export it from this read, which still has it.
+      // No later turn has finished, so the turn read past is still the newest
+      // finished one: export it from this read, which still has it.
       if (past && !ahead.turns.some((turn) => turn.end !== null)) break;
       await this.kv.set(key, next);
       state = next;
@@ -553,16 +561,18 @@ export class Exporter {
     const due = [...held, ...fresh];
 
     if (due.length === 0) {
+      const point = this.resumePoint(folded, state, sentTurn, NO_TURNS);
       if (state) {
         await this.kv.set(key, {
           ...state,
           waiting: null,
-          ...this.resumePoint(folded, state, sentTurn, NO_TURNS),
+          ...point,
           updatedAt: this.now(),
         } satisfies ThreadState);
       }
-      // A retry that finds nothing left to send is done.
-      await this.clearRetry(thread.id);
+      // A retry that finds nothing left to send is done, unless there is more to read.
+      if (state && this.readsOn(folded, state, point)) await this.scheduleCheck(thread.id, this.now());
+      else await this.clearRetry(thread.id);
       return { kind: "nothing" };
     }
 
@@ -609,7 +619,8 @@ export class Exporter {
           ...this.resumePoint(folded, state, baseline, waitedBefore),
           updatedAt: now,
         } satisfies ThreadState);
-        await this.scheduleCheck(thread.id, now + UNAVAILABLE_MS);
+        // Counted from now, after the call: a slow failure backs the provider off from its end.
+        await this.scheduleCheck(thread.id, this.now() + UNAVAILABLE_MS + 1_000);
         return { kind: "nothing" };
       }
       workflow = placed.workflow;
@@ -702,10 +713,11 @@ export class Exporter {
     // The usage span goes last, so a turn that was cut short or refused never
     // sent it: the next export counts it again from the same starting total.
     const usageStays = usageWaitsForTurn || (usage.size > 0 && !usageSent);
+    const point = this.resumePoint(folded, state, lastDone, new Set(waiting));
     await this.kv.set(key, {
       sentTurn: lastDone,
       waiting: waiting.length > 0 ? waiting : null,
-      ...this.resumePoint(folded, state, lastDone, new Set(waiting)),
+      ...point,
       usage: usageStays ? (state?.usage ?? null) : (current ?? state?.usage ?? null),
       usageKnown: usageStays ? usageKnown : true,
       usageTurns: usageStays ? usageTurns + done.size : 0,
@@ -718,7 +730,9 @@ export class Exporter {
       if (workflow) await this.noteWorkflow(workflow, inTrace ? trace : null);
     }
     if (failure) return this.failed(thread.id, failure);
-    if (waitUntil !== null) await this.scheduleCheck(thread.id, waitUntil);
+    // Finished turns may sit in the events this read did not take in.
+    const checkAt = this.readsOn(folded, state, point) ? now : waitUntil;
+    if (checkAt !== null) await this.scheduleCheck(thread.id, checkAt);
     else await this.clearRetry(thread.id);
     if (turnsSent === 0 && refused) {
       return { kind: "failed", message: refused.message, retryable: false };
