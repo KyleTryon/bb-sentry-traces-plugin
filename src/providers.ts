@@ -264,18 +264,28 @@ export class TraceProviders {
     const question = `${method} ${JSON.stringify(input)}`;
     for (const [asked, until] of state.unreadable) if (until <= now) state.unreadable.delete(asked);
     if (state.unreadable.has(question)) return undefined;
-    const unavailable = (message: string, reached: boolean) => {
+    const unavailable = (message: string, reason: "unreached" | "other-contract" | "unreadable") => {
       // Missing, disabled, older than the contract, or answering nonsense: not an error for us.
-      if (reached) {
-        // It is there and said nothing this plugin can use: an answer, not an
-        // outage. Only this question waits; a trace too large to read must not
-        // stop its threads from being placed.
-        state.failingSince = null;
-        if (state.unreadable.size >= MAX_UNREADABLE) state.unreadable.clear();
-        state.unreadable.set(question, now + UNAVAILABLE_MS);
+      // The time is read now: the call may have taken long to fail.
+      const failedAt = this.now();
+      if (reason === "unreached") {
+        state.unavailableUntil = failedAt + UNAVAILABLE_MS;
+        state.failingSince ??= failedAt;
       } else {
-        state.unavailableUntil = now + UNAVAILABLE_MS;
-        state.failingSince ??= now;
+        // It is there and said nothing this plugin can use: an answer, not an outage.
+        state.failingSince = null;
+        if (reason === "other-contract") {
+          // Every answer of its will be like this one.
+          state.unavailableUntil = failedAt + UNAVAILABLE_MS;
+        } else {
+          // Only this question waits; a trace too large to read must not stop
+          // its threads from being placed.
+          if (state.unreadable.size >= MAX_UNREADABLE) {
+            const [oldest] = state.unreadable.keys();
+            state.unreadable.delete(oldest);
+          }
+          state.unreadable.set(question, failedAt + UNAVAILABLE_MS);
+        }
       }
       const text = message.slice(0, 300);
       if (text !== state.error) {
@@ -296,10 +306,15 @@ export class TraceProviders {
         outputSchema: z.unknown(),
       });
     } catch (cause) {
-      return unavailable(errorMessage(cause), false);
+      return unavailable(errorMessage(cause), "unreached");
     }
     const parsed = schema.safeParse(output);
-    if (!parsed.success) return unavailable(`unreadable answer: ${parsed.error.message}`, true);
+    if (!parsed.success) {
+      const contract = (output as { contract?: unknown } | null | undefined)?.contract;
+      return contract === CONTRACT_VERSION
+        ? unavailable(`unreadable answer: ${parsed.error.message}`, "unreadable")
+        : unavailable(`answered with contract ${JSON.stringify(contract) ?? "undefined"}`, "other-contract");
+    }
     state.available = true;
     state.error = null;
     state.answered = true;

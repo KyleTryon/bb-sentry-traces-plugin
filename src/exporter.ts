@@ -138,6 +138,12 @@ const PAGE_SIZE = 100;
 /** One read covers at most this many pages of matching events. */
 const MAX_PAGES = 400;
 /**
+ * A read that ends inside a turn goes on to that turn's end, up to this many
+ * pages in all: a turn longer than one read would otherwise never be seen
+ * finished, and would hold back every turn after it.
+ */
+const MAX_PAGES_LONG_TURN = 4_000;
+/**
  * A thread never sent before starts with its newest turn. When its history is
  * longer than one read, an export reads on through at most this many more
  * before it leaves the rest to the next export.
@@ -340,7 +346,11 @@ export class Exporter {
 
   private async readEvents(threadId: string, afterSeq: number, builder: TraceBuilder) {
     let cursor = afterSeq;
-    for (let page = 0; page < MAX_PAGES; page++) {
+    // The turn a full read ended inside, which the read goes on to the end of.
+    let inside: string | null = null;
+    for (let page = 0; page < MAX_PAGES_LONG_TURN; page++) {
+      if (page === MAX_PAGES) inside = builder.runningTurn;
+      if (page >= MAX_PAGES && (inside === null || !builder.isRunning(inside))) return true;
       const rows = await this.bb.sdk.threads.events.list({
         threadId,
         afterSeq: String(cursor),
@@ -513,7 +523,9 @@ export class Exporter {
       // Held back by a turn or prompt it cannot read past: export from what was read.
       if (next.resumeSeq <= (state?.resumeSeq ?? 0)) break;
       if (reads >= MAX_CATCH_UP_READS) {
-        await this.kv.set(key, next);
+        // Past a turn that may still be the newest finished one, nothing is
+        // saved: the next export starts at this read and looks ahead first.
+        if (!past) await this.kv.set(key, next);
         this.bb.log.debug(`Thread ${thread.id} has a long history; the next export reads on.`);
         return { kind: "nothing" };
       }
@@ -561,12 +573,15 @@ export class Exporter {
     // Without a noted starting total, the thread's total is known to be these
     // turns' only when they are all the thread has. That is decided once, here,
     // and remembered: a later export sees more turns and could not tell.
-    const seenWhole =
-      !state &&
+    const whole =
       !folded.truncated &&
       folded.turns.length === due.length &&
       (folded.turns[0]?.index ?? 1) === 1;
-    const usageKnown = state ? state.usageKnown : seenWhole;
+    // A stored state that never read a total, never moved and never sent a
+    // turn says no more than no state does.
+    const untouched =
+      !!state && state.usage === null && state.resumeSeq === 0 && (state.usageTurns ?? 0) === 0;
+    const usageKnown = state ? state.usageKnown || (untouched && whole) : whole;
     // A turn whose background subagent still works waits for it; the turns
     // after it go on without it.
     const waits = (turn: Turn) =>

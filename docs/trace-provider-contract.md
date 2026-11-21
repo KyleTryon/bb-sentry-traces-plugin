@@ -23,10 +23,12 @@ returns are plain data that follow OpenTelemetry's naming.
 - Every request carries `"contract": 1`, and every answer must carry it back.
   An answer with another version is ignored.
 - Times are milliseconds since the epoch.
-- A wrong version or an answer that does not match this page means "this
-  provider has nothing to say" to that request: the thread exports on its own,
-  and the same request is not made again for five minutes. Other requests are
-  still made.
+- An answer with another version means "this provider has nothing to say":
+  the thread exports on its own, and the plugin does not call the provider
+  again for five minutes.
+- An answer with the right version that does not match this page means the
+  same for that one request: the same request is not made again for five
+  minutes, and other requests are still made.
 - A failed call means the provider could not be reached, and the plugin does
   not call it again for five minutes. From a provider that has never given a
   readable answer since the plugin loaded, that is final: the thread exports

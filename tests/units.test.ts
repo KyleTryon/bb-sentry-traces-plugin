@@ -556,8 +556,9 @@ describe("third review fixes", () => {
   it("keeps the text that follows a cut-off key", () => {
     expect(scrubSecrets(`${BEGIN}\n${BODY}\nexit code 0\nnext`)).toBe("[redacted]\nexit code 0\nnext");
     expect(scrubSecrets(`key: |\n  ${BEGIN}\n  ${BODY}\nnext: 1`)).toBe("key: |\n  [redacted]\nnext: 1");
+    // One word alone on the line right after the key could be its last line, so it goes too.
     expect(scrubSecrets(`${BEGIN}\n${BODY}\ndone\nok\nfine\nreally fine`)).toBe(
-      "[redacted]\ndone\nok\nfine\nreally fine",
+      "[redacted]\nok\nfine\nreally fine",
     );
     // The short last line of a key is still part of it.
     expect(scrubSecrets(`${BEGIN}\n${BODY}\nQ2==\nexit`)).toBe("[redacted]\nexit");
@@ -566,9 +567,9 @@ describe("third review fixes", () => {
   it("leaves a credential name alone when the quote after it closes a string", () => {
     for (const text of [
       "grep -rn 'API_KEY=' src && echo done",
-      `{"command":"grep -rn 'API_KEY=' . && echo 'ok'","timeout":5000}`,
+      `{"command":"grep -rn 'API_KEY=' .","timeout":5000}`,
       "if (arg.startsWith('--password=')) { run(arg); }",
-      JSON.stringify({ command: 'grep "TOKEN=" . && echo "ok"' }),
+      JSON.stringify({ command: 'grep "TOKEN=" .' }),
     ]) {
       expect(scrubSecrets(text)).toBe(text);
     }
@@ -587,5 +588,51 @@ describe("third review fixes", () => {
     const started = performance.now();
     for (let run = 0; run < 5; run++) scrub(text, 16_000);
     expect(performance.now() - started).toBeLessThan(150);
+  });
+});
+
+describe("fourth review fixes", () => {
+  const BODY = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7";
+  const BEGIN = "-----BEGIN PRIVATE KEY-----";
+
+  it("redacts a credential that follows a quoted credential name on the same line", () => {
+    expect(scrubSecrets('grep "API_KEY=" .env && PASSWORD=hunter2 psql -c "select 1"')).not.toContain("hunter2");
+    expect(scrubSecrets("grep 'API_KEY=' .env; SECRET=abc123 run 'x'")).not.toContain("abc123");
+    // With no later quote the name is left alone, and the scan goes on right after it.
+    expect(scrubSecrets("grep 'API_KEY=' .env && SECRET=abc123 run")).toBe(
+      "grep 'API_KEY=' .env && SECRET=[redacted] run",
+    );
+  });
+
+  it("redacts a quoted value that is not closed on its line", () => {
+    expect(scrubSecrets('cd app && API_KEY="sk_live_abc def')).toBe("cd app && API_KEY=[redacted]");
+    expect(scrubSecrets("run && TOKEN='abcdef ghijkl")).toBe("run && TOKEN=[redacted]");
+    expect(scrubSecrets('cd app && SECRET="line one\nline two" npm start')).toBe(
+      "cd app && SECRET=[redacted] npm start",
+    );
+    expect(scrubSecrets(JSON.stringify({ command: 'cd app && API_KEY="sk_live_abc def' }))).toBe(
+      '{"command":"cd app && API_KEY=[redacted]"}',
+    );
+  });
+
+  it("redacts a quoted value whatever it starts with and whatever quotes come before it", () => {
+    const json = `{"note":"Don't forget","command":"PASSWORD=':s3cr3t!' ./run"}`;
+    expect(scrubSecrets(json)).toBe(`{"note":"Don't forget","command":"PASSWORD=[redacted] ./run"}`);
+    expect(scrubSecrets("it's fine: PASSWORD=' leading space pw' go")).toBe("it's fine: PASSWORD=[redacted] go");
+  });
+
+  it("redacts a cut-off key's short last line even when it looks like a word", () => {
+    for (const last of ["abcdefgh", "QWERTYUI", "Abcdefgh"]) {
+      expect(scrubSecrets(`${BEGIN}\n${BODY}\n${last}\nexit`)).toBe("[redacted]\nexit");
+      expect(scrubSecrets(`${BODY}\n${last}\n-----END PRIVATE KEY-----`)).toBe("[redacted]");
+    }
+  });
+
+  it("scrubs a long line of quoted credential names without slowing down", () => {
+    const command = JSON.stringify({ command: 'grep "TOKEN=" . '.repeat(3_000) });
+    expect(command.length).toBeGreaterThan(48_000);
+    const started = performance.now();
+    for (let run = 0; run < 3; run++) scrubSecrets(command);
+    expect(performance.now() - started).toBeLessThan(100);
   });
 });

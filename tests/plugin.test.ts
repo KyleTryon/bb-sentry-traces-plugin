@@ -1970,3 +1970,94 @@ describe("third review fixes", () => {
     expect(agents.map((span) => attr(span, "bb.turn.id"))).toEqual(["turn-1"]);
   }, 30_000);
 });
+
+describe("fourth review fixes", () => {
+  const P = "orchestrator";
+  const KEY = "run_42";
+  const turnIndexes = (spans: Array<{ name: string }>) =>
+    spans
+      .filter((span) => span.name.startsWith("invoke_agent"))
+      .map((span) => attr(span as never, "bb.turn.index"));
+
+  /** A finished turn with more events than one read covers. */
+  function longTurn(h: History, turnId: string) {
+    h.request(`${turnId}-req`).start(turnId, `${turnId}-req`);
+    for (let index = 0; index < 20_000; index++) {
+      h.item(turnId, { type: "commandExecution", id: `${turnId}-${index}`, command: "ls" }, 1);
+    }
+    h.complete(turnId);
+  }
+
+  it("sends a turn longer than one read, and the turns after it", async () => {
+    const { history: h, emit, spans } = await setup();
+    h.turn();
+    await emit("thread.idle");
+    longTurn(h, "long");
+    h.turn();
+    await emit("thread.idle");
+    expect(turnIndexes(spans())).toEqual([1, 2, 3]);
+    expect(spans().filter((span) => attr(span, "bb.turn.id") === "long").length).toBeGreaterThan(20_000);
+  }, 60_000);
+
+  it("starts a thread never sent before at its newest turn, past a turn longer than one read", async () => {
+    const { history: h, emit, spans } = await setup();
+    h.turn();
+    longTurn(h, "long");
+    h.turn();
+    h.turn();
+    await emit("thread.idle");
+    expect(turnIndexes(spans())).toEqual([4]);
+    h.turn();
+    await emit("thread.idle");
+    expect(turnIndexes(spans())).toEqual([4, 5]);
+  }, 60_000);
+
+  it("backs off for five minutes from when a slow call failed, not from when it began", async () => {
+    const { history, emit, clock, rpc } = await setup();
+    rpc.mockImplementationOnce(async () => {
+      clock.now += 60_000;
+      throw new Error("timed out");
+    });
+    history.turn();
+    await emit("thread.idle");
+    expect(rpc).toHaveBeenCalledTimes(1);
+    // Five and a half minutes after the call began, four and a half after it failed.
+    clock.now += 4.5 * 60_000;
+    history.turn();
+    await emit("thread.idle");
+    expect(rpc).toHaveBeenCalledTimes(1);
+  });
+
+  it("asks a provider on another contract once, not once for every thread", async () => {
+    const { histories, emit, rpc, spans } = await setup({
+      providers: { [P]: { contract: 2, contexts: { [THREAD]: { trace: { key: KEY } } } } },
+    });
+    for (const id of [THREAD, "thr_two", "thr_three"]) {
+      histories[id] ??= new History();
+      histories[id].turn();
+      await emit("thread.idle", id);
+    }
+    expect(rpc).toHaveBeenCalledTimes(1);
+    expect(turnIndexes(spans())).toEqual([1, 1, 1]);
+  });
+
+  it("sends a first turn's usage from a state that never read a total", async () => {
+    const { bb, history, emit, spans } = await setup();
+    // As left by a first export that failed before this state recorded what it knew.
+    await bb.storage.kv.set(`thread:${THREAD}`, {
+      sentTurn: 0,
+      resumeSeq: 0,
+      turnsBefore: 0,
+      usage: null,
+      usageKnown: false,
+      partial: null,
+      updatedAt: 0,
+    });
+    history.turn();
+    history.usage(CLAUDE_TOTAL);
+    await emit("thread.idle");
+    const withUsage = spans().filter((span) => attr(span, "gen_ai.usage.input_tokens") !== undefined);
+    expect(withUsage).toHaveLength(1);
+    expect(attr(withUsage[0], "gen_ai.usage.input_tokens")).toBe(10_100);
+  });
+});

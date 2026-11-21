@@ -608,6 +608,16 @@ export class TraceBuilder {
     this.indexOffset = options.indexOffset ?? 0;
   }
 
+  /** The top-level turn that is running as of the last event applied, if any. */
+  get runningTurn(): string | null {
+    return this.activeTurn;
+  }
+
+  /** Whether a top-level turn has started and not ended, as of the last event applied. */
+  isRunning(turnId: string): boolean {
+    return this.turns.get(turnId)?.end === null;
+  }
+
   apply(events: readonly TraceEvent[]): void {
     for (const event of events) {
       if (event.seq <= this.lastSeq) continue;

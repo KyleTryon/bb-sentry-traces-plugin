@@ -21,44 +21,91 @@ const ENV_LINE = new RegExp(
 );
 
 /**
- * Credential-like assignments anywhere in a line, as in `cd app && API_KEY=… npm
- * start` or a command inside one-line JSON. A quoted value (escaped quotes
- * too, as inside JSON) runs to its closing quote. An unquoted value runs to
- * whitespace, a quote or a shell separator; a backslash in it is part of it
- * unless it escapes a quote or is JSON's `\n`.
+ * The name and `=` of a credential-like assignment anywhere in a line, as in
+ * `cd app && API_KEY=… npm start` or a command inside one-line JSON.
  */
-const INLINE_ASSIGNMENT = new RegExp(
-  String.raw`((?<![A-Za-z0-9_])(?:export\s+)?[A-Za-z0-9_]*${CREDENTIAL_NAME}[A-Za-z0-9_]*=)(?!=)` +
-    String.raw`(?:(\\?"[^"\n]*?\\?"|\\?'[^'\n]*?\\?')|(?:[^\s"'\\&;|]|\\(?!["'nrt]))+)`,
+const INLINE_NAME = new RegExp(
+  String.raw`(?<![A-Za-z0-9_])(?:export\s+)?[A-Za-z0-9_]*${CREDENTIAL_NAME}[A-Za-z0-9_]*=(?!=)`,
   "gi",
 );
-
+/**
+ * An unquoted value: it runs to whitespace, a quote or a shell separator. A
+ * backslash is part of it unless it escapes a quote or is JSON's `\n`.
+ */
+const UNQUOTED_VALUE = /(?:[^\s"'\\&;|]|\\(?!["'nrt]))+/y;
 /** What follows a quote that closed a string: a gap, the end, or punctuation, never a value. */
 const AFTER_CLOSING_QUOTE = /^(?:\s|$|\\[nrt]|[)\]},;:|&<>])/;
+/** How far past its line a quoted value with no closing quote on that line is followed. */
+const MAX_VALUE_LINES_CHARS = 4_096;
 
 /**
- * Whether the quote that starts `quoted` opens a value. In `grep 'API_KEY=' src`
- * the quote after the `=` closes a string instead. It is taken to close one
- * only when both signs agree, so that a doubt redacts: an odd number of the
- * same kind of quote (escaped or not) comes before it on its line, and no
- * value starts right after it.
+ * Where the quote at `from` is closed before `limit`, as the index after the
+ * closing quote, or -1. An escaped quote (`\"`, as inside JSON) is closed by
+ * an escaped one; a plain quote by a plain one.
  */
-function opensValue(text: string, at: number, quoted: string): boolean {
-  const escaped = quoted.startsWith("\\");
-  const quote = quoted[escaped ? 1 : 0];
-  if (!AFTER_CLOSING_QUOTE.test(text.slice(at + (escaped ? 2 : 1), at + (escaped ? 4 : 3)))) return true;
-  let count = 0;
-  for (let index = text.lastIndexOf("\n", at - 1) + 1; index < at; index++) {
+function closingQuote(text: string, from: number, limit: number, quote: string, escaped: boolean): number {
+  for (let index = from; index < limit; index++) {
     if (text[index] !== quote) continue;
-    if ((text[index - 1] === "\\") === escaped) count++;
+    const afterBackslash = text[index - 1] === "\\" && text[index - 2] !== "\\";
+    if (afterBackslash === escaped) return index + 1;
   }
-  return count % 2 === 0;
+  return -1;
+}
+
+/**
+ * Where the value that starts at `at` ends, or `at` when there is none to
+ * redact. Nothing here guesses that a secret is not one:
+ *
+ * - a quote closed later on the line: the value runs through that quote,
+ *   whatever is between them. In `grep "KEY=" x && PASSWORD=p run "y"` that
+ *   takes too much, and takes the password with it;
+ * - a quote never closed on its line: a value that starts right after it runs
+ *   to its closing quote on a later line, or else to the end of its line;
+ * - a quote never closed with nothing after it, as in `grep 'API_KEY=' src`:
+ *   that quote closed a string, and there is no value.
+ */
+function inlineValueEnd(text: string, at: number, lineEnd: number): number {
+  const escaped = text[at] === "\\" && (text[at + 1] === '"' || text[at + 1] === "'");
+  const quote = text[escaped ? at + 1 : at];
+  if (quote !== '"' && quote !== "'") {
+    UNQUOTED_VALUE.lastIndex = at;
+    return UNQUOTED_VALUE.test(text) ? UNQUOTED_VALUE.lastIndex : at;
+  }
+  const open = at + (escaped ? 2 : 1);
+  const closed = closingQuote(text, open, lineEnd, quote, escaped);
+  if (closed !== -1) return closed;
+  if (AFTER_CLOSING_QUOTE.test(text.slice(open, open + 2))) return at;
+  if (escaped) {
+    // Inside a JSON string that ends before the value's quote does: up to that string's end.
+    const stringEnd = closingQuote(text, open, lineEnd, quote, false);
+    return stringEnd !== -1 ? stringEnd - 1 : lineEnd;
+  }
+  const later = closingQuote(text, lineEnd, Math.min(text.length, lineEnd + MAX_VALUE_LINES_CHARS), quote, false);
+  return later !== -1 ? later : lineEnd;
 }
 
 function scrubInlineAssignments(text: string): string {
-  return text.replace(INLINE_ASSIGNMENT, (match, name: string, quoted: string | undefined, at: number) =>
-    quoted !== undefined && !opensValue(text, at + name.length, quoted) ? match : `${name}${REDACTED}`,
-  );
+  let out = "";
+  let done = 0;
+  let lineEnd = -1;
+  INLINE_NAME.lastIndex = 0;
+  for (let match = INLINE_NAME.exec(text); match; match = INLINE_NAME.exec(text)) {
+    const at = match.index + match[0].length;
+    if (at > lineEnd) {
+      lineEnd = text.indexOf("\n", at);
+      if (lineEnd === -1) lineEnd = text.length;
+    }
+    const end = inlineValueEnd(text, at, lineEnd);
+    if (end === at) {
+      // No value: go on right after any quote here, so nothing behind it is skipped.
+      INLINE_NAME.lastIndex = at;
+      continue;
+    }
+    out += text.slice(done, at) + REDACTED;
+    done = end;
+    INLINE_NAME.lastIndex = end;
+  }
+  return done === 0 ? text : out + text.slice(done);
 }
 
 /** Quoted credential-like keys with quoted values, as in JSON, YAML or code: `"apiKey": "…"`. */
@@ -113,11 +160,27 @@ function skipGapBack(text: string, at: number): number {
   }
 }
 
+const LINE_BREAK = /[\r\n]|\\[nr]/;
+
+/** Whether only spaces and tabs sit between `at` and the end of its line. */
+function endsLine(text: string, at: number): boolean {
+  while (text[at] === " " || text[at] === "\t") at++;
+  return at >= text.length || LINE_BREAK.test(text.slice(at, at + 2));
+}
+
+/** Whether only spaces and tabs sit between the start of its line and `at`. */
+function startsLine(text: string, at: number): boolean {
+  while (text[at - 1] === " " || text[at - 1] === "\t") at--;
+  if (at === 0 || text[at - 1] === "\n" || text[at - 1] === "\r") return true;
+  return text[at - 2] === "\\" && (text[at - 1] === "n" || text[at - 1] === "r");
+}
+
 /** Where the key body that follows a BEGIN marker ends, or -1 when none follows. */
 function keyBodyEnd(text: string, from: number): number {
   let at = from;
   let end = -1;
   let long = false;
+  let afterLong = false;
   for (;;) {
     const start = skipGap(text, at);
     if (start === at) break;
@@ -131,8 +194,12 @@ function keyBodyEnd(text: string, from: number): number {
     let stop = start;
     while (stop < text.length && KEY_CHAR.test(text[stop])) stop++;
     const piece = text.slice(start, stop);
-    if (!piece || !isKeyBody(piece)) break;
-    long ||= piece.length >= LONG_KEY_PIECE;
+    // A key's last line can be short and look like a word. Alone on the line
+    // right after a long line of body, it is taken to be that last line.
+    const lastLine = afterLong && LINE_BREAK.test(text.slice(at, start)) && endsLine(text, stop);
+    if (!piece || !(isKeyBody(piece) || lastLine)) break;
+    afterLong = piece.length >= LONG_KEY_PIECE;
+    long ||= afterLong;
     end = at = stop;
   }
   return long ? end : -1;
@@ -143,6 +210,7 @@ function keyBodyStart(text: string, to: number): number {
   let at = to;
   let start = -1;
   let long = false;
+  let nearest = true;
   for (;;) {
     const stop = skipGapBack(text, at);
     if (stop === at) break;
@@ -151,7 +219,10 @@ function keyBodyStart(text: string, to: number): number {
     // The `n` of a JSON `\n` is a line break, not the piece's first character.
     if (first > 0 && first < stop && text[first - 1] === "\\" && "nrt".includes(text[first])) first++;
     const piece = text.slice(first, stop);
-    if (!piece || !isKeyBody(piece)) break;
+    // The line just before the marker is the key's last line, short or not.
+    const lastLine = nearest && LINE_BREAK.test(text.slice(stop, at)) && startsLine(text, first);
+    if (!piece || !(isKeyBody(piece) || lastLine)) break;
+    nearest = false;
     long ||= piece.length >= LONG_KEY_PIECE;
     start = at = first;
   }
