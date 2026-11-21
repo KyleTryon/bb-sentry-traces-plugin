@@ -58,6 +58,7 @@ const spanSchema = z
     content: attributeMap,
     workflowRunId: optionalText,
     workflowName: optionalText,
+    final: z.boolean().nullish(),
   })
   .loose();
 

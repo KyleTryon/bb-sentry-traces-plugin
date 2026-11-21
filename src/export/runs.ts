@@ -7,7 +7,7 @@ import { placeWorkflow } from "./location.js";
 import { resourceOf } from "./settings.js";
 import { entries, kv, recordFailure, recordSuccess, trim } from "./store.js";
 import { type ExportContext, type ExportSettings, type TraceEntry, type TraceRef, type WorkflowEntry } from "./types.js";
-import { deletedTraceSpans, providerSpans } from "../integrations/providers/spans.js";
+import { deletedTraceSpans, keysToSend, providerSpans } from "../integrations/providers/spans.js";
 import { type TraceContext } from "../integrations/providers/types.js";
 import { type WorkflowContext } from "../integrations/workflows/ids.js";
 import { workflowEnded } from "../integrations/workflows/schema.js";
@@ -35,7 +35,12 @@ export async function noteTrace(ctx: ExportContext, trace: TraceContext): Promis
   await trim<TraceEntry>(ctx, TRACE_PREFIX, MAX_RUN_ENTRIES, (entry) => entry.firstSeenAt);
 }
 
-/** Sends the root and structure of every remembered provider trace that has ended, once. */
+/**
+ * Sends what is due of every remembered provider trace: while it is open, the
+ * spans its provider says are final and were not sent yet; once it has ended,
+ * the rest, its root included. A trace still open after `OPEN_RUN_KEEP_MS` is
+ * sent as it stands, its root marked `bb.trace.state: "open"`.
+ */
 export async function sweepTraces(
   ctx: ExportContext,
   settings: ExportSettings,
@@ -44,29 +49,44 @@ export async function sweepTraces(
   for (const [id, entry] of Object.entries(await traceEntries(ctx))) {
     const key = TRACE_PREFIX + id;
     const now = ctx.now();
-    if (entry.sentAt !== null || now - entry.firstSeenAt > OPEN_RUN_KEEP_MS) {
-      if (entry.sentAt === null || now - entry.sentAt > SENT_RUN_KEEP_MS) await kv(ctx).delete(key);
+    if (entry.sentAt !== null) {
+      if (now - entry.sentAt > SENT_RUN_KEEP_MS) await kv(ctx).delete(key);
       continue;
     }
+    const expired = now - entry.firstSeenAt > OPEN_RUN_KEEP_MS;
     const trace = await ctx.providers.trace(entry.provider, entry.traceKey, settings.captureContent);
-    // No answer: ask again later. Not ended: its root waits.
-    if (trace === undefined || (trace !== null && !trace.ended)) continue;
+    if (trace === undefined) {
+      // No answer: ask again later, unless it has been open too long to wait for.
+      if (expired) await kv(ctx).delete(key);
+      continue;
+    }
+    const sent = new Set(entry.sentKeys ?? []);
+    const ended = trace === null || trace.ended || expired;
+    const keys = trace === null ? new Set<string>() : keysToSend(trace, sent, ended);
+    // Nothing new is final yet: the rest waits for the end.
+    if (!ended && keys.size === 0) continue;
     const spans =
       trace === null
         ? deletedTraceSpans(entry, { from: entry.firstSeenAt, to: now })
-        : providerSpans(entry, trace, settings.captureContent);
+        : providerSpans(entry, trace, settings.captureContent, {
+            only: keys,
+            rootAttributes: trace.ended ? {} : { "bb.trace.state": "open" },
+          });
+    const done: TraceEntry = ended
+      ? { ...entry, sentAt: now, sentKeys: null }
+      : { ...entry, sentKeys: [...sent, ...keys] };
     const result = await sendSpans(target, spans, resourceOf(settings), ctx.fetch);
     if (!result.ok) {
       ctx.bb.log.warn(`Could not send trace ${id}: ${result.message}`);
       await recordFailure(ctx, result.message);
       // Refused as it is: it would be refused again, so it is given up.
-      if (result.payloadRejected) await kv(ctx).set(key, { ...entry, sentAt: now } satisfies TraceEntry);
+      if (result.payloadRejected) await kv(ctx).set(key, done);
       // A refused key refuses everything else too: try again next time.
       else if (!result.retryable) return;
       continue;
     }
-    await kv(ctx).set(key, { ...entry, sentAt: now } satisfies TraceEntry);
-    await recordSuccess(ctx, { turns: 0, spans: result.spans, traces: 1 });
+    await kv(ctx).set(key, done);
+    await recordSuccess(ctx, { turns: 0, spans: result.spans, traces: ended ? 1 : 0 });
   }
 }
 

@@ -176,6 +176,7 @@ Output: the trace, or `"trace": null` when you have no such trace.
         "name": "decide typesafe/jev-1.13",
         "op": "gen_ai.decide",
         "kind": "client",
+        "final": true,
         "start": 1800000050000,
         "end": 1800000050420,
         "attributes": {
@@ -202,7 +203,7 @@ Output: the trace, or `"trace": null` when you have no such trace.
 
 | Field | Required | Meaning |
 | --- | --- | --- |
-| `ended` | yes | Whether the trace has ended. The plugin sends a trace's spans once, when this is `true`. |
+| `ended` | yes | Whether the trace has ended. The plugin sends the spans not sent yet, and the root, once, when this is `true`. |
 | `pipeline`, `attributes` | optional | As in the thread context; they apply to every span. |
 | `spans[].key` | yes | Your id for the span, unique in the trace. Thread contexts and other spans refer to it. |
 | `spans[].parentKey` | optional | The parent span's key. Missing or unknown means the root. |
@@ -216,6 +217,7 @@ Output: the trace, or `"trace": null` when you have no such trace.
 | `spans[].attributes` | optional | The span's attributes. |
 | `spans[].content` | optional | Attributes that hold user or model text. See [Content](#content). |
 | `spans[].workflowName`, `.workflowRunId` | optional | The bb Workflows run this span started, by the name its script declares or by its run id. See [Workflow runs](#workflow-runs). |
+| `spans[].final` | optional | `true` when the span will not change again, so it can be sent before the trace ends. See [When the trace is sent](#when-the-trace-is-sent). |
 
 At most 2,000 spans.
 
@@ -228,8 +230,22 @@ makes one that covers the other spans.
 ### When the trace is sent
 
 The plugin asks for a trace about once a minute after it first exports a
-thread that belongs to it, and sends the spans once `ended` is `true`. It then
-stops asking. A trace that never ends is dropped after 30 days.
+thread that belongs to it.
+
+- While the trace is open, it sends each span marked `"final": true` that it
+  has not sent yet, once. Mark a span final only when nothing about it will
+  change: Sentry keeps the first copy it gets. The root is never sent early,
+  even when marked final, since it covers the whole trace.
+- Once `ended` is `true`, it sends every span not sent yet, and the root, and
+  stops asking.
+- A trace still open 30 days after it was first seen is sent as it stands,
+  with its root marked `bb.trace.state: "open"`, and is not asked about again.
+
+A span sent early keeps its parent, even when the parent is sent later.
+
+Mark a span final when it records something that happened, such as a model
+call, a check or a choice. Spans whose times or state still move, such as a
+step in progress, should wait for the end.
 
 Thread turns are sent as they finish, before the trace's own spans. Until the
 trace ends, it has no root in Sentry.

@@ -74,7 +74,10 @@ export interface TraceRef {
 /** A provider trace whose own spans still have to be sent when it ends. */
 export interface TraceEntry extends TraceRef {
   firstSeenAt: number;
+  /** When the rest of its spans were sent, at its end. */
   sentAt: number | null;
+  /** The keys of the spans already sent before the trace ended, because its provider said they were final. */
+  sentKeys?: string[] | null;
 }
 
 /** A workflow run whose own spans still have to be sent when it ends. */

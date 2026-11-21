@@ -154,7 +154,7 @@ decisions:
 
 ```
 <provider's root span>                    sent when the trace ends
-├─ <provider's spans>                     steps, decisions, checks, …
+├─ <provider's spans>                     steps, decisions, checks, … (final ones sent early)
 │   └─ invoke_workflow <script>           a workflow run a span names
 │       └─ workflow.call <n>
 │           └─ invoke_agent <agent>       worker thread turns
@@ -174,9 +174,13 @@ spans to your Sentry project.
   (`claude-code`).
 - **Each thread keeps its own conversation**, and every span carries
   `bb.trace.provider`, `bb.trace.key` and the provider's own attributes.
-- **A provider's trace is sent once, when the provider says it has ended.**
-  Until then the trace has no root. A turn that starts in a thread after its
-  trace ended gets its own trace.
+- **A provider's spans are sent as they settle.** A span the provider marks
+  `final`, such as a model call it made, is sent within a minute or so, even
+  while the trace is open. The rest, and the root, are sent once when the
+  provider says the trace has ended; until then the trace has no root. A
+  trace still open after 30 days is sent as it stands, its root marked
+  `bb.trace.state: "open"`. A turn that starts in a thread after its trace
+  ended gets its own trace.
 - **Workflow workers need no provider answer.** A worker takes its trace from
   the thread that started its workflow, and hangs under its workflow call.
 - **Provider input is checked.** Attributes must be plain scalars, are capped

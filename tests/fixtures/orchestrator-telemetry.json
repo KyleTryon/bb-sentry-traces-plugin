@@ -1,18 +1,18 @@
 {
   "coordinatorThreadId": "thr_2",
   "workerThreadId": "thr_5",
-  "scriptName": "orch-run-0309b64b-b-develop-1",
+  "scriptName": "orch-run-c2c691a0-b-develop-1",
   "contexts": {
     "contract": 1,
     "contexts": {
       "thr_5": null,
       "thr_2": {
         "trace": {
-          "key": "run_0309b64b-b",
+          "key": "run_c2c691a0-b",
           "endedAt": null,
           "pipeline": "task-loop",
           "attributes": {
-            "orchestrator.run_id": "run_0309b64b-b",
+            "orchestrator.run_id": "run_c2c691a0-b",
             "orchestrator.workflow_id": "task-loop",
             "orchestrator.task_key": "TASK-1"
           }
@@ -31,11 +31,11 @@
   "trace": {
     "contract": 1,
     "trace": {
-      "key": "run_0309b64b-b",
+      "key": "run_c2c691a0-b",
       "ended": false,
       "pipeline": "task-loop",
       "attributes": {
-        "orchestrator.run_id": "run_0309b64b-b",
+        "orchestrator.run_id": "run_c2c691a0-b",
         "orchestrator.workflow_id": "task-loop",
         "orchestrator.task_key": "TASK-1"
       },
@@ -45,97 +45,126 @@
           "parentKey": null,
           "name": "orchestrator.run task-loop",
           "op": "orchestrator.run",
-          "start": 1795228462423,
-          "end": 1795228462650,
+          "start": 1795303414915,
+          "end": 1795303415112,
           "status": "ok",
           "kind": "internal",
           "attributes": {
-            "orchestrator.run_id": "run_0309b64b-b",
+            "orchestrator.run_id": "run_c2c691a0-b",
             "orchestrator.workflow_id": "task-loop",
             "orchestrator.task_key": "TASK-1",
             "orchestrator.state": "active",
             "orchestrator.attempts_used": 1,
             "orchestrator.failures": 1,
             "orchestrator.coordinator_thread_id": "thr_2"
-          }
+          },
+          "final": false
         },
         {
-          "key": "step:run_0309b64b-b#develop#1",
+          "key": "step:run_c2c691a0-b#develop#1",
           "parentKey": "root",
           "name": "orchestrator.step develop#1",
           "op": "orchestrator.step",
-          "start": 1795228462607,
-          "end": 1795228462607,
+          "start": 1795303415076,
+          "end": 1795303415076,
           "status": "ok",
           "kind": "internal",
           "attributes": {
-            "orchestrator.run_id": "run_0309b64b-b",
+            "orchestrator.run_id": "run_c2c691a0-b",
             "orchestrator.workflow_id": "task-loop",
             "orchestrator.task_key": "TASK-1",
             "orchestrator.step": "develop",
             "orchestrator.attempt": 1,
-            "orchestrator.attempt_id": "run_0309b64b-b#develop#1",
+            "orchestrator.attempt_id": "run_c2c691a0-b#develop#1",
             "orchestrator.state": "done",
             "orchestrator.agent_id": "developer"
           },
-          "workflowName": "orch-run-0309b64b-b-develop-1"
+          "workflowName": "orch-run-c2c691a0-b-develop-1",
+          "final": false
         },
         {
           "key": "pick:2",
           "parentKey": "root",
           "name": "orchestrator.pick developer",
           "op": "orchestrator.pick",
-          "start": 1795228462604,
-          "end": 1795228462604,
+          "start": 1795303415074,
+          "end": 1795303415074,
           "status": "ok",
           "kind": "internal",
           "attributes": {
-            "orchestrator.run_id": "run_0309b64b-b",
+            "orchestrator.run_id": "run_c2c691a0-b",
             "orchestrator.workflow_id": "task-loop",
             "orchestrator.task_key": "TASK-1",
             "orchestrator.agent_id": "developer",
             "orchestrator.pick.provider_id": "prov-a",
             "orchestrator.pick.model": "model-a2",
             "orchestrator.pick.reasoning_level": "medium"
-          }
+          },
+          "final": true
         },
         {
           "key": "pick:3",
           "parentKey": "root",
           "name": "orchestrator.pick reviewer",
           "op": "orchestrator.pick",
-          "start": 1795228462605,
-          "end": 1795228462605,
+          "start": 1795303415074,
+          "end": 1795303415074,
           "status": "ok",
           "kind": "internal",
           "attributes": {
-            "orchestrator.run_id": "run_0309b64b-b",
+            "orchestrator.run_id": "run_c2c691a0-b",
             "orchestrator.workflow_id": "task-loop",
             "orchestrator.task_key": "TASK-1",
             "orchestrator.agent_id": "reviewer",
             "orchestrator.pick.provider_id": "prov-b",
             "orchestrator.pick.model": "model-b1",
             "orchestrator.pick.reasoning_level": "high"
-          }
+          },
+          "final": true
+        },
+        {
+          "key": "decision:1",
+          "parentKey": "root",
+          "name": "decide jev",
+          "op": "gen_ai.decide",
+          "start": 1795303415011,
+          "end": 1795303415012,
+          "status": "ok",
+          "kind": "client",
+          "attributes": {
+            "orchestrator.run_id": "run_c2c691a0-b",
+            "orchestrator.workflow_id": "task-loop",
+            "orchestrator.task_key": "TASK-1",
+            "gen_ai.operation.name": "decide",
+            "gen_ai.provider.name": "typesafe",
+            "gen_ai.request.model": "jev-test",
+            "gen_ai.usage.input_tokens": 120,
+            "gen_ai.usage.output_tokens": 8,
+            "gen_ai.usage.total_tokens": 128,
+            "orchestrator.decision.point": "risk-check",
+            "orchestrator.decision.via": "jev"
+          },
+          "final": true
         },
         {
           "key": "verify:1",
-          "parentKey": "step:run_0309b64b-b#develop#1",
+          "parentKey": "step:run_c2c691a0-b#develop#1",
           "name": "orchestrator.verify",
           "op": "orchestrator.verify",
-          "start": 1795228462642,
-          "end": 1795228462642,
+          "start": 1795303415105,
+          "end": 1795303415105,
           "status": "error",
           "errorType": "verify_failed",
           "kind": "internal",
           "attributes": {
-            "orchestrator.run_id": "run_0309b64b-b",
+            "orchestrator.run_id": "run_c2c691a0-b",
             "orchestrator.workflow_id": "task-loop",
             "orchestrator.task_key": "TASK-1",
-            "orchestrator.attempt_id": "run_0309b64b-b#develop#1",
+            "orchestrator.attempt_id": "run_c2c691a0-b#develop#1",
             "orchestrator.verify.passed": false,
-            "process.exit.code": 0
-          }
+            "process.exit.code": 1
+          },
+          "final": true
         }
       ]
     }

@@ -1173,6 +1173,94 @@ describe("trace providers", () => {
     expect(await bb.storage.kv.list("trace:")).toEqual([`trace:${P}/${KEY}`]);
   });
 
+  it("sends the spans a provider says are final before the trace ends, each once", async () => {
+    let ended = false;
+    let spansNow: unknown[] = [span("decision-1", { final: true, op: "gen_ai.decide", kind: "client" })];
+    const { bb, history, emit, tick, sent } = await setup({
+      providers: { [P]: { contexts: { [THREAD]: context() }, trace: () => trace(ended, spansNow) } },
+    });
+    history.turn();
+    await emit("thread.idle");
+    const before = sent.length;
+
+    // A final span goes out while the trace is open, under the root still to come.
+    await tick();
+    expect(sent).toHaveLength(before + 1);
+    const early = must(sent.at(-1), "early request").spans;
+    expect(names(early)).toEqual(["decision-1"]);
+    expect(must(early[0], "decision span").parentSpanId).toBe(providerSpanId(P, KEY, "root"));
+    expect(must(early[0], "decision span").traceId).toBe(providerTraceId(P, KEY));
+    // Nothing new: nothing is sent.
+    await tick();
+    expect(sent).toHaveLength(before + 1);
+
+    // A span that may still change waits for the end.
+    spansNow = [
+      ...spansNow,
+      span("step-1", { final: false }),
+      span("verify-1", { parentKey: "step-1", final: true }),
+    ];
+    const provider = (await bb.storage.kv.get(`trace:${P}/${KEY}`)) as { sentKeys: string[] };
+    expect(provider.sentKeys).toEqual(["decision-1"]);
+    await tick();
+    expect(sent).toHaveLength(before + 2);
+    const second = must(sent.at(-1), "second request").spans;
+    expect(names(second)).toEqual(["verify-1"]);
+    // Linked to its parent, though that parent is not sent yet.
+    expect(must(second[0], "verify span").parentSpanId).toBe(providerSpanId(P, KEY, "step-1"));
+
+    // At the end, the rest: the root and what was not final.
+    ended = true;
+    await tick();
+    expect(sent).toHaveLength(before + 3);
+    expect(names(must(sent.at(-1), "last request").spans)).toEqual(["orchestrator.run feature", "step-1"]);
+    expect(await bb.storage.kv.get(`trace:${P}/${KEY}`)).toMatchObject({ sentAt: expect.any(Number) as unknown });
+    await tick();
+    expect(sent).toHaveLength(before + 3);
+  });
+
+  it("never sends a root early, even one marked final", async () => {
+    const { history, emit, tick, sent } = await setup({
+      providers: {
+        [P]: {
+          contexts: { [THREAD]: context() },
+          trace: () => ({
+            key: KEY,
+            ended: false,
+            spans: [span("root", { parentKey: null, name: "orchestrator.run feature", final: true }), span("pick-1", { final: true })],
+          }),
+        },
+      },
+    });
+    history.turn();
+    await emit("thread.idle");
+    const before = sent.length;
+    await tick();
+    expect(names(must(sent.at(-1), "request").spans)).toEqual(["pick-1"]);
+    expect(sent).toHaveLength(before + 1);
+  });
+
+  it("sends a trace still open after 30 days as it stands, its root marked open", async () => {
+    const { bb, history, emit, tick, sent, clock } = await setup({
+      providers: {
+        [P]: { contexts: { [THREAD]: context() }, trace: () => trace(false, [span("step-1")]) },
+      },
+    });
+    history.turn();
+    await emit("thread.idle");
+    const before = sent.length;
+    await tick();
+    expect(sent).toHaveLength(before);
+    clock.now += 31 * 24 * 60 * 60_000;
+    await tick();
+    expect(sent).toHaveLength(before + 1);
+    const structure = must(sent.at(-1), "request").spans;
+    expect(names(structure)).toEqual(["orchestrator.run feature", "step-1"]);
+    expect(attr(must(structure[0], "root span"), "bb.trace.state")).toBe("open");
+    expect(attr(must(structure[1], "step span"), "bb.trace.state")).toBeUndefined();
+    expect(await bb.storage.kv.get(`trace:${P}/${KEY}`)).toMatchObject({ sentAt: expect.any(Number) as unknown });
+  });
+
   it("gives a trace its provider deleted a root, then stops asking about it", async () => {
     let gone = false;
     const { bb, history, emit, tick, sent, rpc } = await setup({
@@ -1507,8 +1595,9 @@ describe("trace providers", () => {
 });
 
 describe("the Orchestrator's real answers", () => {
-  // Captured from the Orchestrator plugin's own test world, unedited: a
-  // task-loop run with one dispatched attempt, two model picks and a verify.
+  // Captured from the Orchestrator plugin's own test world, unedited: an open
+  // task-loop run with a Jev decision, one dispatched attempt, two model picks
+  // and a verify.
   const real = JSON.parse(
     readFileSync(new URL("./fixtures/orchestrator-telemetry.json", import.meta.url), "utf8"),
   ) as {
@@ -1516,9 +1605,36 @@ describe("the Orchestrator's real answers", () => {
     workerThreadId: string;
     scriptName: string;
     contexts: { contexts: Record<string, { trace: { key: string } } | null> };
-    trace: { trace: { key: string; spans: Array<{ key: string; name: string }> } };
+    trace: { trace: { key: string; spans: Array<{ key: string; name: string; op: string; final?: boolean }> } };
   };
   const KEY = real.trace.trace.key;
+
+  it("send the run's Jev decision, picks and verify while the run is still open", async () => {
+    const coordinator = real.coordinatorThreadId;
+    const { histories, emit, tick, sent } = await setup({
+      providers: { [P]: { contexts: real.contexts.contexts, trace: () => real.trace.trace } },
+    });
+    histories[coordinator] = new History();
+    must(histories[coordinator], coordinator).turn();
+    await emit("thread.idle", coordinator);
+    const before = sent.length;
+    await tick();
+    expect(sent).toHaveLength(before + 1);
+    const early = must(sent.at(-1), "early request").spans;
+    expect(early.map((span) => attr(span, "sentry.op")).sort((a, b) => String(a).localeCompare(String(b)))).toEqual([
+      "gen_ai.decide",
+      "orchestrator.pick",
+      "orchestrator.pick",
+      "orchestrator.verify",
+    ]);
+    const decide = must(
+      early.find((span) => attr(span, "sentry.op") === "gen_ai.decide"),
+      "decide span",
+    );
+    expect(decide.kind).toBe(3);
+    expect(attr(decide, "gen_ai.request.model")).toBe("jev-test");
+    expect(attr(decide, "gen_ai.usage.input_tokens")).toBe(120);
+  });
 
   it("are accepted as they are, and place a run's threads and workflow", async () => {
     const coordinator = real.coordinatorThreadId;
