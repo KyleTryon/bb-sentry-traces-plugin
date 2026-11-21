@@ -64,8 +64,9 @@ export function parseRawUsage(value: Json): RawUsage | null {
 export function usageDelta(current: RawUsage, previous: RawUsage | null): RawUsage | null {
   if (!previous) return current;
   const sub = (a: number, b: number) => a - b;
+  // A split the earlier total did not have is unknown for this stretch, not all new.
   const optional = (a: number | null, b: number | null) =>
-    a === null ? null : sub(a, b ?? 0);
+    a === null || b === null ? null : sub(a, b);
   const delta: RawUsage = {
     totalTokens: sub(current.totalTokens, previous.totalTokens),
     inputTokens: sub(current.inputTokens, previous.inputTokens),

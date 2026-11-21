@@ -1573,3 +1573,160 @@ describe("bb sentry-traces", () => {
     expect(unknown.stderr).toContain("No thread with id thr_missing");
   });
 });
+
+describe("second review fixes", () => {
+  const P = "orchestrator";
+  const KEY = "run_42";
+
+  it("keeps the end of a long reply and the true size of each cut", async () => {
+    const { history, emit, spans } = await setup({ settings: { captureContent: true } });
+    history.request("req-1").start("turn-1", "req-1");
+    history.item(
+      "turn-1",
+      { type: "toolCall", id: "t1", tool: "mcp__docs__search", arguments: { query: "q".repeat(6_000) } },
+      100,
+      { result: "r".repeat(6_000) },
+    );
+    history.item("turn-1", { type: "agentMessage", id: "m1", text: `${"a".repeat(20_000)}THE-END` }, 100);
+    history.complete("turn-1");
+    await emit("thread.idle");
+
+    const chat = spans().find((span) => attr(span, "gen_ai.output.messages") !== undefined)!;
+    const output = String(attr(chat, "gen_ai.output.messages"));
+    expect(output).toContain("THE-END");
+    expect(output).toContain("[… 4007 earlier characters cut]");
+    const tool = spans().find((span) => span.name === "execute_tool mcp__docs__search")!;
+    expect(String(attr(tool, "gen_ai.tool.call.arguments"))).toMatch(/\[… 2012 more characters cut\]$/);
+    expect(String(attr(tool, "gen_ai.tool.call.result"))).toMatch(/\[… 2000 more characters cut\]$/);
+  });
+
+  it("sends a failed first turn with the next one, not just the next one", async () => {
+    let status = 503;
+    const { history, emit, spans } = await setup({ respond: () => status });
+    await emit("thread.active");
+    history.turn();
+    await emit("thread.idle");
+    expect(spans()).toHaveLength(0);
+    status = 200;
+    history.turn();
+    await emit("thread.idle");
+    const agents = spans().filter((span) => span.name.startsWith("invoke_agent"));
+    expect(agents.map((span) => attr(span, "bb.turn.index"))).toEqual([1, 2]);
+  });
+
+  it("sends the newest turn of a long thread when the read ends right after it", async () => {
+    const { history: h, emit, spans } = await setup();
+    // 4 + 2 × 19,998 = 40,000 events: exactly one read, ending at the turn's end.
+    h.request("req-1").start("t1", "req-1");
+    for (let index = 0; index < 19_998; index++) {
+      h.item("t1", { type: "commandExecution", id: `c${index}`, command: "ls" }, 1);
+    }
+    h.complete("t1");
+    for (let index = 0; index < 5; index++) {
+      h.push("thread/contextWindowUsage/updated", { contextWindowUsage: { usedTokens: index } });
+    }
+    await emit("thread.idle");
+    const agents = spans().filter((span) => span.name.startsWith("invoke_agent"));
+    expect(agents.map((span) => attr(span, "bb.turn.id"))).toEqual(["t1"]);
+  }, 30_000);
+
+  it.each(["local_agent", "local_subagent"])(
+    "waits for a background subagent (%s) that outlives its turn, then sends its real end",
+    async (taskType) => {
+      const { bb, history, emit, tick, clock, spans } = await setup();
+      history.request("req-1").start("turn-1", "req-1");
+      const agentCall = {
+        type: "toolCall",
+        id: "agent-1",
+        tool: "Agent",
+        arguments: { subagent_type: "Explore", run_in_background: true },
+      };
+      history.push("item/started", { item: { ...agentCall, status: "pending" } }, "turn-1");
+      history.push("turn/started", { parentToolCallId: "agent-1" }, "sub-turn");
+      history.push("item/completed", { item: { ...agentCall, status: "completed" } }, "turn-1");
+      const task = { type: "backgroundTask", id: "task-1", taskType, parentToolCallId: "agent-1" };
+      history.push("item/backgroundTask/progress", { item: { ...task, status: "pending" } }, "turn-1");
+      history.complete("turn-1");
+      await emit("thread.idle");
+      expect(spans()).toHaveLength(0);
+      expect(await bb.storage.kv.get(`retry:${THREAD}`)).toMatchObject({ attempts: 0 });
+
+      history.wait(60_000);
+      history.item("sub-turn", { type: "commandExecution", id: "sub-cmd", command: "ls" }, 200);
+      history.push("turn/completed", { status: "completed" }, "sub-turn");
+      const done = history.push("item/backgroundTask/completed", {
+        item: { ...task, status: "completed", usage: { totalTokens: 1_234 } },
+      });
+      clock.now += 20 * 60_000;
+      await tick();
+
+      const agent = spans().find((span) => span.name === "invoke_agent Explore")!;
+      expect(agent).toBeDefined();
+      expect(attr(agent, "bb.span.running")).toBeUndefined();
+      expect(attr(agent, "bb.span.status")).toBe("completed");
+      expect(attr(agent, "bb.subagent.tokens")).toBe(1_234);
+      expect(Number(agent.endTimeUnixNano)).toBe(done.createdAt * 1_000_000);
+      expect(spans().some((span) => span.name === "execute_tool Background")).toBe(false);
+      expect(await bb.storage.kv.list("retry:")).toEqual([]);
+    },
+  );
+
+  it("sends a turn whose background subagent never reports back once the wait is over", async () => {
+    const { history, emit, tick, clock, spans } = await setup();
+    history.request("req-1").start("turn-1", "req-1");
+    const agentCall = { type: "toolCall", id: "agent-1", tool: "Agent", arguments: { run_in_background: true } };
+    history.push("item/started", { item: { ...agentCall, status: "pending" } }, "turn-1");
+    history.push("item/completed", { item: { ...agentCall, status: "completed" } }, "turn-1");
+    const task = { type: "backgroundTask", id: "task-1", taskType: "local_agent", parentToolCallId: "agent-1" };
+    history.push("item/backgroundTask/progress", { item: { ...task, status: "pending" } }, "turn-1");
+    history.complete("turn-1");
+    await emit("thread.idle");
+    expect(spans()).toHaveLength(0);
+    clock.now += 3 * 60 * 60_000;
+    await tick();
+    const agent = spans().find((span) => span.name === "invoke_agent subagent")!;
+    expect(attr(agent, "bb.span.running")).toBe(true);
+  });
+
+  it("waits out a provider that stops answering instead of moving its thread out of its trace", async () => {
+    const orchestrator = { contexts: { [THREAD]: { trace: { key: KEY } } } };
+    const providers: Record<string, typeof orchestrator> = { [P]: orchestrator };
+    const { history, emit, tick, clock, spans } = await setup({ providers });
+    history.turn();
+    await emit("thread.idle");
+    const traceId = providerTraceId(P, KEY);
+    expect(new Set(spans().map((span) => span.traceId))).toEqual(new Set([traceId]));
+
+    // The provider reloads and misses one call.
+    delete providers[P];
+    history.turn();
+    await emit("thread.idle");
+    const before = spans().length;
+    providers[P] = orchestrator;
+    clock.now += 6 * 60_000;
+    await tick();
+    const later = spans().slice(before);
+    expect(later.length).toBeGreaterThan(0);
+    expect(new Set(later.map((span) => span.traceId))).toEqual(new Set([traceId]));
+    expect(later.some((span) => attr(span, "bb.turn.index") === 2)).toBe(true);
+  });
+
+  it("takes a provider that stays gone to be gone, and exports on its own", async () => {
+    const orchestrator = { contexts: { [THREAD]: { trace: { key: KEY } } } };
+    const providers: Record<string, typeof orchestrator> = { [P]: orchestrator };
+    const { history, emit, tick, clock, spans } = await setup({ providers });
+    history.turn();
+    await emit("thread.idle");
+    delete providers[P];
+    history.turn();
+    await emit("thread.idle");
+    const before = spans().length;
+    for (let step = 0; step < 8; step++) {
+      clock.now += 6 * 60_000;
+      await tick();
+    }
+    const later = spans().slice(before);
+    expect(later.length).toBeGreaterThan(0);
+    expect(later.some((span) => span.traceId === providerTraceId(P, KEY))).toBe(false);
+  });
+});

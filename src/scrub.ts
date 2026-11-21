@@ -20,6 +20,18 @@ const ENV_LINE = new RegExp(
   "i",
 );
 
+/**
+ * Credential-like assignments anywhere in a line, as in `cd app && API_KEY=… npm
+ * start` or a command inside one-line JSON. The value runs to whitespace, a
+ * quote, or a shell separator; a quoted value (escaped quotes too, as inside
+ * JSON) runs to its closing quote.
+ */
+const INLINE_ASSIGNMENT = new RegExp(
+  `((?<![A-Za-z0-9_])(?:export\\s+)?[A-Za-z0-9_]*${CREDENTIAL_NAME}[A-Za-z0-9_]*=)` +
+    `(?!=)(?:\\\\?"[^"\\n]*?\\\\?"|\\\\?'[^'\\n]*?\\\\?'|[^\\s"'\\\\&;|]+)`,
+  "gi",
+);
+
 /** Quoted credential-like keys with quoted values, as in JSON, YAML or code: `"apiKey": "…"`. */
 const QUOTED_PAIR = new RegExp(
   `((["'])[A-Za-z0-9_.-]*${CREDENTIAL_NAME}[A-Za-z0-9_.-]*\\2\\s*[:=]\\s*)(["'])(?:\\\\.|(?!\\3)[^\\\\\\n])+\\3`,
@@ -28,10 +40,26 @@ const QUOTED_PAIR = new RegExp(
 
 const PEM_BLOCK =
   /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g;
-/** A key whose end was cut off runs to the end of the text. */
+/** In text cut short here: a key whose end was cut off runs to the end. */
 const PEM_UNTERMINATED = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*$/;
-/** A key whose start was cut off runs from the start of the text. */
+/** In text cut short here: a key whose start was cut off runs from the start. */
 const PEM_UNSTARTED = /^[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/;
+/**
+ * In any other text, a lone marker is only a cut-off key when nothing but key
+ * body sits between it and the edge, so code or prose that just mentions a
+ * marker keeps the rest of its text.
+ */
+const PEM_BODY_TO_END = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[A-Za-z0-9+/=\s]*$/;
+const PEM_BODY_FROM_START = /^[A-Za-z0-9+/=\s]*-----END [A-Z0-9 ]*PRIVATE KEY-----/;
+
+/** Where a text was cut before it reached the scrubber. */
+export interface Cut {
+  start?: boolean;
+  end?: boolean;
+}
+
+/** Room for the marker a cut adds, so text already cut to a cap is not cut again. */
+const MARKER_ROOM = 64;
 
 /** Known token shapes; each hit is replaced wholesale. */
 const TOKEN_PATTERNS: RegExp[] = [
@@ -54,16 +82,21 @@ const TOKEN_PATTERNS: RegExp[] = [
  */
 const SCRUB_MARGIN = 16_384;
 
-/** Replaces secrets in free text: PEM blocks, dotenv lines, quoted pairs and known token shapes. */
-export function scrubSecrets(value: string): string {
+/**
+ * Replaces secrets in free text: PEM blocks, dotenv lines, inline assignments,
+ * quoted pairs and known token shapes. `cut` says which ends were cut off, where
+ * a lone key marker is taken to be a key that runs on past the cut.
+ */
+export function scrubSecrets(value: string, cut: Cut = {}): string {
   let out = value
     .replace(PEM_BLOCK, REDACTED)
-    .replace(PEM_UNTERMINATED, REDACTED)
-    .replace(PEM_UNSTARTED, REDACTED);
+    .replace(cut.end ? PEM_UNTERMINATED : PEM_BODY_TO_END, REDACTED)
+    .replace(cut.start ? PEM_UNSTARTED : PEM_BODY_FROM_START, REDACTED);
   out = out
     .split("\n")
     .map((line) => line.replace(ENV_LINE, `$1${REDACTED}`))
     .join("\n");
+  out = out.replace(INLINE_ASSIGNMENT, `$1${REDACTED}`);
   out = out.replace(QUOTED_PAIR, `$1$3${REDACTED}$3`);
   for (const pattern of TOKEN_PATTERNS) out = out.replace(pattern, REDACTED);
   return out;
@@ -73,7 +106,7 @@ export function scrubSecrets(value: string): string {
 export function scrub(value: string, max: number): string {
   // Only the part that can be kept, plus a margin, is worth scrubbing.
   const head = value.slice(0, max + SCRUB_MARGIN);
-  const clean = scrubSecrets(head);
+  const clean = scrubSecrets(head, { end: head !== value });
   if (head === value && clean.length <= max) return clean;
   const over = Math.max(value.length, clean.length) - max;
   return `${clean.slice(0, Math.max(0, max))}\n[… ${over} more characters cut]`;
@@ -82,7 +115,7 @@ export function scrub(value: string, max: number): string {
 /** Scrubs, then keeps the last `max` characters, with a visible marker when cut. */
 export function scrubTail(value: string, max: number): string {
   const tail = value.length > max + SCRUB_MARGIN ? value.slice(-(max + SCRUB_MARGIN)) : value;
-  const clean = scrubSecrets(tail);
+  const clean = scrubSecrets(tail, { start: tail !== value });
   if (tail === value && clean.length <= max) return clean;
   const over = Math.max(value.length, clean.length) - max;
   return `[… ${over} earlier characters cut]\n${max > 0 ? clean.slice(-max) : ""}`;
@@ -90,5 +123,16 @@ export function scrubTail(value: string, max: number): string {
 
 /** Scrubs, then makes one line of at most `max` characters, ending in "…" when cut. */
 export function scrubLine(value: string, max: number): string {
-  return oneLine(scrubSecrets(value.slice(0, max + SCRUB_MARGIN)), max);
+  const head = value.slice(0, max + SCRUB_MARGIN);
+  return oneLine(scrubSecrets(head, { end: head !== value }), max);
+}
+
+/**
+ * Scrubs text again on its way out. Text already cut to `max` by `scrub` or
+ * `scrubTail` keeps its own cut and marker; anything longer is cut here,
+ * keeping its start or, with `keep: "end"`, its end.
+ */
+export function rescrub(value: string, max: number, keep: "start" | "end" = "start"): string {
+  if (value.length <= max + MARKER_ROOM) return scrubSecrets(value);
+  return keep === "end" ? scrubTail(value, max) : scrub(value, max);
 }

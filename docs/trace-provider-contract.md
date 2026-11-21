@@ -24,8 +24,12 @@ returns are plain data that follow OpenTelemetry's naming.
   An answer with another version is ignored.
 - Times are milliseconds since the epoch.
 - A failed call, a wrong version or an answer that does not match this page all
-  mean "this provider has nothing to say". The thread then exports on its own,
-  and the plugin does not ask that provider again for five minutes.
+  mean "this provider has nothing to say", and the plugin does not ask that
+  provider again for five minutes. From a provider that has never answered
+  since the plugin loaded, that is final: the thread exports on its own. A
+  provider that answered before and then fails, as during a reload, may still
+  claim the thread, so the export waits and asks again, for up to 30 minutes
+  of failures before it takes the provider to be gone.
 - The plugin reads the fields below and ignores any others.
 - Providers are asked in the order of the `providers` setting. The first one
   with an answer for a thread wins.

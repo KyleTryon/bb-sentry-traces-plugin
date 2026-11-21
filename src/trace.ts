@@ -212,6 +212,8 @@ const ACTIVITY_ITEMS: Record<string, ActivityKind> = {
   agentMessage: "writing",
 };
 const SUBAGENT_TOOLS = new Set(["Agent", "Task"]);
+/** Background task types that are a subagent's own run, as bb's `isBackgroundAgentTaskType` says. */
+const AGENT_TASK_TYPES = new Set(["local_agent", "local_subagent"]);
 
 interface Request {
   input: string | null;
@@ -988,7 +990,7 @@ export class TraceBuilder {
       }
       return;
     }
-    if (type === "backgroundTask" && item.taskType === "local_agent") {
+    if (type === "backgroundTask" && AGENT_TASK_TYPES.has(text(item.taskType))) {
       this.foldSubagentTask(parentToolCallId, item, event);
       return;
     }

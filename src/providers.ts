@@ -11,9 +11,10 @@
  * plugins named in the `providers` setting, checks and caps what comes back,
  * and never reads a provider's database or thread metadata.
  *
- * A provider may be missing, disabled, or older than the contract. Any failed
- * or malformed answer means "not in a trace of yours", and the thread exports
- * on its own.
+ * A provider may be missing, disabled, or older than the contract. A provider
+ * that has never answered is taken to be absent, and the thread exports on its
+ * own. One that answered before and stopped is asked again for a while before
+ * it is taken to be gone, so a reload does not move threads out of its traces.
  */
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
@@ -32,7 +33,12 @@ const MAX_ATTRIBUTE_CHARS = 2_000;
 const MAX_CONTENT_CHARS = 8_000;
 const MAX_KEY_CHARS = 200;
 /** How long to stop asking a provider after it failed to answer. */
-const UNAVAILABLE_MS = 5 * 60 * 1_000;
+export const UNAVAILABLE_MS = 5 * 60 * 1_000;
+/**
+ * How long a provider that answered before may fail before it is taken to be
+ * gone. Until then, which trace its threads belong to is unknown.
+ */
+const OUTAGE_GRACE_MS = 30 * 60 * 1_000;
 
 /** What Workflows says about a worker thread, sent along so a provider can place and name it. */
 export interface WorkflowHint {
@@ -209,6 +215,10 @@ interface Availability {
   unavailableUntil: number;
   available: boolean | null;
   error: string | null;
+  /** Whether it has ever answered, since this plugin loaded. */
+  answered: boolean;
+  /** When its current run of failures began; null while it answers. */
+  failingSince: number | null;
 }
 
 export class TraceProviders {
@@ -230,7 +240,13 @@ export class TraceProviders {
   }
 
   private async call<T>(provider: string, method: string, input: Record<string, unknown>, schema: z.ZodType<T>) {
-    const state = this.state.get(provider) ?? { unavailableUntil: 0, available: null, error: null };
+    const state = this.state.get(provider) ?? {
+      unavailableUntil: 0,
+      available: null,
+      error: null,
+      answered: false,
+      failingSince: null,
+    };
     this.state.set(provider, state);
     if (state.unavailableUntil > this.now()) return undefined;
     try {
@@ -244,10 +260,13 @@ export class TraceProviders {
       const parsed = schema.parse(output);
       state.available = true;
       state.error = null;
+      state.answered = true;
+      state.failingSince = null;
       return parsed;
     } catch (cause) {
       // Missing, disabled, older than the contract, or answering nonsense: not an error for us.
       state.unavailableUntil = this.now() + UNAVAILABLE_MS;
+      state.failingSince ??= this.now();
       const message = errorMessage(cause).slice(0, 300);
       if (message !== state.error) {
         this.bb.log.debug(`Trace provider ${provider} did not answer ${method}: ${message}`);
@@ -258,8 +277,26 @@ export class TraceProviders {
     }
   }
 
+  /**
+   * Whether a provider that did not answer may still be there: it answered
+   * before and has not been failing for long. Its answer is then unknown, not no.
+   */
+  private outage(provider: string): boolean {
+    const state = this.state.get(provider);
+    if (!state?.answered || state.failingSince === null) return false;
+    return this.now() - state.failingSince < OUTAGE_GRACE_MS;
+  }
+
   /** One provider's answers for several threads; a thread it does not know is absent. */
   async contexts(provider: string, threads: readonly ThreadQuery[]): Promise<Map<string, TraceContext>> {
+    return (await this.lookup(provider, threads)) ?? new Map();
+  }
+
+  /** Like `contexts`, but `undefined` when the provider did not answer. */
+  private async lookup(
+    provider: string,
+    threads: readonly ThreadQuery[],
+  ): Promise<Map<string, TraceContext> | undefined> {
     const found = new Map<string, TraceContext>();
     if (threads.length === 0) return found;
     const result = await this.call(
@@ -268,6 +305,7 @@ export class TraceProviders {
       { threads: threads.slice(0, 200) },
       contextResultSchema,
     );
+    if (result === undefined) return undefined;
     for (const { threadId } of threads) {
       const context = result?.contexts[threadId];
       if (!context) continue;
@@ -289,17 +327,24 @@ export class TraceProviders {
 
   /**
    * Where a thread sits in a provider's trace, or null when no provider claims
-   * it. The first provider with an answer wins.
+   * it. The first provider with an answer wins. `undefined` when a provider
+   * that may still claim it did not answer: placing the thread now would be
+   * for good, so the caller should ask again later.
    *
    * A workflow worker a provider cannot place takes its trace from the thread
    * that started its workflow, when that thread is in a trace: its turns then
    * hang under its workflow call, and it gets no agent from the provider.
    */
-  async threadContext(thread: ThreadQuery): Promise<TraceContext | null> {
+  async threadContext(thread: ThreadQuery): Promise<TraceContext | null | undefined> {
     const originThreadId = thread.workflow?.originThreadId;
     const threads = originThreadId ? [thread, { threadId: originThreadId }] : [thread];
     for (const provider of await this.providerIds()) {
-      const contexts = await this.contexts(provider, threads);
+      const contexts = await this.lookup(provider, threads);
+      if (contexts === undefined) {
+        // An earlier provider's answer would win over any later one's.
+        if (this.outage(provider)) return undefined;
+        continue;
+      }
       const own = contexts.get(thread.threadId);
       if (own) return own;
       const origin = originThreadId ? contexts.get(originThreadId) : undefined;

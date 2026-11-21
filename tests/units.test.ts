@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { modelStretches } from "../src/breakdown.js";
 import { attributes, hexId, span as otlpSpan, spanIdFor, traceIdFor } from "../src/otlp.js";
 import { Exporter } from "../src/exporter.js";
-import { scrub, scrubLine, scrubSecrets, scrubTail } from "../src/scrub.js";
+import { rescrub, scrub, scrubLine, scrubSecrets, scrubTail } from "../src/scrub.js";
 import { batches, MAX_REQUEST_BYTES, MAX_SPANS_PER_REQUEST, parseDsn, sendSpans } from "../src/sentry.js";
 import { syntheticSpans } from "../src/cli.js";
 import { TraceBuilder } from "../src/trace.js";
@@ -451,5 +451,60 @@ describe("review fixes", () => {
     expect(stats.turnsSent).toBe(10);
     expect(stats.spansSent).toBe(30);
     expect(stats.failures).toBe(10);
+  });
+});
+
+describe("second review fixes", () => {
+  it("redacts credentials assigned inline, as in a command inside one-line JSON", () => {
+    const args = JSON.stringify({ command: "STRIPE_SECRET_KEY=rk_live_abc123 npm start" });
+    expect(scrubSecrets(args)).toBe('{"command":"STRIPE_SECRET_KEY=[redacted] npm start"}');
+    expect(scrubSecrets("cd app && API_KEY=s3cr3t ./run.sh")).toBe("cd app && API_KEY=[redacted] ./run.sh");
+    expect(scrubSecrets('x; export GH_TOKEN="two words" && y')).toBe("x; export GH_TOKEN=[redacted] && y");
+    const quoted = JSON.stringify({ command: 'DB_PASSWORD="hunter two" psql' });
+    expect(scrubSecrets(quoted)).not.toContain("hunter");
+    // Comparisons and look-alikes stay.
+    expect(scrubSecrets("if (token===x) max_tokens=100 author=ada")).toBe(
+      "if (token===x) max_tokens=100 author=ada",
+    );
+  });
+
+  it("keeps text that only mentions a private key marker", () => {
+    const code = 'if (line === "-----END PRIVATE KEY-----") done();\nconst next = 1;';
+    expect(scrubSecrets(`const header = 1;\n${code}`)).toBe(`const header = 1;\n${code}`);
+    const begin = 'write("-----BEGIN PRIVATE KEY-----");\nwrite(body);';
+    expect(scrubSecrets(begin)).toBe(begin);
+  });
+
+  it("does not cut text again that was already cut to the cap", () => {
+    const reply = `${"a".repeat(20_000)}THE-END`;
+    const kept = scrubTail(reply, 16_000);
+    expect(rescrub(kept, 16_000, "end")).toBe(kept);
+    const args = scrub("b".repeat(6_000), 4_000);
+    expect(rescrub(args, 4_000)).toBe(args);
+    expect(rescrub("c".repeat(9_000), 4_000)).toBe(scrub("c".repeat(9_000), 4_000));
+  });
+
+  it("does not count a whole cache total as one stretch's when the earlier total had no split", () => {
+    const base = {
+      totalTokens: 1_000,
+      inputTokens: 100,
+      cachedInputTokens: 800,
+      outputTokens: 100,
+      reasoningOutputTokens: 0,
+    };
+    const earlier = { ...base, cacheReadInputTokens: null, cacheWriteInputTokens: null };
+    const now = {
+      ...base,
+      totalTokens: 2_000,
+      cachedInputTokens: 1_600,
+      inputTokens: 200,
+      outputTokens: 200,
+      cacheReadInputTokens: 1_500,
+      cacheWriteInputTokens: 100,
+    };
+    const delta = usageDelta(now, earlier)!;
+    expect(delta.cacheReadInputTokens).toBeNull();
+    expect(delta.cacheWriteInputTokens).toBeNull();
+    expect(toSentryUsage(delta).cacheReadTokens).toBe(800);
   });
 });

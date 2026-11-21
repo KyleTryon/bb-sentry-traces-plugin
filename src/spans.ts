@@ -19,7 +19,7 @@ import {
   traceAttributes,
   type TraceContext,
 } from "./providers.js";
-import { scrub } from "./scrub.js";
+import { rescrub, scrub } from "./scrub.js";
 import {
   MAX_ARGS,
   MAX_INPUT,
@@ -158,12 +158,15 @@ function messages(role: "user" | "assistant", texts: readonly string[]): string 
   return parts.length > 0 ? JSON.stringify([{ role, parts }]) : undefined;
 }
 
-/** The replies that fit the cap, newest kept first: the last reply is the answer. */
+/**
+ * The replies that fit the cap, newest kept first: the last reply is the
+ * answer. Each keeps its end, the way the trace already cut it.
+ */
 function fitReplies(replies: readonly string[]): string[] {
   const kept: string[] = [];
   let room = MAX_REPLY;
   for (let index = replies.length - 1; index >= 0 && room > 0; index--) {
-    const reply = scrub(replies[index], room);
+    const reply = rescrub(replies[index], room, "end");
     kept.unshift(reply);
     room -= reply.length;
   }
@@ -232,7 +235,7 @@ export function turnSpans(turn: Turn, options: TurnSpanOptions): OtlpSpan[] {
   // The model the provider switched to mid-turn is the one that answered from then on.
   const answeredBy = (end: number) =>
     turn.fallback && end >= turn.fallback.at ? turn.fallback.model : undefined;
-  const input = captureContent && turn.input ? scrub(turn.input, MAX_INPUT) : null;
+  const input = captureContent && turn.input ? rescrub(turn.input, MAX_INPUT) : null;
   const inputMessages = input ? messages("user", [input]) : undefined;
   const outputMessages = captureContent ? messages("assistant", fitReplies(turn.replies)) : undefined;
 
@@ -370,9 +373,9 @@ export function turnSpans(turn: Turn, options: TurnSpanOptions): OtlpSpan[] {
           "gen_ai.transfer.target.name": isAgent ? span.agent : undefined,
           "gen_ai.transfer.mode": isAgent ? "return_to_caller" : undefined,
           "gen_ai.tool.call.arguments":
-            captureContent && isTool && span.args ? scrub(span.args, MAX_ARGS) : undefined,
+            captureContent && isTool && span.args ? rescrub(span.args, MAX_ARGS) : undefined,
           "gen_ai.tool.call.result":
-            captureContent && isTool && span.result ? scrub(span.result, MAX_RESULT) : undefined,
+            captureContent && isTool && span.result ? rescrub(span.result, MAX_RESULT) : undefined,
           "process.exit.code": span.exitCode ?? undefined,
           "bb.span.detail": captureContent && span.detail ? scrub(span.detail, 300) : undefined,
         },

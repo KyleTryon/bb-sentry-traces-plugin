@@ -21,6 +21,7 @@ import {
   providerTraceId,
   traceAttributes,
   TraceProviders,
+  UNAVAILABLE_MS,
   workflowSpan,
   type TraceContext,
 } from "./providers.js";
@@ -153,6 +154,14 @@ const OPEN_RUN_KEEP_MS = 30 * 24 * 60 * 60_000;
  * name it. A provider may only learn that when it handles the workflow's result.
  */
 const WORKFLOW_LINK_WAIT_MS = 10 * 60_000;
+/**
+ * How long a finished turn waits for a background subagent it started. Its
+ * agent's end comes in after the turn's, and a sent turn is never read again.
+ */
+const BACKGROUND_AGENT_WAIT_MS = 2 * 60 * 60_000;
+/** How often a waiting turn is looked at again: sooner while its wait is young. */
+const WAIT_CHECK_MIN_MS = 60_000;
+const WAIT_CHECK_MAX_MS = 15 * 60_000;
 
 const EVENT_TYPES = [...TRACE_EVENT_TYPES] as unknown as Parameters<
   BbPluginApi["sdk"]["threads"]["events"]["list"]
@@ -170,6 +179,11 @@ interface Folded {
   turns: Turn[];
   builder: TraceBuilder;
   truncated: boolean;
+}
+
+/** A subagent of the turn whose agent is still working in the background. */
+function hasRunningAgent(turn: Turn): boolean {
+  return turn.spans.some((span) => span.kind === "subagent" && span.end === null);
 }
 
 export function emptyStats(): Stats {
@@ -353,7 +367,10 @@ export class Exporter {
 
   // ----------------------------------------------------------------- exporting
 
-  /** The workflow call and the provider trace a thread belongs to, if any. */
+  /**
+   * The workflow call and the provider trace a thread belongs to, if any.
+   * `trace` is undefined when a provider that may claim the thread did not answer.
+   */
   private async placement(thread: ThreadInfo) {
     const workflow = await this.workflows.workerContext(thread);
     const trace = await this.providers.threadContext({
@@ -409,7 +426,9 @@ export class Exporter {
         });
       }
     }
-    const { workflow, trace } = await this.placement(thread);
+    const placed = await this.placement(thread);
+    const workflow = placed.workflow;
+    const trace = placed.trace ?? null;
     const now = this.now();
     const spans = picked.flatMap((turn) =>
       turnSpans(turn, {
@@ -433,10 +452,13 @@ export class Exporter {
     const key = THREAD_KEY + thread.id;
     let state = await this.kv.get<ThreadState>(key);
     let folded = await this.fold(thread.id, state, settings.captureContent);
+    // The newest finished turn a catch-up read passed over, in case no later read has one.
+    let passed: Turn | null = null;
     // Turning the plugin on sends what finishes from now on, not the whole
     // history: a thread never sent before reads on to its newest turns.
     for (let reads = 0; folded.truncated && (state?.sentTurn ?? null) === null; reads++) {
-      const skipped = folded.turns.filter((turn) => turn.end !== null).at(-1)?.index ?? null;
+      const newest = folded.turns.filter((turn) => turn.end !== null).at(-1) ?? null;
+      const skipped = newest?.index ?? null;
       const next: ThreadState = {
         sentTurn: null,
         ...this.resumePoint(folded, state, skipped),
@@ -449,6 +471,7 @@ export class Exporter {
       if (next.resumeSeq <= (state?.resumeSeq ?? 0)) break;
       await this.kv.set(key, next);
       state = next;
+      if (newest) passed = newest;
       if (reads >= MAX_CATCH_UP_READS) {
         this.bb.log.debug(`Thread ${thread.id} has a long history; the next export reads on.`);
         return { kind: "nothing" };
@@ -458,24 +481,54 @@ export class Exporter {
     if (folded.truncated) {
       this.bb.log.warn(`Thread ${thread.id} has more events than one export reads; its newest turns may wait.`);
     }
-    const finished = folded.turns.filter((turn) => turn.end !== null);
+    let finished = folded.turns.filter((turn) => turn.end !== null);
+    // The catch-up read past the newest finished turn and found none after it.
+    if (finished.length === 0 && passed) finished = [passed];
     const sentTurn = state?.sentTurn ?? null;
-    const pending = (
+    const due = (
       sentTurn !== null ? finished.filter((turn) => turn.index > sentTurn) : finished.slice(-1)
     ).slice(-MAX_TURNS_PER_EXPORT);
+    // A thread never sent before starts at its newest turn: the turns before
+    // it count as done, so a failed first export does not lose that turn.
+    const baseline = sentTurn ?? (due.length > 0 ? due[0].index - 1 : null);
+    // A turn whose background subagent still works waits for it, and the turns
+    // after it wait their turn.
+    const waitingAt = due.findIndex(
+      (turn) => hasRunningAgent(turn) && this.now() - (turn.end ?? 0) < BACKGROUND_AGENT_WAIT_MS,
+    );
+    const waiting = waitingAt !== -1;
+    const pending = waiting ? due.slice(0, waitingAt) : due;
+    const waitUntil = (() => {
+      if (!waiting) return null;
+      const ended = due[waitingAt].end ?? this.now();
+      const age = this.now() - ended;
+      const step = Math.min(WAIT_CHECK_MAX_MS, Math.max(WAIT_CHECK_MIN_MS, age));
+      return Math.min(ended + BACKGROUND_AGENT_WAIT_MS + 1_000, this.now() + step);
+    })();
 
     if (pending.length === 0) {
       if (state) {
         await this.kv.set(key, {
           ...state,
-          ...this.resumePoint(folded, state, sentTurn),
+          sentTurn: baseline,
+          ...this.resumePoint(folded, state, baseline),
           updatedAt: this.now(),
         } satisfies ThreadState);
       }
       // A retry that finds nothing left to send is done.
-      await this.clearRetry(thread.id);
+      if (waitUntil !== null) await this.scheduleCheck(thread.id, waitUntil);
+      else await this.clearRetry(thread.id);
       return { kind: "nothing" };
     }
+
+    const { workflow, trace: placed } = await this.placement(thread);
+    if (placed === undefined) {
+      // A provider that may claim the thread did not answer: ask again later.
+      this.bb.log.debug(`A trace provider did not answer for ${thread.id}; its export waits.`);
+      await this.scheduleCheck(thread.id, this.now() + UNAVAILABLE_MS);
+      return { kind: "nothing" };
+    }
+    const trace = placed;
 
     const current = await this.readUsage(thread.id);
     const usage = new Map<string, TurnUsage>();
@@ -494,7 +547,6 @@ export class Exporter {
       }
     }
 
-    const { workflow, trace } = await this.placement(thread);
     const now = this.now();
     const resource = this.resource(settings);
     // Turns that started after the trace ended are the thread's own.
@@ -503,7 +555,7 @@ export class Exporter {
     // One turn at a time, so a failure leaves the turns before it sent and the
     // spans Sentry already took are never sent again.
     const partial = state?.partial ?? null;
-    let lastDone = sentTurn;
+    let lastDone = baseline;
     let cut: { turnId: string; spanIds: string[] } | null = null;
     let failure: SendResult | null = null;
     let refused: SendResult | null = null;
@@ -565,7 +617,8 @@ export class Exporter {
       if (workflow) await this.noteWorkflow(workflow, inTrace ? trace : null);
     }
     if (failure) return this.failed(thread.id, failure);
-    await this.clearRetry(thread.id);
+    if (waitUntil !== null) await this.scheduleCheck(thread.id, waitUntil);
+    else await this.clearRetry(thread.id);
     if (turnsSent === 0 && refused) {
       return { kind: "failed", message: refused.message, retryable: false };
     }
@@ -632,6 +685,17 @@ export class Exporter {
     const delay = Math.min(RETRY_MAX_MS, RETRY_BASE_MS * 2 ** (attempts - 1));
     await this.kv.set(key, { attempts, nextAt: this.now() + delay } satisfies RetryEntry);
     // The entries due soonest go first when the queue is full.
+    await this.trim<RetryEntry>(RETRY_PREFIX, MAX_RETRY_ENTRIES, (entry) => entry.nextAt);
+  }
+
+  /**
+   * Looks at a thread again at `at` without counting a failed attempt: it is
+   * waiting on something, not failing. A failure's count is kept.
+   */
+  private async scheduleCheck(threadId: string, at: number): Promise<void> {
+    const key = RETRY_PREFIX + threadId;
+    const attempts = (await this.kv.get<RetryEntry>(key))?.attempts ?? 0;
+    await this.kv.set(key, { attempts, nextAt: at } satisfies RetryEntry);
     await this.trim<RetryEntry>(RETRY_PREFIX, MAX_RETRY_ENTRIES, (entry) => entry.nextAt);
   }
 
