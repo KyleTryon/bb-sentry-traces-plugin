@@ -4,14 +4,16 @@
  */
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { TraceBuilder } from "../core/trace/builder.js";
-import { TRACE_EVENT_TYPES, type TraceEvent } from "../core/trace/types.js";
+import { TRACE_EVENT_TYPES } from "../core/trace/types.js";
 import { type RawUsage, readTotal } from "../core/usage.js";
 import { MAX_PAGES, MAX_PAGES_LONG_TURN, PAGE_SIZE, REQUEST_WINDOW_MS } from "./constants.js";
 import { type ExportContext, type Folded, type ThreadState } from "./types.js";
 
-const EVENT_TYPES = [...TRACE_EVENT_TYPES] as unknown as Parameters<
-  BbPluginApi["sdk"]["threads"]["events"]["list"]
->[0]["types"];
+type ThreadEventTypes = NonNullable<
+  Parameters<BbPluginApi["sdk"]["threads"]["events"]["list"]>[0]["types"]
+>;
+// Checked by the compiler: every trace event type must be one the SDK lists.
+const EVENT_TYPES: ThreadEventTypes = TRACE_EVENT_TYPES;
 
 export async function readEvents(ctx: ExportContext, threadId: string, afterSeq: number, builder: TraceBuilder) {
   let cursor = afterSeq;
@@ -26,9 +28,10 @@ export async function readEvents(ctx: ExportContext, threadId: string, afterSeq:
       limit: String(PAGE_SIZE),
       types: EVENT_TYPES,
     });
-    if (rows.length === 0) return false;
-    builder.apply(rows as unknown as TraceEvent[]);
-    cursor = rows[rows.length - 1].seq;
+    const last = rows.at(-1);
+    if (last === undefined) return false;
+    builder.apply(rows);
+    cursor = last.seq;
     if (rows.length < PAGE_SIZE) return false;
   }
   return true;
@@ -48,7 +51,8 @@ export async function readUsage(ctx: ExportContext, threadId: string): Promise<R
     limit: "1",
     types: ["thread/tokenUsage/updated"],
   });
-  return rows.length > 0 ? readTotal(rows[0].data) : null;
+  const [latest] = rows;
+  return latest ? readTotal(latest.data) : null;
 }
 
 /**

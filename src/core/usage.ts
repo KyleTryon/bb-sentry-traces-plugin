@@ -37,23 +37,23 @@ function count(value: unknown): number | null {
 
 /** Reads `tokenUsage.total` from a `thread/tokenUsage/updated` event's data. */
 export function readTotal(data: unknown): RawUsage | null {
-  const total = record(record(record(data).tokenUsage).total);
+  const total = record(record(record(data)['tokenUsage'])['total']);
   return parseRawUsage(total);
 }
 
 export function parseRawUsage(value: Json): RawUsage | null {
-  const inputTokens = count(value.inputTokens);
-  const outputTokens = count(value.outputTokens);
+  const inputTokens = count(value['inputTokens']);
+  const outputTokens = count(value['outputTokens']);
   if (inputTokens === null || outputTokens === null) return null;
-  const cachedInputTokens = count(value.cachedInputTokens) ?? 0;
+  const cachedInputTokens = count(value['cachedInputTokens']) ?? 0;
   return {
-    totalTokens: count(value.totalTokens) ?? 0,
+    totalTokens: count(value['totalTokens']) ?? 0,
     inputTokens,
     cachedInputTokens,
-    cacheReadInputTokens: count(value.cacheReadInputTokens),
-    cacheWriteInputTokens: count(value.cacheWriteInputTokens),
+    cacheReadInputTokens: count(value['cacheReadInputTokens']),
+    cacheWriteInputTokens: count(value['cacheWriteInputTokens']),
     outputTokens,
-    reasoningOutputTokens: count(value.reasoningOutputTokens) ?? 0,
+    reasoningOutputTokens: count(value['reasoningOutputTokens']) ?? 0,
   };
 }
 

@@ -12,6 +12,12 @@ import { attr, DSN, eventsList, fakeFetch, History, SECRETS } from "./helpers.js
 
 const THREAD = "thr_one";
 
+/** An element an indexed read must have: when it is missing, the test fails and names `label`. */
+function must<T>(value: T | undefined, label: string): T {
+  if (value === undefined) throw new Error(`expected ${label}`);
+  return value;
+}
+
 const CLAUDE_TOTAL = {
   totalTokens: 11_000,
   inputTokens: 100,
@@ -90,7 +96,7 @@ async function setup(options: Setup = {}) {
           options.workflows?.metadata[threadId] ?? {},
       },
       plugins: { callRpc: rpc },
-    } as never,
+    },
   });
   await createPlugin({ fetch: fetchImpl, now: () => clock.now })(bb);
   disposers.push(() => harness.lifecycle.dispose());
@@ -119,7 +125,8 @@ async function setup(options: Setup = {}) {
     service.controller.abort();
     await service.done;
   };
-  return { bb, harness, histories, history: histories[THREAD], clock, sent, spans, rpc, emit, tick };
+  const history = must(histories[THREAD], "the thread's history");
+  return { bb, harness, histories, history, clock, sent, spans, rpc, emit, tick };
 }
 
 const names = (spans: Array<{ name: string }>) => spans.map((span) => span.name);
@@ -156,6 +163,16 @@ const turnIndexes = (spans: Array<{ name: string }>) =>
   spans
     .filter((span) => span.name.startsWith("invoke_agent"))
     .map((span) => attr(span as never, "bb.turn.index"));
+/** The spans in the OTLP JSON that `bb sentry-traces export` prints. */
+function exportedSpans(stdout: string) {
+  // A narrow cast at this boundary: the parts of the export these tests read.
+  const body = JSON.parse(stdout) as {
+    resourceSpans: Array<{
+      scopeSpans: Array<{ spans: Array<{ name: string; attributes: Array<{ key: string }> }> }>;
+    }>;
+  };
+  return must(must(body.resourceSpans[0], "resource spans").scopeSpans[0], "scope spans").spans;
+}
 /** A finished turn of `items` commands. */
 function turnOf(h: History, turnId: string, items: number) {
   h.request(`${turnId}-req`).start(turnId, `${turnId}-req`);
@@ -200,7 +217,7 @@ describe("exporting a thread", () => {
     await emit("thread.idle");
 
     expect(sent).toHaveLength(1);
-    expect(sent[0].url).toContain("/api/4500000000000001/integration/otlp/v1/traces");
+    expect(must(sent[0], "request").url).toContain("/api/4500000000000001/integration/otlp/v1/traces");
     const all = spans();
     expect(new Set(all.map((span) => span.traceId)).size).toBe(1);
     // The chat span that carries the turn's usage goes last.
@@ -215,7 +232,8 @@ describe("exporting a thread", () => {
     ]);
     expect(attr(all.at(-1)!, "gen_ai.usage.input_tokens")).toBeDefined();
 
-    const [agent, ...rest] = all;
+    const agent = must(all[0], "agent span");
+    const rest = all.slice(1);
     expect(agent.parentSpanId).toBeUndefined();
     expect(attr(agent, "sentry.op")).toBe("gen_ai.invoke_agent");
     expect(attr(agent, "gen_ai.operation.name")).toBe("invoke_agent");
@@ -252,13 +270,13 @@ describe("exporting a thread", () => {
       (span) => attr(span, "gen_ai.usage.input_tokens") !== undefined,
     );
     expect(withUsage).toHaveLength(1);
-    expect(withUsage[0].name).toBe("chat claude-fable-5-2");
+    expect(must(withUsage[0], "span with usage").name).toBe("chat claude-fable-5-2");
     // Input includes the cached tokens Claude Code reports separately.
-    expect(attr(withUsage[0], "gen_ai.usage.input_tokens")).toBe(10_100);
-    expect(attr(withUsage[0], "gen_ai.usage.cache_read.input_tokens")).toBe(9_000);
-    expect(attr(withUsage[0], "gen_ai.usage.cache_creation.input_tokens")).toBe(1_000);
-    expect(attr(withUsage[0], "gen_ai.usage.output_tokens")).toBe(900);
-    expect(attr(withUsage[0], "gen_ai.usage.total_tokens")).toBe(11_000);
+    expect(attr(must(withUsage[0], "span with usage"), "gen_ai.usage.input_tokens")).toBe(10_100);
+    expect(attr(must(withUsage[0], "span with usage"), "gen_ai.usage.cache_read.input_tokens")).toBe(9_000);
+    expect(attr(must(withUsage[0], "span with usage"), "gen_ai.usage.cache_creation.input_tokens")).toBe(1_000);
+    expect(attr(must(withUsage[0], "span with usage"), "gen_ai.usage.output_tokens")).toBe(900);
+    expect(attr(must(withUsage[0], "span with usage"), "gen_ai.usage.total_tokens")).toBe(11_000);
   });
 
   it("charges each later turn only with what it added", async () => {
@@ -290,7 +308,7 @@ describe("exporting a thread", () => {
     );
     // Only the newest turn goes out when the plugin is first turned on.
     expect(spans().filter((span) => span.name.startsWith("invoke_agent"))).toHaveLength(1);
-    expect(attr(spans()[0], "bb.turn.index")).toBe(2);
+    expect(attr(must(spans()[0], "first span"), "bb.turn.index")).toBe(2);
   });
 
   it("sends each turn once, and reads only new events the next time", async () => {
@@ -332,7 +350,10 @@ describe("exporting a thread", () => {
     h.complete("t2");
     await emit("thread.idle");
     expect(spans().filter((span) => span.name === "Starting")).toEqual([]);
-    const [, second] = spans().filter((span) => span.name.startsWith("invoke_agent"));
+    const second = must(
+      spans().filter((span) => span.name.startsWith("invoke_agent"))[1],
+      "second agent span",
+    );
     const ms = Number((BigInt(second.endTimeUnixNano) - BigInt(second.startTimeUnixNano)) / 1_000_000n);
     expect(ms).toBeLessThan(1_000);
   });
@@ -394,7 +415,7 @@ describe("exporting a thread", () => {
     history.complete("turn-1");
     await emit("thread.idle");
 
-    const [root] = spans();
+    const root = must(spans()[0], "root span");
     const call = spans().find((span) => span.name === "execute_tool Agent")!;
     const agent = spans().find((span) => span.name === "invoke_agent Explore")!;
     const inner = spans().find((span) => span.name === "execute_tool shell")!;
@@ -456,7 +477,7 @@ describe("exporting a thread", () => {
     });
     history.complete("turn-1", "failed", "overloaded_error");
     await emit("thread.failed");
-    const [agent] = spans();
+    const agent = must(spans()[0], "agent span");
     expect(agent.status).toEqual({ code: 2, message: "overloaded_error" });
     const tool = spans().find((span) => span.name === "execute_tool shell")!;
     expect(tool.status.code).toBe(2);
@@ -614,9 +635,9 @@ describe("exporting a thread", () => {
     clock.now += 20 * 60_000;
     await tick();
     expect(usageOf()).toHaveLength(1);
-    expect(attr(usageOf()[0], "bb.turn.id")).toBe("slow");
-    expect(attr(usageOf()[0], "gen_ai.usage.input_tokens")).toBe(10_100);
-    expect(attr(usageOf()[0], "bb.usage.turns")).toBe(2);
+    expect(attr(must(usageOf()[0], "span with usage"), "bb.turn.id")).toBe("slow");
+    expect(attr(must(usageOf()[0], "span with usage"), "gen_ai.usage.input_tokens")).toBe(10_100);
+    expect(attr(must(usageOf()[0], "span with usage"), "bb.usage.turns")).toBe(2);
   });
 
   it("sends a new thread's first usage when its first export has to be retried", async () => {
@@ -633,7 +654,7 @@ describe("exporting a thread", () => {
     await tick();
     const withUsage = spans().filter((span) => attr(span, "gen_ai.usage.input_tokens") !== undefined);
     expect(withUsage).toHaveLength(1);
-    expect(attr(withUsage[0], "gen_ai.usage.input_tokens")).toBe(10_100);
+    expect(attr(must(withUsage[0], "span with usage"), "gen_ai.usage.input_tokens")).toBe(10_100);
   });
 
   it("sends a long thread's newest finished turn when the turn after it never finishes", async () => {
@@ -689,7 +710,7 @@ describe("exporting a thread", () => {
     await emit("thread.idle");
     const withUsage = spans().filter((span) => attr(span, "gen_ai.usage.input_tokens") !== undefined);
     expect(withUsage).toHaveLength(1);
-    expect(attr(withUsage[0], "gen_ai.usage.input_tokens")).toBe(10_100);
+    expect(attr(must(withUsage[0], "span with usage"), "gen_ai.usage.input_tokens")).toBe(10_100);
   });
 
   it("reads on after a turn longer than one read without waiting for the thread's next event", async () => {
@@ -743,8 +764,8 @@ describe("content capture", () => {
     history.complete("turn-1");
     await emit("thread.idle");
 
-    const [agent] = spans();
-    const input = JSON.parse(String(attr(agent, "gen_ai.input.messages")));
+    const agent = must(spans()[0], "agent span");
+    const input: unknown = JSON.parse(String(attr(agent, "gen_ai.input.messages")));
     expect(input).toEqual([
       { role: "user", parts: [{ type: "text", content: `${SECRETS.prompt} with [redacted]` }] },
     ]);
@@ -880,7 +901,7 @@ describe("failures", () => {
     expect(spans().filter((span) => span.name === "execute_tool shell")).toHaveLength(450);
     const withUsage = spans().filter((span) => attr(span, "gen_ai.usage.input_tokens") !== undefined);
     expect(withUsage).toHaveLength(1);
-    expect(attr(withUsage[0], "gen_ai.usage.input_tokens")).toBe(10_100);
+    expect(attr(must(withUsage[0], "span with usage"), "gen_ai.usage.input_tokens")).toBe(10_100);
   });
 
   it("retries an export that could not reach Sentry, then sends the turn once", async () => {
@@ -982,8 +1003,8 @@ describe("trace providers", () => {
     history.turn();
     await emit("thread.idle");
     expect(rpc).toHaveBeenCalledTimes(1);
-    expect(spans()[0].parentSpanId).toBeUndefined();
-    expect(attr(spans()[0], "bb.trace.provider")).toBeUndefined();
+    expect(must(spans()[0], "first span").parentSpanId).toBeUndefined();
+    expect(attr(must(spans()[0], "first span"), "bb.trace.provider")).toBeUndefined();
     // A missing provider is not asked again for every export.
     history.turn();
     await emit("thread.idle");
@@ -1032,7 +1053,7 @@ describe("trace providers", () => {
     });
     for (const id of ["thr_worker", "thr_sub"]) histories[id] = new History();
     for (const id of [THREAD, "thr_worker", "thr_sub"]) {
-      histories[id].turn();
+      must(histories[id], id).turn();
       await emit("thread.idle", id);
     }
 
@@ -1059,8 +1080,8 @@ describe("trace providers", () => {
       expect(attr(span, "gen_ai.pipeline.name")).toBe("feature");
     }
     // A thread's own attributes stay on that thread.
-    expect(attr(agents[0], "orchestrator.role")).toBe("coordinator");
-    expect(attr(agents[1], "orchestrator.role")).toBeUndefined();
+    expect(attr(must(agents[0], "first agent span"), "orchestrator.role")).toBe("coordinator");
+    expect(attr(must(agents[1], "second agent span"), "orchestrator.role")).toBeUndefined();
 
     // The trace's own spans wait for it to end, and are then sent once.
     const before = sent.length;
@@ -1078,7 +1099,11 @@ describe("trace providers", () => {
       "orchestrator.verify",
       "orchestrator.subtask ENG-8",
     ]);
-    const [root, step, decide, verify, subtask] = structure;
+    const root = must(structure[0], "root span");
+    const step = must(structure[1], "step span");
+    const decide = must(structure[2], "decide span");
+    const verify = must(structure[3], "verify span");
+    const subtask = must(structure[4], "subtask span");
     expect(root.spanId).toBe(providerSpanId(P, KEY, "root"));
     expect(root.parentSpanId).toBeUndefined();
     expect(attr(root, "sentry.op")).toBe("orchestrator.run");
@@ -1140,11 +1165,11 @@ describe("trace providers", () => {
 
     const agents = spans().filter((span) => span.name.startsWith("invoke_agent"));
     expect(agents.map((span) => span.traceId === providerTraceId(P, KEY))).toEqual([true, true, false]);
-    expect(agents[2].parentSpanId).toBeUndefined();
-    expect(attr(agents[2], "bb.trace.provider")).toBeUndefined();
-    expect(attr(agents[2], "orchestrator.run_id")).toBeUndefined();
+    expect(must(agents[2], "third agent span").parentSpanId).toBeUndefined();
+    expect(attr(must(agents[2], "third agent span"), "bb.trace.provider")).toBeUndefined();
+    expect(attr(must(agents[2], "third agent span"), "orchestrator.run_id")).toBeUndefined();
     // Still the same conversation.
-    expect(attr(agents[2], "gen_ai.conversation.id")).toBe(THREAD);
+    expect(attr(must(agents[2], "third agent span"), "gen_ai.conversation.id")).toBe(THREAD);
     expect(await bb.storage.kv.list("trace:")).toEqual([`trace:${P}/${KEY}`]);
   });
 
@@ -1163,12 +1188,12 @@ describe("trace providers", () => {
     await tick();
     expect(sent).toHaveLength(before + 1);
     expect(sent.at(-1)!.spans).toHaveLength(1);
-    const [root] = sent.at(-1)!.spans;
+    const root = must(sent.at(-1)?.spans[0], "root span");
     expect(root.spanId).toBe(providerSpanId(P, KEY, "root"));
     expect(root.traceId).toBe(providerTraceId(P, KEY));
     expect(attr(root, "bb.trace.state")).toBe("deleted");
     expect(attr(root, "orchestrator.run_id")).toBe(KEY);
-    expect(await bb.storage.kv.get(`trace:${P}/${KEY}`)).toMatchObject({ sentAt: expect.any(Number) });
+    expect(await bb.storage.kv.get(`trace:${P}/${KEY}`)).toMatchObject({ sentAt: expect.any(Number) as unknown });
     const asked = rpc.mock.calls.length;
     await tick();
     expect(rpc.mock.calls.length).toBe(asked);
@@ -1187,9 +1212,9 @@ describe("trace providers", () => {
     await emit("thread.idle");
     // The plugin never asks itself.
     expect(rpc.mock.calls.map(([call]) => call.pluginId)).toEqual(["alpha", "beta"]);
-    expect(spans()[0].traceId).toBe(providerTraceId("beta", "b1"));
-    expect(spans()[0].name).toBe("invoke_agent Beta Agent");
-    expect(attr(spans()[0], "bb.trace.provider")).toBe("beta");
+    expect(must(spans()[0], "first span").traceId).toBe(providerTraceId("beta", "b1"));
+    expect(must(spans()[0], "first span").name).toBe("invoke_agent Beta Agent");
+    expect(attr(must(spans()[0], "first span"), "bb.trace.provider")).toBe("beta");
   });
 
   describe("does not trust what a provider sends", () => {
@@ -1199,8 +1224,8 @@ describe("trace providers", () => {
       });
       history.turn();
       await emit("thread.idle");
-      expect(spans()[0].parentSpanId).toBeUndefined();
-      expect(attr(spans()[0], "bb.trace.provider")).toBeUndefined();
+      expect(must(spans()[0], "first span").parentSpanId).toBeUndefined();
+      expect(attr(must(spans()[0], "first span"), "bb.trace.provider")).toBeUndefined();
     });
 
     it("ignores a malformed answer", async () => {
@@ -1209,7 +1234,7 @@ describe("trace providers", () => {
       });
       history.turn();
       await emit("thread.idle");
-      expect(spans()[0].parentSpanId).toBeUndefined();
+      expect(must(spans()[0], "first span").parentSpanId).toBeUndefined();
     });
 
     it("drops attributes that are reserved, not scalar or badly named, and keeps its own", async () => {
@@ -1236,7 +1261,7 @@ describe("trace providers", () => {
       });
       history.turn();
       await emit("thread.idle");
-      const [agent] = spans();
+      const agent = must(spans()[0], "agent span");
       expect(attr(agent, "sentry.op")).toBe("gen_ai.invoke_agent");
       expect(attr(agent, "gen_ai.conversation.id")).toBe(THREAD);
       expect(attr(agent, "bb.thread.id")).toBe(THREAD);
@@ -1267,9 +1292,12 @@ describe("trace providers", () => {
       await tick();
       const structure = sent.at(-1)!.spans;
       expect(names(structure)).toEqual([`${P}.trace feature`, "first", "b"]);
-      expect(structure[0].spanId).toBe(providerSpanId(P, KEY, "root"));
-      expect(structure[1].parentSpanId).toBe(structure[0].spanId);
-      expect(structure[2].parentSpanId).toBe(structure[1].spanId);
+      const root = must(structure[0], "root span");
+      const second = must(structure[1], "second span");
+      const third = must(structure[2], "third span");
+      expect(root.spanId).toBe(providerSpanId(P, KEY, "root"));
+      expect(second.parentSpanId).toBe(root.spanId);
+      expect(third.parentSpanId).toBe(second.spanId);
     });
 
     it("refuses a trace with more spans than the limit", async () => {
@@ -1340,7 +1368,7 @@ describe("trace providers", () => {
     const before = spans().length;
 
     // A thread this plugin has stored nothing for, while the provider reloads.
-    const other = (histories.thr_two = new History());
+    const other = (histories['thr_two'] = new History());
     delete providers[P];
     other.turn();
     await emit("thread.idle", "thr_two");
@@ -1430,7 +1458,7 @@ describe("trace providers", () => {
     });
     for (const id of [THREAD, "thr_two", "thr_three"]) {
       histories[id] ??= new History();
-      histories[id].turn();
+      must(histories[id], id).turn();
       await emit("thread.idle", id);
     }
     expect(rpc).toHaveBeenCalledTimes(1);
@@ -1535,10 +1563,12 @@ describe("the Orchestrator's real answers", () => {
     });
     for (const id of [coordinator, worker]) {
       histories[id] = new History();
-      histories[id].turn();
+      must(histories[id], id).turn();
       await emit("thread.idle", id);
     }
-    const [lead, developer] = spans().filter((span) => span.name.startsWith("invoke_agent"));
+    const agentSpans = spans().filter((span) => span.name.startsWith("invoke_agent"));
+    const lead = must(agentSpans[0], "lead agent span");
+    const developer = must(agentSpans[1], "developer agent span");
     // The coordinator is named as the user named the agent.
     expect(lead.name).toBe("invoke_agent Coordinator");
     expect(attr(lead, "bb.agent.id")).toBe("coordinator");
@@ -1577,7 +1607,7 @@ describe("bb details", () => {
     const { history, emit, spans, sent } = await setup({ threads: { [THREAD]: environment } });
     history.turn();
     await emit("thread.idle");
-    const [agent] = spans();
+    const agent = must(spans()[0], "agent span");
     expect(attr(agent, "bb.environment.id")).toBe("env_1");
     expect(attr(agent, "bb.environment.worktree")).toBe(true);
     expect(attr(agent, "bb.host.id")).toBe("host_1");
@@ -1599,7 +1629,7 @@ describe("bb details", () => {
     });
     history.turn();
     await emit("thread.idle");
-    expect(attr(spans()[0], "bb.environment.branch")).toBe(SECRETS.branch);
+    expect(attr(must(spans()[0], "first span"), "bb.environment.branch")).toBe(SECRETS.branch);
   });
 
   it("reports the model a provider fell back to, from the moment it did", async () => {
@@ -1615,7 +1645,7 @@ describe("bb details", () => {
     history.item("turn-1", { type: "agentMessage", id: "m1", text: "done" }, 1_000);
     history.complete("turn-1");
     await emit("thread.idle");
-    const [agent] = spans();
+    const agent = must(spans()[0], "agent span");
     const chats = spans().filter((span) => span.name.startsWith("chat"));
     expect(attr(agent, "gen_ai.request.model")).toBe("claude-fable-5-2");
     expect(attr(agent, "gen_ai.response.model")).toBe("claude-opus-5-5");
@@ -1638,7 +1668,7 @@ describe("bb details", () => {
     });
     history.complete("turn-1");
     await emit("thread.idle");
-    const [agent] = spans();
+    const agent = must(spans()[0], "agent span");
     expect(attr(agent, "bb.rate_limit.status")).toBe("warning");
     expect(attr(agent, "bb.context.used_tokens")).toBe(287_498);
     expect(attr(agent, "bb.context.window_tokens")).toBe(1_000_000);
@@ -1699,7 +1729,7 @@ describe("workflow runs", () => {
     });
     for (const id of WORKERS) {
       histories[id] = new History();
-      histories[id].turn();
+      must(histories[id], id).turn();
       await emit("thread.idle", id);
     }
     const agents = spans().filter((span) => span.name.startsWith("invoke_agent"));
@@ -1714,7 +1744,7 @@ describe("workflow runs", () => {
       expect(attr(span, "gen_ai.pipeline.name")).toBe("review-changes");
       expect(attr(span, "bb.workflow.origin_thread_id")).toBe(THREAD);
     }
-    expect(attr(agents[1], "bb.workflow.call.index")).toBe(1);
+    expect(attr(must(agents[1], "second agent span"), "bb.workflow.call.index")).toBe(1);
     // Each worker is still its own conversation.
     expect(agents.map((span) => attr(span, "gen_ai.conversation.id"))).toEqual(WORKERS);
 
@@ -1734,7 +1764,10 @@ describe("workflow runs", () => {
       "workflow.call 1",
       "workflow.call 2",
     ]);
-    const [root, phase, first, , unphased] = structure;
+    const root = must(structure[0], "root span");
+    const phase = must(structure[1], "phase span");
+    const first = must(structure[2], "first call span");
+    const unphased = must(structure[4], "unphased call span");
     expect(root.spanId).toBe(workflowRootSpanId(WF));
     expect(root.parentSpanId).toBeUndefined();
     expect(root.traceId).toBe(workflowTraceId(WF));
@@ -1761,8 +1794,8 @@ describe("workflow runs", () => {
       threads,
       workflows: { metadata, view: () => view("succeeded") },
     });
-    histories.thr_w1 = new History();
-    histories.thr_w1.turn();
+    histories['thr_w1'] = new History();
+    must(histories['thr_w1'], "thr_w1").turn();
     await emit("thread.idle", "thr_w1");
     await tick();
     expect(names(sent.at(-1)!.spans)).toEqual([
@@ -1779,10 +1812,10 @@ describe("workflow runs", () => {
       threads,
       workflows: { metadata, view: () => view("running", { name: SECRETS.workflowLabel }) },
     });
-    histories.thr_w1 = new History();
-    histories.thr_w1.turn();
+    histories['thr_w1'] = new History();
+    must(histories['thr_w1'], "thr_w1").turn();
     await emit("thread.idle", "thr_w1");
-    expect(attr(spans()[0], "bb.workflow.name")).toBeUndefined();
+    expect(attr(must(spans()[0], "first span"), "bb.workflow.name")).toBeUndefined();
     expect(JSON.stringify(spans())).not.toContain(SECRETS.workflowLabel);
   });
 
@@ -1792,12 +1825,12 @@ describe("workflow runs", () => {
       // Forged or damaged metadata: no call id.
       workflows: { metadata: { thr_w1: { runId: WF } }, view: () => view("running") },
     });
-    histories.thr_w1 = new History();
-    histories.thr_w1.turn();
+    histories['thr_w1'] = new History();
+    must(histories['thr_w1'], "thr_w1").turn();
     await emit("thread.idle", "thr_w1");
-    expect(spans()[0].parentSpanId).toBeUndefined();
-    expect(attr(spans()[0], "bb.workflow.run_id")).toBeUndefined();
-    expect(attr(spans()[0], "bb.thread.origin_plugin")).toBe("workflows");
+    expect(must(spans()[0], "first span").parentSpanId).toBeUndefined();
+    expect(attr(must(spans()[0], "first span"), "bb.workflow.run_id")).toBeUndefined();
+    expect(attr(must(spans()[0], "first span"), "bb.thread.origin_plugin")).toBe("workflows");
   });
 
   it("gives a workflow Workflows deleted a root, then stops asking", async () => {
@@ -1806,12 +1839,12 @@ describe("workflow runs", () => {
       threads,
       workflows: { metadata, view: () => (gone ? null : view("running")) },
     });
-    histories.thr_w1 = new History();
-    histories.thr_w1.turn();
+    histories['thr_w1'] = new History();
+    must(histories['thr_w1'], "thr_w1").turn();
     await emit("thread.idle", "thr_w1");
     gone = true;
     await tick();
-    const [root] = sent.at(-1)!.spans;
+    const root = must(sent.at(-1)?.spans[0], "root span");
     expect(root.spanId).toBe(workflowRootSpanId(WF));
     expect(attr(root, "bb.workflow.status")).toBe("deleted");
     const asked = rpc.mock.calls.length;
@@ -1846,11 +1879,11 @@ describe("workflow runs", () => {
         // The provider knows the thread that started the workflow, not its workers.
         providers: { [P]: { contexts: { [THREAD]: origin() }, trace: () => trace(spans_) } },
       });
-      histories.thr_w1 = new History();
-      histories.thr_w1.turn();
+      histories['thr_w1'] = new History();
+      must(histories['thr_w1'], "thr_w1").turn();
       await emit("thread.idle", "thr_w1");
 
-      const [agent] = spans();
+      const agent = must(spans()[0], "agent span");
       expect(agent.traceId).toBe(providerTraceId(P, KEY));
       // The worker's place is its workflow call.
       expect(agent.parentSpanId).toBe(workflowCallSpanId(WF, "call_0"));
@@ -1894,7 +1927,7 @@ describe("workflow runs", () => {
       spans_ = [span("step-1", { workflowRunId: WF })];
       await tick();
       expect(sent).toHaveLength(before + 1);
-      const [root] = sent.at(-1)!.spans;
+      const root = must(sent.at(-1)?.spans[0], "root span");
       expect(root.name).toBe("invoke_workflow review-changes");
       expect(root.traceId).toBe(providerTraceId(P, KEY));
       expect(root.parentSpanId).toBe(providerSpanId(P, KEY, "step-1"));
@@ -1914,8 +1947,8 @@ describe("workflow runs", () => {
           },
         },
       });
-      histories.thr_w1 = new History();
-      histories.thr_w1.turn();
+      histories['thr_w1'] = new History();
+      must(histories['thr_w1'], "thr_w1").turn();
       await emit("thread.idle", "thr_w1");
       clock.now = 1_800_000_030_000 + 1_000;
       await tick();
@@ -1934,8 +1967,8 @@ describe("workflow runs", () => {
           },
         },
       });
-      histories.thr_w1 = new History();
-      histories.thr_w1.turn();
+      histories['thr_w1'] = new History();
+      must(histories['thr_w1'], "thr_w1").turn();
       await emit("thread.idle", "thr_w1");
       clock.now = 1_800_000_030_000 + 11 * 60_000;
       await tick();
@@ -1958,8 +1991,8 @@ describe("workflow runs", () => {
           },
         },
       });
-      histories.thr_w1 = new History();
-      histories.thr_w1.turn();
+      histories['thr_w1'] = new History();
+      must(histories['thr_w1'], "thr_w1").turn();
       await emit("thread.idle", "thr_w1");
       const before = sent.length;
       down = true;
@@ -1992,10 +2025,10 @@ describe("workflow runs", () => {
           },
         },
       });
-      histories.thr_w1 = new History();
-      histories.thr_w1.turn();
+      histories['thr_w1'] = new History();
+      must(histories['thr_w1'], "thr_w1").turn();
       await emit("thread.idle", "thr_w1");
-      const [agent] = spans();
+      const agent = must(spans()[0], "agent span");
       const tools = spans().filter((span) => span.name.startsWith("execute_tool"));
       expect(agent.name).toBe("invoke_agent Senior Dev");
       expect(attr(agent, "gen_ai.agent.name")).toBe("Senior Dev");
@@ -2008,7 +2041,7 @@ describe("workflow runs", () => {
       await tick();
       const calls = sent.at(-1)!.spans.filter((span) => span.name.startsWith("workflow.call"));
       expect(calls.map((span) => attr(span, "bb.agent.id"))).toEqual(["developer", undefined, undefined]);
-      expect(attr(calls[0], "bb.agent.name")).toBe("Senior Dev");
+      expect(attr(must(calls[0], "first call span"), "bb.agent.name")).toBe("Senior Dev");
     });
   });
 });
@@ -2024,7 +2057,7 @@ describe("bb sentry-traces", () => {
     expect(text.stdout).toContain("o42.ingest.us.sentry.io, project 4500000000000001");
     expect(text.stdout).toContain("Sent: 1 turns");
     expect(text.stdout).not.toContain("0123456789abcdef");
-    const json = JSON.parse((await harness.behavior.runCli(["status", "--json"])).stdout);
+    const json: unknown = JSON.parse((await harness.behavior.runCli(["status", "--json"])).stdout);
     expect(json).toMatchObject({
       enabled: true,
       sending: true,
@@ -2048,7 +2081,7 @@ describe("bb sentry-traces", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toMatch(/Trace id: [0-9a-f]{32}/);
     expect(sent).toHaveLength(1);
-    expect(names(sent[0].spans)).toEqual([
+    expect(names(must(sent[0], "request").spans)).toEqual([
       "invoke_agent bb-sentry-traces-test",
       "chat claude-sonnet-4-5",
       "execute_tool shell",
@@ -2056,7 +2089,7 @@ describe("bb sentry-traces", () => {
       "invoke_agent bb-sentry-traces-test-helper",
       "chat claude-sonnet-4-5",
     ]);
-    expect(sent[0].spans.every((span) => attr(span, "bb.synthetic") === true)).toBe(true);
+    expect(must(sent[0], "request").spans.every((span) => attr(span, "bb.synthetic") === true)).toBe(true);
   });
 
   it("test fails clearly without a DSN or when Sentry refuses", async () => {
@@ -2076,8 +2109,7 @@ describe("bb sentry-traces", () => {
     history.turn();
     const result = await harness.behavior.runCli(["export", THREAD, "--all"]);
     expect(result.exitCode).toBe(0);
-    const body = JSON.parse(result.stdout);
-    const spans = body.resourceSpans[0].scopeSpans[0].spans as Array<{ name: string }>;
+    const spans = exportedSpans(result.stdout);
     expect(spans.filter((span) => span.name.startsWith("invoke_agent"))).toHaveLength(2);
     expect(result.stdout).not.toContain(SECRETS.prompt);
     expect(sent).toHaveLength(0);
@@ -2100,10 +2132,7 @@ describe("bb sentry-traces", () => {
     const finished = await harness.behavior.runCli(["export", THREAD, "--all"]);
     expect(finished.stdout).not.toContain("gen_ai.usage.input_tokens");
     const all = await harness.behavior.runCli(["export", THREAD, "--all", "--running"]);
-    const spans = JSON.parse(all.stdout).resourceSpans[0].scopeSpans[0].spans as Array<{
-      name: string;
-      attributes: Array<{ key: string }>;
-    }>;
+    const spans = exportedSpans(all.stdout);
     expect(spans.filter((span) => span.name.startsWith("invoke_agent"))).toHaveLength(2);
     expect(
       spans.filter((span) =>
@@ -2134,7 +2163,9 @@ describe("bb sentry-traces", () => {
     expect(failed.stdout + summary.stdout).toContain("A trace provider did not answer");
     const json = await harness.behavior.runCli(["export", THREAD]);
     expect(json.stderr).toContain("A trace provider did not answer");
-    expect(() => JSON.parse(json.stdout)).not.toThrow();
+    expect(() => {
+      JSON.parse(json.stdout);
+    }).not.toThrow();
   });
 });
 

@@ -7,8 +7,7 @@
  * Sentry SDK here and no global instrumentation: plugin code shares bb's
  * server process, so this only builds OTLP/JSON and posts it with `fetch`.
  */
-import type { BbPluginApi } from "@get-bb/plugin-sdk";
-import { z } from "zod";
+import type { BbPluginApi, StandardSchemaV1 } from "@get-bb/plugin-sdk";
 import { CLI_NAME, registerCli } from "./cli.js";
 import { Exporter } from "./export/exporter.js";
 import { type ExportSettings } from "./export/types.js";
@@ -23,6 +22,22 @@ export interface PluginOptions {
   /** Test seams. */
   fetch?: Fetch;
   now?: () => number;
+}
+
+/**
+ * A text setting's check: at most `max` characters. Written out rather than
+ * taken from zod, whose failure type does not fit the SDK's `path?` under
+ * exactOptionalPropertyTypes.
+ */
+function maxLength(max: number, message: string): StandardSchemaV1<string, string> {
+  return {
+    "~standard": {
+      version: 1,
+      vendor: "bb-sentry-traces",
+      validate: (value) =>
+        typeof value === "string" && value.length <= max ? { value } : { issues: [{ message }] },
+    },
+  };
 }
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
@@ -60,24 +75,24 @@ export function createPlugin(options: PluginOptions = {}) {
         type: "string",
         label: "Environment label, such as dev or laptop",
         default: "",
-        experimental_schema: z.string().max(64, "Use at most 64 characters"),
+        experimental_schema: maxLength(64, "Use at most 64 characters"),
       },
       providers: {
         type: "string",
         label: "Trace providers: plugin ids that group threads into traces, separated by commas",
         default: "orchestrator",
-        experimental_schema: z.string().max(200, "Use at most 200 characters"),
+        experimental_schema: maxLength(200, "Use at most 200 characters"),
       },
     });
 
     const readSettings = async (): Promise<ExportSettings> => {
       const values = await settings.get();
       return {
-        dsn: typeof values.dsn === "string" ? values.dsn : undefined,
-        enabled: values.enabled,
-        captureContent: values.captureContent,
-        environment: values.environment,
-        providers: parseProviders(values.providers, bb.pluginId),
+        dsn: typeof values['dsn'] === "string" ? values['dsn'] : undefined,
+        enabled: values['enabled'],
+        captureContent: values['captureContent'],
+        environment: values['environment'],
+        providers: parseProviders(values['providers'], bb.pluginId),
       };
     };
 
@@ -94,14 +109,14 @@ export function createPlugin(options: PluginOptions = {}) {
     };
     checkDsn((await readSettings()).dsn);
     settings.onChange((next, previous) => {
-      if (next.dsn !== previous.dsn) checkDsn(typeof next.dsn === "string" ? next.dsn : undefined);
+      if (next['dsn'] !== previous['dsn']) checkDsn(typeof next['dsn'] === "string" ? next['dsn'] : undefined);
     });
 
     const exporter = new Exporter({
       bb,
       settings: readSettings,
-      fetch: options.fetch,
-      now: options.now,
+      ...(options.fetch ? { fetch: options.fetch } : {}),
+      ...(options.now ? { now: options.now } : {}),
     });
     bb.onDispose(() => exporter.dispose());
 
@@ -129,7 +144,12 @@ export function createPlugin(options: PluginOptions = {}) {
       },
     });
 
-    registerCli(bb, { exporter, settings: readSettings, fetch: options.fetch, now: options.now });
+    registerCli(bb, {
+      exporter,
+      settings: readSettings,
+      ...(options.fetch ? { fetch: options.fetch } : {}),
+      ...(options.now ? { now: options.now } : {}),
+    });
   };
 }
 

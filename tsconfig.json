@@ -1,6 +1,21 @@
 {
   "compilerOptions": {
     "strict": true,
+
+    // Forces undefined checks when indexing arrays or records (e.g., arr[0])
+    "noUncheckedIndexedAccess": true,
+    // Distinguishes between `prop?: string` and `prop: string | undefined`
+    "exactOptionalPropertyTypes": true,
+    // Prevents accidental overrides in subclasses without the `override` keyword
+    "noImplicitOverride": true,
+    // Requires bracket notation for index signatures, preventing typo bugs
+    "noPropertyAccessFromIndexSignature": true,
+    // Catches unintended switch statement fallthroughs
+    "noFallthroughCasesInSwitch": true,
+    // Enforces explicit `import type` for cleaner bundling with Rolldown/Vite
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+
     "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "bundler",

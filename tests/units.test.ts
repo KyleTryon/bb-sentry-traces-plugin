@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { z } from "zod";
 import { modelStretches } from "../src/core/breakdown.js";
 import { attributes, hexId, span as otlpSpan, spanIdFor, traceIdFor } from "../src/core/otlp.js";
 import { Exporter } from "../src/export/exporter.js";
@@ -18,9 +19,18 @@ const PEM = `-----BEGIN RSA PRIVATE KEY-----\n${KEY_BODY}\n-----END RSA PRIVATE 
 const BODY = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7";
 const BEGIN = "-----BEGIN PRIVATE KEY-----";
 
+/** The item at `index`; the test fails when there is none. */
+function itemAt<T>(items: readonly T[], index: number): T {
+  const item = items.at(index);
+  if (item === undefined) throw new Error(`no item at index ${index}`);
+  return item;
+}
+
 describe("version", () => {
   it("matches package.json", () => {
-    const manifest = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+    const manifest = z
+      .object({ version: z.string() })
+      .parse(JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")));
     expect(VERSION).toBe(manifest.version);
   });
 });
@@ -459,12 +469,13 @@ describe("sendSpans", () => {
     const result = await sendSpans(target, spans, { pluginVersion: "1", environment: "dev" }, fetchImpl);
     expect(result).toMatchObject({ ok: true, spans: spans.length });
     expect(sent).toHaveLength(1);
-    expect(sent[0].url).toBe(target.endpoint);
-    expect(sent[0].headers).toEqual({
+    const request = itemAt(sent, 0);
+    expect(request.url).toBe(target.endpoint);
+    expect(request.headers).toEqual({
       "content-type": "application/json",
       "x-sentry-auth": target.authHeader,
     });
-    expect(sent[0].body.resourceSpans[0].resource.attributes).toContainEqual({
+    expect(itemAt(request.body.resourceSpans, 0).resource.attributes).toContainEqual({
       key: "deployment.environment.name",
       value: { stringValue: "dev" },
     });
@@ -472,7 +483,7 @@ describe("sendSpans", () => {
 
   it("splits a large export into several requests", async () => {
     const { fetchImpl, sent } = fakeFetch();
-    const many = Array.from({ length: MAX_SPANS_PER_REQUEST + 5 }, () => spans[0]);
+    const many = Array.from({ length: MAX_SPANS_PER_REQUEST + 5 }, () => itemAt(spans, 0));
     const result = await sendSpans(target, many, { pluginVersion: "1" }, fetchImpl);
     expect(result.spans).toBe(many.length);
     expect(sent.map((request) => request.spans.length)).toEqual([MAX_SPANS_PER_REQUEST, 5]);
@@ -520,7 +531,7 @@ describe("TraceBuilder", () => {
     history.turn();
     const builder = new TraceBuilder({ content: false });
     builder.apply(history.events);
-    const [turn] = builder.snapshot(history.now);
+    const turn = itemAt(builder.snapshot(history.now), 0);
     expect(turn).toMatchObject({
       id: "turn-1",
       index: 1,
@@ -536,7 +547,7 @@ describe("TraceBuilder", () => {
       ["tool", "mcp__docs__search", "completed"],
       ["read", "Read", "completed"],
     ]);
-    expect(turn.spans[0].exitCode).toBe(0);
+    expect(itemAt(turn.spans, 0).exitCode).toBe(0);
     expect(turn.activity.map((activity) => activity.kind)).toEqual(["thinking", "writing"]);
     expect(modelStretches(turn, history.now).length).toBeGreaterThan(1);
   });
@@ -555,15 +566,15 @@ describe("TraceBuilder", () => {
     history.turn();
     const builder = new TraceBuilder({ content: true });
     builder.apply(history.events);
-    const [turn] = builder.snapshot(history.now);
+    const turn = itemAt(builder.snapshot(history.now), 0);
     expect(turn.input).toBe(SECRETS.prompt);
     expect(turn.replies).toEqual([SECRETS.reply]);
-    expect(turn.spans[0]).toMatchObject({
+    expect(itemAt(turn.spans, 0)).toMatchObject({
       name: "deploy-acme-prod.sh",
       args: SECRETS.command,
       result: SECRETS.output,
     });
-    expect(turn.spans[1]).toMatchObject({
+    expect(itemAt(turn.spans, 1)).toMatchObject({
       args: JSON.stringify({ query: SECRETS.toolArg }),
       result: SECRETS.toolResult,
     });
@@ -604,7 +615,9 @@ describe("TraceBuilder", () => {
     builder.apply(history.events);
     const turns = builder.snapshot(history.now);
     expect(turns).toHaveLength(1);
-    const [agent, command] = turns[0].spans;
+    const turnSpans = itemAt(turns, 0).spans;
+    const agent = itemAt(turnSpans, 0);
+    const command = itemAt(turnSpans, 1);
     // The kind of agent is kept; the task it was given is not.
     expect(agent).toMatchObject({
       kind: "subagent",
@@ -637,7 +650,7 @@ describe("TraceBuilder", () => {
     history.complete("turn-1");
     const builder = new TraceBuilder({ content: false });
     builder.apply(history.events);
-    expect(builder.snapshot(history.now)[0].spans[0]).toMatchObject({
+    expect(itemAt(itemAt(builder.snapshot(history.now), 0).spans, 0)).toMatchObject({
       toolName: "Task",
       agent: "subagent",
     });
@@ -649,7 +662,7 @@ describe("TraceBuilder", () => {
     history.request("queued");
     const builder = new TraceBuilder({ content: false, indexOffset: 4 });
     builder.apply(history.events);
-    expect(builder.snapshot(history.now)[0].index).toBe(5);
+    expect(itemAt(builder.snapshot(history.now), 0).index).toBe(5);
     const queued = history.events.at(-1)!;
     expect(builder.earliestUnmatchedRequest(0)).toBe(queued.seq);
     expect(builder.earliestUnmatchedRequest(queued.createdAt + 1)).toBeNull();

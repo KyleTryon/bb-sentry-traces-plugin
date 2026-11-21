@@ -24,9 +24,10 @@ const HEREDOC_WORD = "<<…";
  * step, and `cat <<EOF | …` only hands text to the next program.
  */
 function writesFile(words: string[]): boolean {
-  if (words[0] === "tee") return true;
-  if (words[0] === "cat" && words.includes(HEREDOC_WORD)) return true;
-  return ["cat", "echo", "printf"].includes(words[0]) && words.some((word) => word.startsWith(">"));
+  const [program = ""] = words;
+  if (program === "tee") return true;
+  if (program === "cat" && words.includes(HEREDOC_WORD)) return true;
+  return ["cat", "echo", "printf"].includes(program) && words.some((word) => word.startsWith(">"));
 }
 
 /**
@@ -50,7 +51,7 @@ export function shellCommands(command: string): string[][] {
     words = [];
   };
   for (let index = 0; index < command.length; index++) {
-    const char = command[index];
+    const char = command.charAt(index);
     const next = command[index + 1];
     if (char === "'") {
       const close = command.indexOf(char, index + 1);

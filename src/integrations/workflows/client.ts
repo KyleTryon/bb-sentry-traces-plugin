@@ -67,9 +67,9 @@ export class WorkflowsClient {
       return null;
     }
     // Any client can write thread metadata, so only well-formed values count.
-    const runId = text(metadata.runId);
-    const callId = text(metadata.callId);
-    const originThreadId = text(metadata.originThreadId) || thread.lifecycleOwnerThreadId || "";
+    const runId = text(metadata['runId']);
+    const callId = text(metadata['callId']);
+    const originThreadId = text(metadata['originThreadId']) || thread.lifecycleOwnerThreadId || "";
     if (!runId || !callId || !originThreadId) return null;
 
     const run = await this.runView(originThreadId, runId);

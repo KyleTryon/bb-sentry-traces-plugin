@@ -78,10 +78,11 @@ export async function previewThread(
     : folded.turns.filter((turn) => turn.end !== null);
   const picked = options.turns === "all" ? eligible : eligible.slice(-options.turns);
   const usage = new Map<string, TurnUsage>();
-  if (picked.length > 0 && picked.length === folded.turns.length) {
+  const newest = picked.at(-1);
+  if (newest && picked.length === folded.turns.length) {
     const total = await readUsage(ctx, thread.id);
     if (total && !isEmptyUsage(total)) {
-      usage.set(picked[picked.length - 1].id, {
+      usage.set(newest.id, {
         usage: toSentryUsage(total),
         turns: picked.length,
       });
@@ -371,12 +372,13 @@ export async function exportThread(ctx: ExportContext, thread: ThreadInfo): Prom
   const sentTurn = state?.sentTurn ?? null;
   const waitedBefore = new Set(state?.waiting ?? []);
   const due = dueTurns(finished, sentTurn, waitedBefore);
-  if (due.length === 0) return settleIdle(ctx, thread, state, folded, sentTurn);
+  const [oldestDue] = due;
+  if (oldestDue === undefined) return settleIdle(ctx, thread, state, folded, sentTurn);
 
   const now = ctx.now();
   // A thread never sent before starts at its newest turn: the turns before
   // it count as done, so a first export that fails or waits keeps that turn.
-  const baseline = sentTurn ?? due[0].index - 1;
+  const baseline = sentTurn ?? oldestDue.index - 1;
   const knownTotal = knowsTotal(state, folded, due);
   const { waits, waitUntil } = waitingOn(due, now);
   const pending = due.filter((turn) => !waits(turn));
@@ -397,11 +399,12 @@ export async function exportThread(ctx: ExportContext, thread: ThreadInfo): Prom
   const usageTurns = state?.usageTurns ?? 0;
   const current = pending.length > 0 ? await readUsage(ctx, thread.id) : null;
   const usage = new Map<string, TurnUsage>();
-  if (pending.length > 0 && !usageWaitsForTurn && current && knownTotal) {
+  const newestPending = pending.at(-1);
+  if (newestPending && !usageWaitsForTurn && current && knownTotal) {
     const delta = usageDelta(current, state?.usage ?? null);
     if (delta && !isEmptyUsage(delta)) {
       // One span of one turn carries it, so cost is never counted twice.
-      usage.set(pending[pending.length - 1].id, {
+      usage.set(newestPending.id, {
         usage: toSentryUsage(delta),
         turns: pending.length + usageTurns,
       });

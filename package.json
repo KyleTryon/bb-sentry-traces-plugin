@@ -29,9 +29,10 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
+    "lint": "oxlint --type-aware --type-check -c .oxlintrc.json .",
     "test": "vitest run --config vitest.config.ts",
     "build": "bb plugin build .",
-    "check": "npm run typecheck && npm test"
+    "check": "npm run typecheck && npm run lint && npm test"
   },
   "dependencies": {
     "zod": "^4.6.5"
@@ -43,6 +44,8 @@
     "better-sqlite3": "^12.0.0",
     "cron-parser": "^5.5.0",
     "hono": "^4.11.9",
+    "oxlint": "^1.94.0",
+    "oxlint-tsgolint": "^7.0.2007",
     "typescript": "^5.7.0",
     "vitest": "^3.2.4"
   },

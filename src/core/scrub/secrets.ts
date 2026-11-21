@@ -66,7 +66,8 @@ class LineQuotes {
     let high = all.length;
     while (low < high) {
       const middle = (low + high) >> 1;
-      if (all[middle] < from) low = middle + 1;
+      const quoteAt = all[middle];
+      if (quoteAt !== undefined && quoteAt < from) low = middle + 1;
       else high = middle;
     }
     return low === 0 ? all : all.slice(low);
@@ -97,7 +98,8 @@ function inlineValueEnd(text: string, at: number, line: LineQuotes): number {
   }
   const open = at + (escaped ? 2 : 1);
   const more = line.after(open, quote, escaped);
-  if (more.length === 0) {
+  const first = more[0];
+  if (first === undefined) {
     const limit = Math.min(text.length, line.end + MAX_VALUE_LINES_CHARS);
     for (let index = line.end; index < limit; index++) {
       if (isQuote(text, index, quote, escaped)) return index + 1;
@@ -107,7 +109,7 @@ function inlineValueEnd(text: string, at: number, line: LineQuotes): number {
   if (more.length % 2 === 0) return line.end;
   INLINE_NAME.lastIndex = open;
   const next = INLINE_NAME.exec(text);
-  return next && next.index < more[0] ? line.end : more[0] + 1;
+  return next && next.index < first ? line.end : first + 1;
 }
 
 function scrubInlineAssignments(text: string): string {
@@ -220,7 +222,7 @@ function keyBodyEnd(text: string, from: number): number {
       }
     }
     let stop = start;
-    while (stop < text.length && KEY_CHAR.test(text[stop])) stop++;
+    while (stop < text.length && KEY_CHAR.test(text.charAt(stop))) stop++;
     const piece = text.slice(start, stop);
     // A key's last line can be short and look like a word. Alone on the line
     // right after a long line of body, it is taken to be that last line.
@@ -243,9 +245,10 @@ function keyBodyStart(text: string, to: number): number {
     const stop = skipGapBack(text, at);
     if (stop === at) break;
     let first = stop;
-    while (first > 0 && KEY_CHAR.test(text[first - 1])) first--;
+    while (first > 0 && KEY_CHAR.test(text.charAt(first - 1))) first--;
     // The `n` of a JSON `\n` is a line break, not the piece's first character.
-    if (first > 0 && first < stop && text[first - 1] === "\\" && "nrt".includes(text[first])) first++;
+    if (first > 0 && first < stop && text[first - 1] === "\\" && "nrt".includes(text.charAt(first)))
+      first++;
     const piece = text.slice(first, stop);
     // The line just before the marker is the key's last line, short or not.
     const lastLine = nearest && LINE_BREAK.test(text.slice(stop, at)) && startsLine(text, first);

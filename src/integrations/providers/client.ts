@@ -73,7 +73,7 @@ export class TraceProviders {
       error: null,
       answered: false,
       failingSince: null,
-      unreadable: new Map(),
+      unreadable: new Map<string, number>(),
     };
     this.state.set(provider, state);
     const now = this.now();
@@ -99,7 +99,7 @@ export class TraceProviders {
           // its threads from being placed.
           if (state.unreadable.size >= MAX_UNREADABLE) {
             const [oldest] = state.unreadable.keys();
-            state.unreadable.delete(oldest);
+            if (oldest !== undefined) state.unreadable.delete(oldest);
           }
           state.unreadable.set(question, failedAt + UNAVAILABLE_MS);
         }
@@ -119,7 +119,7 @@ export class TraceProviders {
       output = await this.bb.sdk.plugins.callRpc({
         pluginId: provider,
         method,
-        input: { contract: CONTRACT_VERSION, ...input } as never,
+        input: { contract: CONTRACT_VERSION, ...input },
         outputSchema: z.unknown(),
       });
     } catch (cause) {

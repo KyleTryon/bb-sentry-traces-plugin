@@ -110,7 +110,7 @@ function itemStatus(value: unknown): Status {
 function unwrapCommand(command: unknown): string {
   const raw = Array.isArray(command) ? command.map(text).join(" ") : text(command);
   const wrapped = /^\/bin\/(?:ba|z)?sh -lc (["'])([\s\S]*)\1$/.exec(raw.trim());
-  return wrapped ? wrapped[2] : raw;
+  return wrapped?.[2] ?? raw;
 }
 
 const THREAD_MESSAGE_PREFIX = /^\s*\[bb message from thread:([^\]\s]+)\]\s*/;
@@ -146,7 +146,7 @@ function agentKind(value: unknown): string {
  * own name: nothing the user or the model wrote.
  */
 function describe(item: Json, content: boolean): Description {
-  const title = content ? text(record(item.presentation).title) : "";
+  const title = content ? text(record(item['presentation'])['title']) : "";
   const plain = (kind: SpanKind, toolName: string): Description => ({
     kind,
     toolName,
@@ -156,11 +156,11 @@ function describe(item: Json, content: boolean): Description {
     args: null,
     agent: null,
   });
-  switch (item.type) {
+  switch (item['type']) {
     case "commandExecution": {
       const base = plain("command", "shell");
       if (!content) return base;
-      const command = unwrapCommand(item.command);
+      const command = unwrapCommand(item['command']);
       return {
         ...base,
         name: programOf(command),
@@ -171,14 +171,14 @@ function describe(item: Json, content: boolean): Description {
     case "fileRead": {
       const base = plain("read", "Read");
       if (!content) return base;
-      const path = text(item.path);
+      const path = text(item['path']);
       return { ...base, detail: basename(path) || title, args: scrub(path, MAX_ARGS) || null };
     }
     case "fileChange": {
       const base = plain("edit", "Edit");
       if (!content) return base;
-      const changes = Array.isArray(item.changes) ? item.changes : [];
-      const paths = changes.map((change) => text(record(change).path)).filter(Boolean);
+      const changes = Array.isArray(item['changes']) ? item['changes'] : [];
+      const paths = changes.map((change) => text(record(change)['path'])).filter(Boolean);
       return {
         ...base,
         detail: clip(paths.map(basename).join(", ")) || title,
@@ -188,59 +188,59 @@ function describe(item: Json, content: boolean): Description {
     case "search": {
       const base = plain("search", "Search");
       if (!content) return base;
-      const query = text(item.query);
+      const query = text(item['query']);
       return { ...base, detail: clip(query || title), args: scrub(query, MAX_ARGS) || null };
     }
     case "webSearch": {
       const base = plain("web", "WebSearch");
       if (!content) return base;
-      const query = text(item.query);
+      const query = text(item['query']);
       return { ...base, detail: clip(query || title), args: scrub(query, MAX_ARGS) || null };
     }
     case "webFetch": {
       const base = plain("web", "WebFetch");
       if (!content) return base;
-      const url = text(item.url);
+      const url = text(item['url']);
       return { ...base, detail: clip(url || title), args: scrub(url, MAX_ARGS) || null };
     }
     case "contextCompaction":
       return plain("compaction", "Compaction");
     case "delegation": {
-      const background = item.background === true;
+      const background = item['background'] === true;
       const base = { ...plain("subagent", "delegation"), name: SUBAGENT, agent: SUBAGENT, background };
-      return content ? { ...base, detail: clip(text(item.label) || title) } : base;
+      return content ? { ...base, detail: clip(text(item['label']) || title) } : base;
     }
     case "backgroundTask": {
       const base = { ...plain("background", "Background"), background: true };
       if (!content) return base;
-      return { ...base, detail: clip(text(item.description) || title) };
+      return { ...base, detail: clip(text(item['description']) || title) };
     }
     case "toolCall": {
-      const tool = text(item.tool) || "tool";
-      const args = record(item.arguments);
+      const tool = text(item['tool']) || "tool";
+      const args = record(item['arguments']);
       if (SUBAGENT_TOOLS.has(tool)) {
-        const background = args.run_in_background === true;
-        const agent = agentKind(args.subagent_type);
+        const background = args['run_in_background'] === true;
+        const agent = agentKind(args['subagent_type']);
         const base = { ...plain("subagent", tool), name: agent, agent, background };
         if (!content) return base;
         return {
           ...base,
-          detail: clip(text(args.description) || title),
-          args: scrubValue(item.arguments, MAX_ARGS) || null,
+          detail: clip(text(args['description']) || title),
+          args: scrubValue(item['arguments'], MAX_ARGS) || null,
         };
       }
       const base = plain("tool", tool);
       if (!content) return base;
       return {
         ...base,
-        detail: clip(title || text(item.server)),
-        args: scrubValue(item.arguments, MAX_ARGS) || null,
+        detail: clip(title || text(item['server'])),
+        args: scrubValue(item['arguments'], MAX_ARGS) || null,
       };
     }
     default: {
       // The static label a plugin or provider registered for this kind of row.
-      const label = record(record(item.presentation).label);
-      const base = plain("tool", text(item.type) || text(label.completed) || "tool");
+      const label = record(record(item['presentation'])['label']);
+      const base = plain("tool", text(item['type']) || text(label['completed']) || "tool");
       return content ? { ...base, detail: clip(title) } : base;
     }
   }
@@ -251,27 +251,27 @@ function describeInteraction(
   payload: Json,
   content: boolean,
 ): Pick<Span, "toolName" | "name" | "detail"> {
-  const kind = text(payload.kind);
+  const kind = text(payload['kind']);
   if (kind === "user_question") {
-    const [first] = Array.isArray(payload.questions) ? payload.questions.map(record) : [];
+    const [first] = Array.isArray(payload['questions']) ? payload['questions'].map(record) : [];
     return {
       toolName: "Question",
       name: "Question",
-      detail: content ? clip(text(first?.prompt) || text(first?.shortLabel)) : "",
+      detail: content ? clip(text(first?.['prompt']) || text(first?.['shortLabel'])) : "",
     };
   }
   const toolName =
     kind.includes("permission") || kind.includes("approval") ? "Approval" : "Waiting for user";
   return {
     toolName,
-    name: content ? clip(text(payload.title)) || toolName : toolName,
+    name: content ? clip(text(payload['title'])) || toolName : toolName,
     detail: content ? clip(kind.replace(/_/g, " ")) : "",
   };
 }
 
 function errorOf(item: Json): string | null {
-  const error = item.error;
-  const message = typeof error === "string" ? error : text(record(error).message);
+  const error = item['error'];
+  const message = typeof error === "string" ? error : text(record(error)['message']);
   return message ? clip(message, MAX_ERROR) : null;
 }
 
@@ -400,24 +400,24 @@ export class TraceBuilder {
     const turnId = event.scope.turnId;
     switch (event.type) {
       case "client/turn/requested": {
-        const requestId = text(data.requestId);
+        const requestId = text(data['requestId']);
         if (!requestId) return;
-        const input = Array.isArray(data.input) ? data.input : [];
-        const parts = input.map((part) => text(record(part).text)).filter(Boolean);
+        const input = Array.isArray(data['input']) ? data['input'] : [];
+        const parts = input.map((part) => text(record(part)['text'])).filter(Boolean);
         // bb prefixes messages from other threads and its own notices.
         const first = parts[0] ?? "";
         const prefix = THREAD_MESSAGE_PREFIX.exec(first);
         const system = prefix ? null : SYSTEM_MESSAGE_PREFIX.exec(first);
-        const execution = record(data.execution);
+        const execution = record(data['execution']);
         this.requests.set(requestId, {
           input: this.content ? scrub(parts.join("\n\n"), MAX_INPUT) : null,
-          sender: text(data.senderThreadId) || prefix?.[1] || (system ? BB_SENDER : null),
-          model: text(execution.model) || null,
-          reasoningLevel: text(execution.reasoningLevel) || null,
-          serviceTier: text(execution.serviceTier) || null,
-          permissionMode: text(execution.permissionMode) || null,
-          initiator: text(data.initiator) || null,
-          source: text(data.source) || null,
+          sender: text(data['senderThreadId']) || prefix?.[1] || (system ? BB_SENDER : null),
+          model: text(execution['model']) || null,
+          reasoningLevel: text(execution['reasoningLevel']) || null,
+          serviceTier: text(execution['serviceTier']) || null,
+          permissionMode: text(execution['permissionMode']) || null,
+          initiator: text(data['initiator']) || null,
+          source: text(data['source']) || null,
           seq: event.seq,
           at: event.createdAt,
           matched: false,
@@ -425,11 +425,11 @@ export class TraceBuilder {
         return;
       }
       case "turn/started":
-        if (turnId) this.startTurn(turnId, text(data.parentToolCallId), event);
+        if (turnId) this.startTurn(turnId, text(data['parentToolCallId']), event);
         return;
       case "turn/input/accepted": {
         const turn = turnId ? this.turns.get(turnId) : undefined;
-        const request = this.requests.get(text(data.clientRequestId));
+        const request = this.requests.get(text(data['clientRequestId']));
         if (turn && request && turn.requestSeq === null) this.acceptRequest(turn, request, event);
         return;
       }
@@ -443,7 +443,7 @@ export class TraceBuilder {
         if (!turn) return;
         this.touch(turn, event.seq, event.createdAt);
         turn.end = event.createdAt;
-        turn.status = itemStatus(data.status);
+        turn.status = itemStatus(data['status']);
         turn.error = errorOf(data);
         if (this.activeTurn === turn.id) this.activeTurn = null;
         return;
@@ -452,16 +452,16 @@ export class TraceBuilder {
       case "item/completed":
       case "item/backgroundTask/progress":
       case "item/backgroundTask/completed":
-        this.foldItem(turnId, record(data.item), event);
+        this.foldItem(turnId, record(data['item']), event);
         return;
       case "system/interaction/lifecycle":
-        this.foldInteraction(turnId, record(data.interaction), event);
+        this.foldInteraction(turnId, record(data['interaction']), event);
         return;
       case "provider/error":
         this.addMarker(turnId, event, {
           toolName: "Provider error",
           errorType: "provider_error",
-          error: [text(data.message), text(data.detail)].filter(Boolean).join(": "),
+          error: [text(data['message']), text(data['detail'])].filter(Boolean).join(": "),
           status: "failed",
         });
         return;
@@ -469,7 +469,7 @@ export class TraceBuilder {
         this.addMarker(turnId, event, {
           toolName: "bb error",
           errorType: "bb_error",
-          error: text(data.message) || text(data.code),
+          error: text(data['message']) || text(data['code']),
           status: "failed",
         });
         return;
@@ -477,33 +477,33 @@ export class TraceBuilder {
         this.addMarker(turnId, event, {
           toolName: "Stopped",
           errorType: "interrupted",
-          error: text(data.reason),
+          error: text(data['reason']),
           status: "interrupted",
         });
         return;
       case "provider/modelFallback": {
         const turn = this.turnFor(turnId);
-        const model = text(data.fallbackModel);
+        const model = text(data['fallbackModel']);
         if (turn && model) {
-          turn.fallback = { model, reason: text(data.reason) || null, at: event.createdAt };
+          turn.fallback = { model, reason: text(data['reason']) || null, at: event.createdAt };
         }
         return;
       }
       case "provider/rateLimits/updated": {
         const turn = this.turnFor(turnId);
-        const status = text(record(data.rateLimits).status);
+        const status = text(record(data['rateLimits'])['status']);
         if (turn && status) turn.rateLimitStatus = status;
         return;
       }
       case "thread/contextWindowUsage/updated": {
         const turn = this.turnFor(turnId);
         if (!turn) return;
-        const usage = record(data.contextWindowUsage);
-        const snapshot = record(usage.snapshot);
+        const usage = record(data['contextWindowUsage']);
+        const snapshot = record(usage['snapshot']);
         const number = (...values: unknown[]) =>
           values.find((value): value is number => typeof value === "number") ?? null;
-        const usedTokens = number(usage.usedTokens, snapshot.usedTokens);
-        const windowTokens = number(usage.modelContextWindow, snapshot.contextWindowTokens);
+        const usedTokens = number(usage['usedTokens'], snapshot['usedTokens']);
+        const windowTokens = number(usage['modelContextWindow'], snapshot['contextWindowTokens']);
         if (usedTokens !== null || windowTokens !== null) turn.context = { usedTokens, windowTokens };
         return;
       }
@@ -653,10 +653,10 @@ export class TraceBuilder {
 
   /** Approvals, questions, and other forms that wait on the user. */
   private foldInteraction(turnId: string | undefined, interaction: Json, event: TraceEvent): void {
-    const interactionId = text(interaction.id);
+    const interactionId = text(interaction['id']);
     if (!interactionId) return;
     const id = `interaction:${interactionId}`;
-    const status = text(interaction.status);
+    const status = text(interaction['status']);
     // Still waiting: asked, or answered and on its way to the agent.
     const waiting = status === "pending" || status === "resolving";
     const existing = this.spans.get(id);
@@ -676,17 +676,17 @@ export class TraceBuilder {
     this.addSpan(turn, {
       ...this.blankSpan(id, event.seq),
       kind: "waiting",
-      ...describeInteraction(record(interaction.payload), this.content),
+      ...describeInteraction(record(interaction['payload']), this.content),
       start: event.createdAt,
     });
   }
 
   private foldItem(turnId: string | undefined, item: Json, event: TraceEvent): void {
-    const id = text(item.id);
-    const type = text(item.type);
+    const id = text(item['id']);
+    const type = text(item['type']);
     if (!id || SKIPPED_ITEMS.has(type)) return;
     const parentToolCallId =
-      text(item.parentToolCallId) || (turnId && this.turnParent.get(turnId)) || "";
+      text(item['parentToolCallId']) || (turnId && this.turnParent.get(turnId)) || "";
     // Background tasks report completion outside any turn; find their turn
     // through the span itself or the tool call that started it.
     const root = turnId
@@ -696,8 +696,9 @@ export class TraceBuilder {
     if (!turn) return;
     this.touch(turn, event.seq, event.createdAt);
 
-    if (type in ACTIVITY_ITEMS) {
-      this.foldActivity(turn, id, ACTIVITY_ITEMS[type], parentToolCallId, event);
+    const activity = ACTIVITY_ITEMS[type];
+    if (activity !== undefined) {
+      this.foldActivity(turn, id, activity, parentToolCallId, event);
       // Only the turn's own agent writes the replies the user reads.
       if (
         this.content &&
@@ -705,12 +706,12 @@ export class TraceBuilder {
         event.type === "item/completed" &&
         !parentToolCallId
       ) {
-        const reply = text(item.text).trim();
+        const reply = text(item['text']).trim();
         if (reply) turn.replies.push(scrubTail(reply, MAX_REPLY));
       }
       return;
     }
-    if (type === "backgroundTask" && AGENT_TASK_TYPES.has(text(item.taskType))) {
+    if (type === "backgroundTask" && AGENT_TASK_TYPES.has(text(item['taskType']))) {
       this.foldSubagentTask(parentToolCallId, item, event);
       return;
     }
@@ -753,14 +754,14 @@ export class TraceBuilder {
   private finish(span: Span, item: Json, event: TraceEvent): void {
     span.end = Math.max(event.createdAt, span.start);
     span.endSeq = event.seq;
-    span.status = itemStatus(item.status);
-    if (typeof item.exitCode === "number") span.exitCode = item.exitCode;
+    span.status = itemStatus(item['status']);
+    if (typeof item['exitCode'] === "number") span.exitCode = item['exitCode'];
     if (span.status === "failed") span.errorType = "tool_error";
     else if (span.status === "interrupted") span.errorType = "interrupted";
     if (!this.content) return;
     // A tool's error text and output are tool output.
     span.error = errorOf(item) ?? span.error;
-    const result = scrubValue(item.aggregatedOutput ?? item.result, MAX_RESULT);
+    const result = scrubValue(item['aggregatedOutput'] ?? item['result'], MAX_RESULT);
     if (result) span.result = result;
   }
 
@@ -804,10 +805,10 @@ export class TraceBuilder {
    * keeps working in the background, so the task says when it really ends.
    */
   private foldSubagentTask(spanId: string, item: Json, event: TraceEvent): void {
-    this.recordSubagentUsage(spanId, record(item.usage));
+    this.recordSubagentUsage(spanId, record(item['usage']));
     const span = this.spans.get(spanId);
     if (!span) return;
-    const status = itemStatus(item.status);
+    const status = itemStatus(item['status']);
     const finished = event.type === "item/backgroundTask/completed" || status !== "running";
     if (!finished) {
       // Its call already returned, so the agent runs in the background.
@@ -826,7 +827,7 @@ export class TraceBuilder {
   }
 
   private recordSubagentUsage(spanId: string, usage: Json): void {
-    const tokens = usage.totalTokens;
+    const tokens = usage['totalTokens'];
     if (!spanId || typeof tokens !== "number") return;
     const span = this.spans.get(spanId);
     if (span) span.tokens = tokens;

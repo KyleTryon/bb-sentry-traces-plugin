@@ -103,7 +103,9 @@ function fitReplies(replies: readonly string[]): string[] {
   const kept: string[] = [];
   let room = MAX_REPLY;
   for (let index = replies.length - 1; index >= 0 && room > 0; index--) {
-    const reply = rescrub(replies[index], room, "end");
+    const text = replies[index];
+    if (text === undefined) continue;
+    const reply = rescrub(text, room, "end");
     kept.unshift(reply);
     room -= reply.length;
   }
@@ -118,9 +120,17 @@ function toolSpanName(span: Span): string {
     case "compaction":
     case "error":
       return span.toolName;
-    default:
-      return `execute_tool ${span.toolName}`;
+    case "command":
+    case "tool":
+    case "read":
+    case "edit":
+    case "search":
+    case "web":
+    case "subagent":
+    case "background":
+      break;
   }
+  return `execute_tool ${span.toolName}`;
 }
 
 function sentryOp(span: Span): string {
@@ -133,9 +143,17 @@ function sentryOp(span: Span): string {
       return "bb.compaction";
     case "error":
       return "bb.error";
-    default:
-      return "gen_ai.execute_tool";
+    case "command":
+    case "tool":
+    case "read":
+    case "edit":
+    case "search":
+    case "web":
+    case "subagent":
+    case "background":
+      break;
   }
+  return "gen_ai.execute_tool";
 }
 
 /** The spans of one finished or running turn. */

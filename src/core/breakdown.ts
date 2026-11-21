@@ -83,26 +83,26 @@ export function laneBreakdown(turn: TimedTurn, lane: string | null, now: number)
   ]);
   edges.sort((a, b) => a.at - b.at);
   const counts = Array.from({ length: PHASES.length }, () => 0);
-  const modelRank = PHASES.indexOf("model");
   const segments: Segment[] = [];
   let cursor = from;
-  let index = 0;
   const emit = (until: number) => {
     if (until <= cursor) return;
     const rank = counts.findIndex((count) => count > 0);
-    const phase = PHASES[rank === -1 ? modelRank : rank];
+    // Nothing in play is the model's own time.
+    const phase = (rank === -1 ? undefined : PHASES[rank]) ?? "model";
     const last = segments.at(-1);
     if (last && last.phase === phase && last.end === cursor) last.end = until;
     else segments.push({ phase, start: cursor, end: until });
     cursor = until;
   };
-  while (index < edges.length) {
-    const at = edges[index].at;
-    emit(at);
-    while (index < edges.length && edges[index].at === at) {
-      counts[edges[index].rank] += edges[index].delta;
-      index++;
+  // Edges at the same moment are applied together, after the moment is emitted.
+  let at: number | undefined;
+  for (const edge of edges) {
+    if (edge.at !== at) {
+      emit(edge.at);
+      at = edge.at;
     }
+    counts[edge.rank] = (counts[edge.rank] ?? 0) + edge.delta;
   }
   emit(to);
   return segments;

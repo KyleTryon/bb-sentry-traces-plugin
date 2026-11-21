@@ -33,7 +33,9 @@ for (const path of sourceFiles(ROOT)) {
   const file = rel(path);
   const local: string[] = [];
   const packages: string[] = [];
-  for (const [, spec] of readFileSync(path, "utf8").matchAll(/(?:from\s+|import\()\s*"([^"]+)"/g)) {
+  for (const match of readFileSync(path, "utf8").matchAll(/(?:from\s+|import\()\s*"([^"]+)"/g)) {
+    const spec = match[1];
+    if (spec === undefined) continue;
     if (spec.startsWith(".")) local.push(`${posix.join(posix.dirname(file), spec.replace(/\.js$/, ""))}.ts`);
     else packages.push(spec);
   }
