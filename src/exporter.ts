@@ -64,6 +64,13 @@ export interface ThreadState {
   /** Whether `usage` was actually read, so a null means "none yet", not "unknown". */
   usageKnown: boolean;
   /**
+   * Turns at or before `sentTurn` that are not sent yet: held back for a
+   * background subagent still at work, or waiting to be sent again.
+   */
+  waiting?: number[] | null;
+  /** Turns sent since `usage` was read whose share of it was not sent yet. */
+  usageTurns?: number;
+  /**
    * A turn whose spans went out in several requests and stopped part way:
    * the ids of the spans Sentry already has, so they are not sent twice.
    */
@@ -162,6 +169,9 @@ const BACKGROUND_AGENT_WAIT_MS = 2 * 60 * 60_000;
 /** How often a waiting turn is looked at again: sooner while its wait is young. */
 const WAIT_CHECK_MIN_MS = 60_000;
 const WAIT_CHECK_MAX_MS = 15 * 60_000;
+/** At most this many waiting turns are remembered per thread. */
+const MAX_WAITING_TURNS = 50;
+const NO_TURNS: ReadonlySet<number> = new Set();
 
 const EVENT_TYPES = [...TRACE_EVENT_TYPES] as unknown as Parameters<
   BbPluginApi["sdk"]["threads"]["events"]["list"]
@@ -184,6 +194,19 @@ interface Folded {
 /** A subagent of the turn whose agent is still working in the background. */
 function hasRunningAgent(turn: Turn): boolean {
   return turn.spans.some((span) => span.kind === "subagent" && span.end === null);
+}
+
+/** What is remembered about a thread before anything of it was read. */
+function newThreadState(now: number): ThreadState {
+  return {
+    sentTurn: null,
+    resumeSeq: 0,
+    turnsBefore: 0,
+    usage: null,
+    usageKnown: false,
+    partial: null,
+    updatedAt: now,
+  };
 }
 
 export function emptyStats(): Stats {
@@ -349,12 +372,22 @@ export class Exporter {
     return rows.length > 0 ? readTotal(rows[0].data) : null;
   }
 
-  /** Where the next export can start reading without losing a turn's prompt or start. */
-  private resumePoint(folded: Folded, state: ThreadState | undefined, sentTurn: number | null) {
+  /**
+   * Where the next export can start reading without losing a turn's prompt or
+   * start: before every turn that is not done, including those still waiting.
+   */
+  private resumePoint(
+    folded: Folded,
+    state: ThreadState | undefined,
+    sentTurn: number | null,
+    waiting: ReadonlySet<number>,
+  ) {
     const previous = state?.resumeSeq ?? 0;
     const candidates = [Math.max(previous, folded.builder.lastSeq)];
     for (const turn of folded.turns) {
-      if (turn.end !== null && sentTurn !== null && turn.index <= sentTurn) continue;
+      if (turn.end !== null && sentTurn !== null && turn.index <= sentTurn && !waiting.has(turn.index)) {
+        continue;
+      }
       candidates.push(Math.min(turn.firstSeq, turn.requestSeq ?? turn.firstSeq) - 1);
     }
     const unanswered = folded.builder.earliestUnmatchedRequest(this.now() - REQUEST_WINDOW_MS);
@@ -409,6 +442,8 @@ export class Exporter {
     spans: OtlpSpan[];
     turns: number;
     trace: TraceContext | null;
+    /** A trace provider that may claim the thread did not answer: a real export would wait. */
+    traceUnknown: boolean;
     workflow: WorkflowContext | null;
   }> {
     const folded = await this.fold(thread.id, undefined, options.captureContent);
@@ -440,7 +475,7 @@ export class Exporter {
         usage,
       }),
     );
-    return { spans, turns: picked.length, trace, workflow };
+    return { spans, turns: picked.length, trace, traceUnknown: placed.trace === undefined, workflow };
   }
 
   private async exportThread(thread: ThreadInfo): Promise<ExportOutcome> {
@@ -452,16 +487,22 @@ export class Exporter {
     const key = THREAD_KEY + thread.id;
     let state = await this.kv.get<ThreadState>(key);
     let folded = await this.fold(thread.id, state, settings.captureContent);
-    // The newest finished turn a catch-up read passed over, in case no later read has one.
-    let passed: Turn | null = null;
     // Turning the plugin on sends what finishes from now on, not the whole
-    // history: a thread never sent before reads on to its newest turns.
+    // history: a thread never sent before reads on to its newest turns. Each
+    // read stops short of the newest finished turn it saw, so the next read
+    // still has that turn when no later one has finished.
     for (let reads = 0; folded.truncated && (state?.sentTurn ?? null) === null; reads++) {
-      const newest = folded.turns.filter((turn) => turn.end !== null).at(-1) ?? null;
-      const skipped = newest?.index ?? null;
+      const newest = folded.turns.filter((turn) => turn.end !== null).at(-1);
+      let point = this.resumePoint(folded, state, newest ? newest.index - 1 : null, NO_TURNS);
+      // The read began with that turn and a later turn fills the rest of it:
+      // that later turn is the newest, so read on past this one.
+      const later = newest ? folded.turns.some((turn) => turn.index > newest.index) : false;
+      if (newest && later && point.resumeSeq <= (state?.resumeSeq ?? 0)) {
+        point = this.resumePoint(folded, state, newest.index, NO_TURNS);
+      }
       const next: ThreadState = {
         sentTurn: null,
-        ...this.resumePoint(folded, state, skipped),
+        ...point,
         usage: state?.usage ?? null,
         usageKnown: state?.usageKnown ?? false,
         partial: null,
@@ -471,7 +512,6 @@ export class Exporter {
       if (next.resumeSeq <= (state?.resumeSeq ?? 0)) break;
       await this.kv.set(key, next);
       state = next;
-      if (newest) passed = newest;
       if (reads >= MAX_CATCH_UP_READS) {
         this.bb.log.debug(`Thread ${thread.id} has a long history; the next export reads on.`);
         return { kind: "nothing" };
@@ -481,73 +521,95 @@ export class Exporter {
     if (folded.truncated) {
       this.bb.log.warn(`Thread ${thread.id} has more events than one export reads; its newest turns may wait.`);
     }
-    let finished = folded.turns.filter((turn) => turn.end !== null);
-    // The catch-up read past the newest finished turn and found none after it.
-    if (finished.length === 0 && passed) finished = [passed];
+    const finished = folded.turns.filter((turn) => turn.end !== null);
     const sentTurn = state?.sentTurn ?? null;
-    const due = (
+    const waitedBefore = new Set(state?.waiting ?? []);
+    // Turns held back earlier for a background subagent, then the turns after the last one done.
+    const held = finished.filter(
+      (turn) => sentTurn !== null && turn.index <= sentTurn && waitedBefore.has(turn.index),
+    );
+    const fresh = (
       sentTurn !== null ? finished.filter((turn) => turn.index > sentTurn) : finished.slice(-1)
     ).slice(-MAX_TURNS_PER_EXPORT);
-    // A thread never sent before starts at its newest turn: the turns before
-    // it count as done, so a failed first export does not lose that turn.
-    const baseline = sentTurn ?? (due.length > 0 ? due[0].index - 1 : null);
-    // A turn whose background subagent still works waits for it, and the turns
-    // after it wait their turn.
-    const waitingAt = due.findIndex(
-      (turn) => hasRunningAgent(turn) && this.now() - (turn.end ?? 0) < BACKGROUND_AGENT_WAIT_MS,
-    );
-    const waiting = waitingAt !== -1;
-    const pending = waiting ? due.slice(0, waitingAt) : due;
-    const waitUntil = (() => {
-      if (!waiting) return null;
-      const ended = due[waitingAt].end ?? this.now();
-      const age = this.now() - ended;
-      const step = Math.min(WAIT_CHECK_MAX_MS, Math.max(WAIT_CHECK_MIN_MS, age));
-      return Math.min(ended + BACKGROUND_AGENT_WAIT_MS + 1_000, this.now() + step);
-    })();
+    const due = [...held, ...fresh];
 
-    if (pending.length === 0) {
+    if (due.length === 0) {
       if (state) {
         await this.kv.set(key, {
           ...state,
-          sentTurn: baseline,
-          ...this.resumePoint(folded, state, baseline),
+          waiting: null,
+          ...this.resumePoint(folded, state, sentTurn, NO_TURNS),
           updatedAt: this.now(),
         } satisfies ThreadState);
       }
       // A retry that finds nothing left to send is done.
-      if (waitUntil !== null) await this.scheduleCheck(thread.id, waitUntil);
-      else await this.clearRetry(thread.id);
+      await this.clearRetry(thread.id);
       return { kind: "nothing" };
     }
 
-    const { workflow, trace: placed } = await this.placement(thread);
-    if (placed === undefined) {
-      // A provider that may claim the thread did not answer: ask again later.
-      this.bb.log.debug(`A trace provider did not answer for ${thread.id}; its export waits.`);
-      await this.scheduleCheck(thread.id, this.now() + UNAVAILABLE_MS);
-      return { kind: "nothing" };
-    }
-    const trace = placed;
+    const now = this.now();
+    // A thread never sent before starts at its newest turn: the turns before
+    // it count as done, so a first export that fails or waits keeps that turn.
+    const baseline = sentTurn ?? due[0].index - 1;
+    // A turn whose background subagent still works waits for it; the turns
+    // after it go on without it.
+    const waits = (turn: Turn) =>
+      hasRunningAgent(turn) && now - (turn.end ?? now) < BACKGROUND_AGENT_WAIT_MS;
+    const pending = due.filter((turn) => !waits(turn));
+    const waitUntil = due.filter(waits).reduce<number | null>((soonest, turn) => {
+      const ended = turn.end ?? now;
+      const step = Math.min(WAIT_CHECK_MAX_MS, Math.max(WAIT_CHECK_MIN_MS, now - ended));
+      const at = Math.min(ended + BACKGROUND_AGENT_WAIT_MS + 1_000, now + step);
+      return soonest === null ? at : Math.min(soonest, at);
+    }, null);
 
-    const current = await this.readUsage(thread.id);
+    let workflow: WorkflowContext | null = null;
+    let trace: TraceContext | null = null;
+    if (pending.length > 0) {
+      const placed = await this.placement(thread);
+      if (placed.trace === undefined) {
+        // A provider that may claim the thread did not answer: ask again
+        // later, from where this export would have started.
+        this.bb.log.debug(`A trace provider did not answer for ${thread.id}; its export waits.`);
+        await this.kv.set(key, {
+          ...(state ?? newThreadState(now)),
+          sentTurn: baseline,
+          waiting: state?.waiting ?? null,
+          ...this.resumePoint(folded, state, baseline, waitedBefore),
+          updatedAt: now,
+        } satisfies ThreadState);
+        await this.scheduleCheck(thread.id, now + UNAVAILABLE_MS);
+        return { kind: "nothing" };
+      }
+      workflow = placed.workflow;
+      trace = placed.trace;
+    }
+
+    // While a turn waits, its tokens so far are in the thread's total too, and
+    // the total cannot be split by turn: the usage waits with it.
+    const usageWaitsForTurn = pending.length < due.length;
+    const usageTurns = state?.usageTurns ?? 0;
+    const current = pending.length > 0 ? await this.readUsage(thread.id) : null;
     const usage = new Map<string, TurnUsage>();
     // Without a known starting total, the total is this turn's only when the
     // thread has no other turns.
     const wholeThread =
-      !state && folded.turns.length === pending.length && (folded.turns[0]?.index ?? 1) === 1;
-    if (current && (state?.usageKnown || wholeThread)) {
+      !state?.usageKnown &&
+      (state?.resumeSeq ?? 0) === 0 &&
+      usageTurns === 0 &&
+      folded.turns.length === pending.length &&
+      (folded.turns[0]?.index ?? 1) === 1;
+    if (pending.length > 0 && !usageWaitsForTurn && current && (state?.usageKnown || wholeThread)) {
       const delta = usageDelta(current, state?.usage ?? null);
       if (delta && !isEmptyUsage(delta)) {
         // One span of one turn carries it, so cost is never counted twice.
         usage.set(pending[pending.length - 1].id, {
           usage: toSentryUsage(delta),
-          turns: pending.length,
+          turns: pending.length + usageTurns,
         });
       }
     }
 
-    const now = this.now();
     const resource = this.resource(settings);
     // Turns that started after the trace ended are the thread's own.
     const inTrace = pending.some((turn) => contextForTurn(turn, trace) !== null);
@@ -556,6 +618,7 @@ export class Exporter {
     // spans Sentry already took are never sent again.
     const partial = state?.partial ?? null;
     let lastDone = baseline;
+    const done = new Set<number>();
     let cut: { turnId: string; spanIds: string[] } | null = null;
     let failure: SendResult | null = null;
     let refused: SendResult | null = null;
@@ -563,7 +626,12 @@ export class Exporter {
     let turnsSent = 0;
     let spansSent = 0;
     const traceIds = new Set<string>();
-    for (const turn of pending) {
+    for (const turn of due) {
+      if (waits(turn)) {
+        // Passed over for now; it is remembered as waiting.
+        lastDone = Math.max(lastDone, turn.index);
+        continue;
+      }
       const all = turnSpans(turn, {
         thread,
         trace: contextForTurn(turn, trace),
@@ -579,7 +647,8 @@ export class Exporter {
       spansSent += accepted.length;
       for (const span of accepted) traceIds.add(span.traceId);
       if (result.ok) {
-        lastDone = turn.index;
+        done.add(turn.index);
+        lastDone = Math.max(lastDone, turn.index);
         turnsSent++;
         if (usage.has(turn.id)) usageSent = true;
         continue;
@@ -589,7 +658,8 @@ export class Exporter {
         this.bb.log.warn(`Sentry refused turn ${turn.index} of ${thread.id}, which is skipped: ${result.message}`);
         await this.recordFailure(result.message);
         refused = result;
-        lastDone = turn.index;
+        done.add(turn.index);
+        lastDone = Math.max(lastDone, turn.index);
         continue;
       }
       failure = result;
@@ -599,15 +669,23 @@ export class Exporter {
       };
       break;
     }
+    // Turns at or before the last one done that are not done: they wait, or
+    // waited and could not be sent this time.
+    const waiting = due
+      .filter((turn) => turn.index <= lastDone && !done.has(turn.index))
+      .map((turn) => turn.index)
+      .slice(-MAX_WAITING_TURNS);
 
     // The usage span goes last, so a turn that was cut short or refused never
     // sent it: the next export counts it again from the same starting total.
-    const usageWaits = usage.size > 0 && !usageSent;
+    const usageStays = usageWaitsForTurn || (usage.size > 0 && !usageSent);
     await this.kv.set(key, {
       sentTurn: lastDone,
-      ...this.resumePoint(folded, state, lastDone),
-      usage: usageWaits ? (state?.usage ?? null) : (current ?? state?.usage ?? null),
-      usageKnown: true,
+      waiting: waiting.length > 0 ? waiting : null,
+      ...this.resumePoint(folded, state, lastDone, new Set(waiting)),
+      usage: usageStays ? (state?.usage ?? null) : (current ?? state?.usage ?? null),
+      usageKnown: usageStays ? (state?.usageKnown ?? false) : true,
+      usageTurns: usageStays ? usageTurns + done.size : 0,
       partial: cut && cut.spanIds.length > 0 ? cut : null,
       updatedAt: now,
     } satisfies ThreadState);
@@ -622,6 +700,7 @@ export class Exporter {
     if (turnsSent === 0 && refused) {
       return { kind: "failed", message: refused.message, retryable: false };
     }
+    if (pending.length === 0) return { kind: "nothing" };
     return { kind: "sent", turns: turnsSent, spans: spansSent, traceIds: [...traceIds] };
   }
 

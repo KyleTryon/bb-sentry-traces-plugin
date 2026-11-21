@@ -249,32 +249,44 @@ export class TraceProviders {
     };
     this.state.set(provider, state);
     if (state.unavailableUntil > this.now()) return undefined;
+    const unavailable = (message: string, reached: boolean) => {
+      // Missing, disabled, older than the contract, or answering nonsense: not an error for us.
+      state.unavailableUntil = this.now() + UNAVAILABLE_MS;
+      if (reached) {
+        // It is there and said nothing this plugin can use: that is an answer, not an outage.
+        state.answered = true;
+        state.failingSince = null;
+      } else {
+        state.failingSince ??= this.now();
+      }
+      const text = message.slice(0, 300);
+      if (text !== state.error) {
+        this.bb.log.debug(`Trace provider ${provider} did not answer ${method}: ${text}`);
+      }
+      state.available = false;
+      state.error = text;
+      return undefined;
+    };
+    let output: unknown;
     try {
-      const output = await this.bb.sdk.plugins.callRpc({
+      // The answer is checked here rather than by the transport, so a call that
+      // failed can be told apart from an answer that does not fit the contract.
+      output = await this.bb.sdk.plugins.callRpc({
         pluginId: provider,
         method,
         input: { contract: CONTRACT_VERSION, ...input } as never,
-        outputSchema: schema,
+        outputSchema: z.unknown(),
       });
-      // Parsed here too, so the schema's defaults and limits hold whatever the transport does.
-      const parsed = schema.parse(output);
-      state.available = true;
-      state.error = null;
-      state.answered = true;
-      state.failingSince = null;
-      return parsed;
     } catch (cause) {
-      // Missing, disabled, older than the contract, or answering nonsense: not an error for us.
-      state.unavailableUntil = this.now() + UNAVAILABLE_MS;
-      state.failingSince ??= this.now();
-      const message = errorMessage(cause).slice(0, 300);
-      if (message !== state.error) {
-        this.bb.log.debug(`Trace provider ${provider} did not answer ${method}: ${message}`);
-      }
-      state.available = false;
-      state.error = message;
-      return undefined;
+      return unavailable(errorMessage(cause), false);
     }
+    const parsed = schema.safeParse(output);
+    if (!parsed.success) return unavailable(`unreadable answer: ${parsed.error.message}`, true);
+    state.available = true;
+    state.error = null;
+    state.answered = true;
+    state.failingSince = null;
+    return parsed.data;
   }
 
   /**

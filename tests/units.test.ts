@@ -508,3 +508,37 @@ describe("second review fixes", () => {
     expect(toSentryUsage(delta).cacheReadTokens).toBe(800);
   });
 });
+
+describe("follow-up review fixes", () => {
+  const BODY = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7";
+
+  it("redacts a cut-off key with header lines or a note after it, and keeps what follows", () => {
+    const encrypted = `-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,ABC\n\n${BODY}\n${BODY}`;
+    expect(scrubSecrets(encrypted)).toBe("[redacted]");
+    const noted = `cat key.pem\n-----BEGIN PRIVATE KEY-----\n${BODY}\n${BODY}\n...(output truncated)`;
+    expect(scrubSecrets(noted)).toBe("cat key.pem\n[redacted]\n...(output truncated)");
+    const before = `(earlier output cut)\n${BODY}\nQ2==\n-----END PRIVATE KEY-----\ndone`;
+    expect(scrubSecrets(before)).toBe("(earlier output cut)\n[redacted]\ndone");
+    // A tool result as JSON: its line breaks are `\n` written out.
+    const json = JSON.stringify({ output: `-----BEGIN PRIVATE KEY-----\n${BODY}\n${BODY}` });
+    expect(scrubSecrets(json)).not.toContain("MIIEvQ");
+  });
+
+  it("redacts the whole of an inline value with a backslash or an unclosed quote", () => {
+    expect(scrubSecrets("cd x && PASSWORD=ab\\cdsecret npm start")).toBe(
+      "cd x && PASSWORD=[redacted] npm start",
+    );
+    expect(scrubSecrets('TOKEN="abc def npm start\nnext line')).toBe("TOKEN=[redacted]\nnext line");
+    // An escaped quote that closes a JSON string stays.
+    expect(scrubSecrets(JSON.stringify({ command: 'echo "API_KEY=abc"' }))).toBe(
+      '{"command":"echo \\"API_KEY=[redacted]\\""}',
+    );
+  });
+
+  it("cuts text that is over the cap and was never cut, however little it is over", () => {
+    const text = "d".repeat(4_010);
+    expect(rescrub(text, 4_000)).toBe(scrub(text, 4_000));
+    expect(rescrub(text, 4_000, "end")).toBe(scrubTail(text, 4_000));
+    expect(rescrub("short", 4_000)).toBe("short");
+  });
+});

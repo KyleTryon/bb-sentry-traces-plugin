@@ -22,13 +22,22 @@ const ENV_LINE = new RegExp(
 
 /**
  * Credential-like assignments anywhere in a line, as in `cd app && API_KEY=… npm
- * start` or a command inside one-line JSON. The value runs to whitespace, a
- * quote, or a shell separator; a quoted value (escaped quotes too, as inside
- * JSON) runs to its closing quote.
+ * start` or a command inside one-line JSON. A quoted value (escaped quotes
+ * too, as inside JSON) runs to its closing quote, or to the end of the line
+ * when it has none. An unquoted value runs to whitespace, a quote or a shell
+ * separator; a backslash in it is part of it unless it escapes a quote or is
+ * JSON's `\n`.
  */
 const INLINE_ASSIGNMENT = new RegExp(
-  `((?<![A-Za-z0-9_])(?:export\\s+)?[A-Za-z0-9_]*${CREDENTIAL_NAME}[A-Za-z0-9_]*=)` +
-    `(?!=)(?:\\\\?"[^"\\n]*?\\\\?"|\\\\?'[^'\\n]*?\\\\?'|[^\\s"'\\\\&;|]+)`,
+  String.raw`((?<![A-Za-z0-9_])(?:export\s+)?[A-Za-z0-9_]*${CREDENTIAL_NAME}[A-Za-z0-9_]*=)(?!=)` +
+    "(?:" +
+    [
+      String.raw`\\?"[^"\n]*?\\?"`,
+      String.raw`\\?'[^'\n]*?\\?'`,
+      String.raw`\\?["'][^\n]*`,
+      String.raw`(?:[^\s"'\\&;|]|\\(?!["'nrt]))+`,
+    ].join("|") +
+    ")",
   "gi",
 );
 
@@ -44,13 +53,31 @@ const PEM_BLOCK =
 const PEM_UNTERMINATED = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*$/;
 /** In text cut short here: a key whose start was cut off runs from the start. */
 const PEM_UNSTARTED = /^[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/;
-/**
- * In any other text, a lone marker is only a cut-off key when nothing but key
- * body sits between it and the edge, so code or prose that just mentions a
- * marker keeps the rest of its text.
+/*
+ * In any other text, a lone marker is a key cut off elsewhere (by a tool, by
+ * bb) only when key body sits next to it: the marker and the body lines are
+ * redacted, through the last body line, and whatever follows them is kept.
+ * Code or prose that only mentions a marker keeps all its text. Lines break
+ * on real newlines or on JSON's `\n`, and encrypted keys' header lines count
+ * as body.
  */
-const PEM_BODY_TO_END = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[A-Za-z0-9+/=\s]*$/;
-const PEM_BODY_FROM_START = /^[A-Za-z0-9+/=\s]*-----END [A-Z0-9 ]*PRIVATE KEY-----/;
+const PEM_LINE_BREAK = String.raw`(?:\r?\n|(?:\\r)?\\n)`;
+const PEM_HEADER = String.raw`(?:Proc-Type|DEK-Info|Comment):[^\r\n\\]*`;
+const PEM_LONG_LINE = String.raw`[A-Za-z0-9+/=]{16,}(?![A-Za-z0-9+/=])`;
+const PEM_ANY_LINE = String.raw`[A-Za-z0-9+/=]+(?![A-Za-z0-9+/=])`;
+const PEM_BODY_AFTER_BEGIN = new RegExp(
+  String.raw`-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[ \t]*` +
+    String.raw`(?:${PEM_LINE_BREAK}[ \t]*(?:${PEM_HEADER})?)*?` +
+    String.raw`${PEM_LINE_BREAK}[ \t]*${PEM_LONG_LINE}` +
+    String.raw`(?:${PEM_LINE_BREAK}[ \t]*${PEM_ANY_LINE})*`,
+  "g",
+);
+const PEM_BODY_BEFORE_END = new RegExp(
+  String.raw`(?<![A-Za-z0-9+/=])${PEM_LONG_LINE}[ \t]*` +
+    String.raw`(?:${PEM_LINE_BREAK}[ \t]*${PEM_ANY_LINE}[ \t]*)*` +
+    String.raw`${PEM_LINE_BREAK}[ \t]*-----END [A-Z0-9 ]*PRIVATE KEY-----`,
+  "g",
+);
 
 /** Where a text was cut before it reached the scrubber. */
 export interface Cut {
@@ -88,10 +115,10 @@ const SCRUB_MARGIN = 16_384;
  * a lone key marker is taken to be a key that runs on past the cut.
  */
 export function scrubSecrets(value: string, cut: Cut = {}): string {
-  let out = value
-    .replace(PEM_BLOCK, REDACTED)
-    .replace(cut.end ? PEM_UNTERMINATED : PEM_BODY_TO_END, REDACTED)
-    .replace(cut.start ? PEM_UNSTARTED : PEM_BODY_FROM_START, REDACTED);
+  let out = value.replace(PEM_BLOCK, REDACTED);
+  if (cut.end) out = out.replace(PEM_UNTERMINATED, REDACTED);
+  if (cut.start) out = out.replace(PEM_UNSTARTED, REDACTED);
+  out = out.replace(PEM_BODY_AFTER_BEGIN, REDACTED).replace(PEM_BODY_BEFORE_END, REDACTED);
   out = out
     .split("\n")
     .map((line) => line.replace(ENV_LINE, `$1${REDACTED}`))
@@ -127,12 +154,16 @@ export function scrubLine(value: string, max: number): string {
   return oneLine(scrubSecrets(head, { end: head !== value }), max);
 }
 
+const CUT_AT_END = /\n\[… \d+ more characters cut\]$/;
+const CUT_AT_START = /^\[… \d+ earlier characters cut\]\n/;
+
 /**
- * Scrubs text again on its way out. Text already cut to `max` by `scrub` or
- * `scrubTail` keeps its own cut and marker; anything longer is cut here,
- * keeping its start or, with `keep: "end"`, its end.
+ * Scrubs text again on its way out. Text that `scrub` or `scrubTail` already
+ * cut to `max` keeps its own cut and marker; anything else over `max` is cut
+ * here, keeping its start or, with `keep: "end"`, its end.
  */
 export function rescrub(value: string, max: number, keep: "start" | "end" = "start"): string {
-  if (value.length <= max + MARKER_ROOM) return scrubSecrets(value);
+  const marked = (keep === "end" ? CUT_AT_START : CUT_AT_END).test(value);
+  if (value.length <= max || (marked && value.length <= max + MARKER_ROOM)) return scrubSecrets(value);
   return keep === "end" ? scrubTail(value, max) : scrub(value, max);
 }

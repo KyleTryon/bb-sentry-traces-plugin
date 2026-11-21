@@ -1730,3 +1730,171 @@ describe("second review fixes", () => {
     expect(later.some((span) => span.traceId === providerTraceId(P, KEY))).toBe(false);
   });
 });
+
+describe("follow-up review fixes", () => {
+  const P = "orchestrator";
+  const KEY = "run_42";
+
+  /** A turn that starts a background subagent which is still working when the turn ends. */
+  function backgroundTurn(history: History, turnId: string, taskId = `${turnId}-task`) {
+    history.request(`${turnId}-req`).start(turnId, `${turnId}-req`);
+    const call = {
+      type: "toolCall",
+      id: `${turnId}-agent`,
+      tool: "Agent",
+      arguments: { subagent_type: "Explore", run_in_background: true },
+    };
+    history.push("item/started", { item: { ...call, status: "pending" } }, turnId);
+    history.push("turn/started", { parentToolCallId: call.id }, `${turnId}-sub`);
+    history.push("item/completed", { item: { ...call, status: "completed" } }, turnId);
+    const task = { type: "backgroundTask", id: taskId, taskType: "local_agent", parentToolCallId: call.id };
+    history.push("item/backgroundTask/progress", { item: { ...task, status: "pending" } }, turnId);
+    history.complete(turnId);
+    return () =>
+      history.push("item/backgroundTask/completed", {
+        item: { ...task, status: "completed", usage: { totalTokens: 99 } },
+      });
+  }
+
+  const agentTurns = (spans: Array<{ name: string; attributes: unknown }>) =>
+    spans
+      .filter((span) => span.name.startsWith("invoke_agent") && attr(span as never, "bb.turn.id"))
+      .filter((span) => !span.name.includes("Explore"))
+      .map((span) => attr(span as never, "bb.turn.index"));
+
+  it("keeps a long thread's newest turn when it waits after the catch-up read", async () => {
+    const { history: h, emit, tick, clock, spans } = await setup();
+    // 4 + 2 × 19,991 events, then the 8 of a waiting turn: 39,994, then 10 more.
+    h.request("req-1").start("t1", "req-1");
+    for (let index = 0; index < 19_991; index++) {
+      h.item("t1", { type: "commandExecution", id: `c${index}`, command: "ls" }, 1);
+    }
+    h.complete("t1");
+    const finish = backgroundTurn(h, "t2");
+    for (let index = 0; index < 10; index++) {
+      h.push("thread/contextWindowUsage/updated", { contextWindowUsage: { usedTokens: index } });
+    }
+    await emit("thread.idle");
+    expect(spans()).toHaveLength(0);
+    finish();
+    clock.now += 20 * 60_000;
+    await tick();
+    const agents = spans().filter((span) => span.name.startsWith("invoke_agent"));
+    expect(agents.filter((span) => attr(span, "bb.turn.id") === "t2")).not.toHaveLength(0);
+    expect(agents.some((span) => attr(span, "bb.turn.id") === "t1")).toBe(false);
+    const sub = agents.find((span) => span.name === "invoke_agent Explore")!;
+    expect(attr(sub, "bb.span.status")).toBe("completed");
+  }, 30_000);
+
+  it("reads on past an old turn when a later turn fills the rest of the read", async () => {
+    const { history: h, emit, spans } = await setup();
+    h.turn();
+    // 4 + 2 × 19,990 events: more than the rest of the first read, less than a whole read.
+    h.request("req-big").start("big", "req-big");
+    for (let index = 0; index < 19_990; index++) {
+      h.item("big", { type: "commandExecution", id: `b${index}`, command: "ls" }, 1);
+    }
+    h.complete("big");
+    h.turn();
+    await emit("thread.idle");
+    const agents = spans().filter((span) => span.name.startsWith("invoke_agent"));
+    expect(agents.map((span) => attr(span, "bb.turn.id"))).toEqual(["turn-2"]);
+  }, 30_000);
+
+  it("keeps a new thread's first turn when its export waits on a provider", async () => {
+    const orchestrator = { contexts: { [THREAD]: { trace: { key: KEY } } } };
+    const providers: Record<string, typeof orchestrator> = { [P]: orchestrator };
+    const { histories, history, emit, tick, clock, spans } = await setup({ providers });
+    history.turn();
+    await emit("thread.idle");
+    const before = spans().length;
+
+    // A thread this plugin has stored nothing for, while the provider reloads.
+    const other = (histories.thr_two = new History());
+    delete providers[P];
+    other.turn();
+    await emit("thread.idle", "thr_two");
+    other.turn();
+    await emit("thread.idle", "thr_two");
+    expect(spans()).toHaveLength(before);
+
+    providers[P] = orchestrator;
+    clock.now += 6 * 60_000;
+    await tick();
+    const sent = spans().slice(before).filter((span) => span.name.startsWith("invoke_agent"));
+    expect(sent.map((span) => attr(span, "bb.turn.index"))).toEqual([1, 2]);
+  });
+
+  it("sends the turns after a waiting turn at once, and the waiting turn when it is done", async () => {
+    const { history, emit, tick, clock, spans } = await setup();
+    const finish = backgroundTurn(history, "slow");
+    await emit("thread.idle");
+    for (let turn = 0; turn < 30; turn++) {
+      history.turn();
+      await emit("thread.idle");
+    }
+    expect(agentTurns(spans())).toEqual(Array.from({ length: 30 }, (_, index) => index + 2));
+    finish();
+    clock.now += 20 * 60_000;
+    await tick();
+    const all = agentTurns(spans());
+    expect(all).toHaveLength(31);
+    expect(new Set(all).size).toBe(31);
+    expect(all.at(-1)).toBe(1);
+  }, 30_000);
+
+  it("keeps a waiting turn's tokens off the turns sent before it", async () => {
+    const { history, emit, tick, clock, spans } = await setup();
+    await emit("thread.active");
+    history.turn();
+    await emit("thread.idle");
+    // Two turns go out together; the second waits on its subagent.
+    history.turn();
+    const finish = backgroundTurn(history, "slow");
+    history.usage(CLAUDE_TOTAL);
+    await emit("thread.idle");
+    const usageOf = () => spans().filter((span) => attr(span, "gen_ai.usage.input_tokens") !== undefined);
+    expect(agentTurns(spans())).toEqual([1, 2]);
+    expect(usageOf()).toHaveLength(0);
+
+    finish();
+    clock.now += 20 * 60_000;
+    await tick();
+    expect(usageOf()).toHaveLength(1);
+    expect(attr(usageOf()[0], "bb.turn.id")).toBe("slow");
+    expect(attr(usageOf()[0], "gen_ai.usage.input_tokens")).toBe(10_100);
+    expect(attr(usageOf()[0], "bb.usage.turns")).toBe(2);
+  });
+
+  it("exports at once when a provider answers with something it cannot read", async () => {
+    const orchestrator: { contexts: Record<string, unknown>; contract?: number } = {
+      contexts: { [THREAD]: { trace: { key: KEY } } },
+    };
+    const { history, emit, spans } = await setup({ providers: { [P]: orchestrator } });
+    history.turn();
+    await emit("thread.idle");
+    const before = spans().length;
+    orchestrator.contract = 2;
+    history.turn();
+    await emit("thread.idle");
+    const later = spans().slice(before);
+    expect(later.length).toBeGreaterThan(0);
+    expect(later.some((span) => span.traceId === providerTraceId(P, KEY))).toBe(false);
+  });
+
+  it("export says when a provider did not answer, rather than showing a placement as final", async () => {
+    const orchestrator = { contexts: { [THREAD]: { trace: { key: KEY } } } };
+    const providers: Record<string, typeof orchestrator> = { [P]: orchestrator };
+    const { harness, history, emit } = await setup({ providers });
+    history.turn();
+    await emit("thread.idle");
+    delete providers[P];
+    const failed = await harness.behavior.runCli(["export", THREAD, "--summary"]);
+    // The first call fails; the next asks within the outage.
+    const summary = await harness.behavior.runCli(["export", THREAD, "--summary"]);
+    expect(failed.stdout + summary.stdout).toContain("A trace provider did not answer");
+    const json = await harness.behavior.runCli(["export", THREAD]);
+    expect(json.stderr).toContain("A trace provider did not answer");
+    expect(() => JSON.parse(json.stdout)).not.toThrow();
+  });
+});

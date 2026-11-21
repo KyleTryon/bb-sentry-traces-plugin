@@ -339,6 +339,10 @@ export function registerCli(bb: Pick<BbPluginApi, "cli">, deps: CliDeps): void {
                 hint: "Add --running to include the turn in progress.",
               });
             }
+            const unknownTrace = preview.traceUnknown
+              ? "A trace provider did not answer, so this shows the thread on its own. " +
+                "A real export would wait for it and may place the thread in its trace."
+              : null;
             if (input.options.summary) {
               const traces = new Set(preview.spans.map((span) => span.traceId)).size;
               return {
@@ -347,6 +351,7 @@ export function registerCli(bb: Pick<BbPluginApi, "cli">, deps: CliDeps): void {
                   `${preview.turns} turns, ${preview.spans.length} spans, ${traces} traces` +
                     (preview.workflow ? `, workflow run ${preview.workflow.runId}` : "") +
                     (preview.trace ? `, ${preview.trace.provider} trace ${preview.trace.traceKey}` : ""),
+                  ...(unknownTrace ? [unknownTrace] : []),
                   ...preview.spans.map(describeSpan),
                 ].join("\n"),
               };
@@ -368,7 +373,7 @@ export function registerCli(bb: Pick<BbPluginApi, "cli">, deps: CliDeps): void {
                 },
               );
             }
-            return { exitCode: 0, stdout: body };
+            return { exitCode: 0, stdout: body, ...(unknownTrace ? { stderr: `${unknownTrace}\n` } : {}) };
           },
         }),
       },
