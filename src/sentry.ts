@@ -2,8 +2,8 @@
  * Sentry's direct OTLP traces endpoint, reached with plain `fetch`: the DSN
  * gives the ingest host, the project and the public key. No Sentry SDK.
  */
-import { envelope, type OtlpSpan, type OtlpTraces, type ResourceInfo } from "./otlp.js";
-import { errorMessage } from "./util.js";
+import { envelope, type OtlpSpan, type OtlpTraces, type ResourceInfo } from "./core/otlp.js";
+import { errorMessage } from "./core/text.js";
 
 export interface SentryTarget {
   /** `https://<ingest host>/api/<projectId>/integration/otlp/v1/traces` */

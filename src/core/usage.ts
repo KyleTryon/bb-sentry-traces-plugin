@@ -8,7 +8,7 @@
  * convention is read off the numbers themselves: `totalTokens` says which
  * parts were already counted.
  */
-import { record, type Json } from "./util.js";
+import { record, type Json } from "./text.js";
 
 /** bb's `tokenUsage.total` (or `.last`), as stored. */
 export interface RawUsage {

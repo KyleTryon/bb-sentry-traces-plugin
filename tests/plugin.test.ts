@@ -2,8 +2,12 @@ import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/tes
 import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createPlugin } from "../src/server.js";
-import { providerSpanId, providerTraceId } from "../src/providers.js";
-import { workflowCallSpanId, workflowRootSpanId, workflowTraceId } from "../src/spans.js";
+import { providerSpanId, providerTraceId } from "../src/integrations/providers/spans.js";
+import {
+  workflowCallSpanId,
+  workflowRootSpanId,
+  workflowTraceId,
+} from "../src/integrations/workflows/ids.js";
 import { attr, DSN, eventsList, fakeFetch, History, SECRETS } from "./helpers.js";
 
 const THREAD = "thr_one";
@@ -119,6 +123,47 @@ async function setup(options: Setup = {}) {
 }
 
 const names = (spans: Array<{ name: string }>) => spans.map((span) => span.name);
+
+const P = "orchestrator";
+const KEY = "run_42";
+/** A turn that starts a background subagent which is still working when the turn ends. */
+function backgroundTurn(history: History, turnId: string, taskId = `${turnId}-task`) {
+  history.request(`${turnId}-req`).start(turnId, `${turnId}-req`);
+  const call = {
+    type: "toolCall",
+    id: `${turnId}-agent`,
+    tool: "Agent",
+    arguments: { subagent_type: "Explore", run_in_background: true },
+  };
+  history.push("item/started", { item: { ...call, status: "pending" } }, turnId);
+  history.push("turn/started", { parentToolCallId: call.id }, `${turnId}-sub`);
+  history.push("item/completed", { item: { ...call, status: "completed" } }, turnId);
+  const task = { type: "backgroundTask", id: taskId, taskType: "local_agent", parentToolCallId: call.id };
+  history.push("item/backgroundTask/progress", { item: { ...task, status: "pending" } }, turnId);
+  history.complete(turnId);
+  return () =>
+    history.push("item/backgroundTask/completed", {
+      item: { ...task, status: "completed", usage: { totalTokens: 99 } },
+    });
+}
+const agentTurns = (spans: Array<{ name: string; attributes: unknown }>) =>
+  spans
+    .filter((span) => span.name.startsWith("invoke_agent") && attr(span as never, "bb.turn.id"))
+    .filter((span) => !span.name.includes("Explore"))
+    .map((span) => attr(span as never, "bb.turn.index"));
+const inTrace = (span: { traceId: string }) => span.traceId === providerTraceId(P, KEY);
+const turnIndexes = (spans: Array<{ name: string }>) =>
+  spans
+    .filter((span) => span.name.startsWith("invoke_agent"))
+    .map((span) => attr(span as never, "bb.turn.index"));
+/** A finished turn of `items` commands. */
+function turnOf(h: History, turnId: string, items: number) {
+  h.request(`${turnId}-req`).start(turnId, `${turnId}-req`);
+  for (let index = 0; index < items; index++) {
+    h.item(turnId, { type: "commandExecution", id: `${turnId}-${index}`, command: "ls" }, 1);
+  }
+  h.complete(turnId);
+}
 
 describe("configuration", () => {
   it("says how to clear the notice, and checks a DSN changed later", async () => {
@@ -419,6 +464,260 @@ describe("exporting a thread", () => {
     expect(attr(tool, "process.exit.code")).toBe(2);
     expect(JSON.stringify(tool)).not.toContain(SECRETS.toolError);
   });
+
+  it("sends the newest turn of a long thread when the read ends right after it", async () => {
+    const { history: h, emit, spans } = await setup();
+    // 4 + 2 × 19,998 = 40,000 events: exactly one read, ending at the turn's end.
+    h.request("req-1").start("t1", "req-1");
+    for (let index = 0; index < 19_998; index++) {
+      h.item("t1", { type: "commandExecution", id: `c${index}`, command: "ls" }, 1);
+    }
+    h.complete("t1");
+    for (let index = 0; index < 5; index++) {
+      h.push("thread/contextWindowUsage/updated", { contextWindowUsage: { usedTokens: index } });
+    }
+    await emit("thread.idle");
+    const agents = spans().filter((span) => span.name.startsWith("invoke_agent"));
+    expect(agents.map((span) => attr(span, "bb.turn.id"))).toEqual(["t1"]);
+  }, 30_000);
+
+  it.each(["local_agent", "local_subagent"])(
+    "waits for a background subagent (%s) that outlives its turn, then sends its real end",
+    async (taskType) => {
+      const { bb, history, emit, tick, clock, spans } = await setup();
+      history.request("req-1").start("turn-1", "req-1");
+      const agentCall = {
+        type: "toolCall",
+        id: "agent-1",
+        tool: "Agent",
+        arguments: { subagent_type: "Explore", run_in_background: true },
+      };
+      history.push("item/started", { item: { ...agentCall, status: "pending" } }, "turn-1");
+      history.push("turn/started", { parentToolCallId: "agent-1" }, "sub-turn");
+      history.push("item/completed", { item: { ...agentCall, status: "completed" } }, "turn-1");
+      const task = { type: "backgroundTask", id: "task-1", taskType, parentToolCallId: "agent-1" };
+      history.push("item/backgroundTask/progress", { item: { ...task, status: "pending" } }, "turn-1");
+      history.complete("turn-1");
+      await emit("thread.idle");
+      expect(spans()).toHaveLength(0);
+      expect(await bb.storage.kv.get(`retry:${THREAD}`)).toMatchObject({ attempts: 0 });
+
+      history.wait(60_000);
+      history.item("sub-turn", { type: "commandExecution", id: "sub-cmd", command: "ls" }, 200);
+      history.push("turn/completed", { status: "completed" }, "sub-turn");
+      const done = history.push("item/backgroundTask/completed", {
+        item: { ...task, status: "completed", usage: { totalTokens: 1_234 } },
+      });
+      clock.now += 20 * 60_000;
+      await tick();
+
+      const agent = spans().find((span) => span.name === "invoke_agent Explore")!;
+      expect(agent).toBeDefined();
+      expect(attr(agent, "bb.span.running")).toBeUndefined();
+      expect(attr(agent, "bb.span.status")).toBe("completed");
+      expect(attr(agent, "bb.subagent.tokens")).toBe(1_234);
+      expect(Number(agent.endTimeUnixNano)).toBe(done.createdAt * 1_000_000);
+      expect(spans().some((span) => span.name === "execute_tool Background")).toBe(false);
+      expect(await bb.storage.kv.list("retry:")).toEqual([]);
+    },
+  );
+
+  it("sends a turn whose background subagent never reports back once the wait is over", async () => {
+    const { history, emit, tick, clock, spans } = await setup();
+    history.request("req-1").start("turn-1", "req-1");
+    const agentCall = { type: "toolCall", id: "agent-1", tool: "Agent", arguments: { run_in_background: true } };
+    history.push("item/started", { item: { ...agentCall, status: "pending" } }, "turn-1");
+    history.push("item/completed", { item: { ...agentCall, status: "completed" } }, "turn-1");
+    const task = { type: "backgroundTask", id: "task-1", taskType: "local_agent", parentToolCallId: "agent-1" };
+    history.push("item/backgroundTask/progress", { item: { ...task, status: "pending" } }, "turn-1");
+    history.complete("turn-1");
+    await emit("thread.idle");
+    expect(spans()).toHaveLength(0);
+    clock.now += 3 * 60 * 60_000;
+    await tick();
+    const agent = spans().find((span) => span.name === "invoke_agent subagent")!;
+    expect(attr(agent, "bb.span.running")).toBe(true);
+  });
+
+  it("keeps a long thread's newest turn when it waits after the catch-up read", async () => {
+    const { history: h, emit, tick, clock, spans } = await setup();
+    // 4 + 2 × 19,991 events, then the 8 of a waiting turn: 39,994, then 10 more.
+    h.request("req-1").start("t1", "req-1");
+    for (let index = 0; index < 19_991; index++) {
+      h.item("t1", { type: "commandExecution", id: `c${index}`, command: "ls" }, 1);
+    }
+    h.complete("t1");
+    const finish = backgroundTurn(h, "t2");
+    for (let index = 0; index < 10; index++) {
+      h.push("thread/contextWindowUsage/updated", { contextWindowUsage: { usedTokens: index } });
+    }
+    await emit("thread.idle");
+    expect(spans()).toHaveLength(0);
+    finish();
+    clock.now += 20 * 60_000;
+    await tick();
+    const agents = spans().filter((span) => span.name.startsWith("invoke_agent"));
+    expect(agents.filter((span) => attr(span, "bb.turn.id") === "t2")).not.toHaveLength(0);
+    expect(agents.some((span) => attr(span, "bb.turn.id") === "t1")).toBe(false);
+    const sub = agents.find((span) => span.name === "invoke_agent Explore")!;
+    expect(attr(sub, "bb.span.status")).toBe("completed");
+  }, 30_000);
+
+  it("reads on past an old turn when a later turn fills the rest of the read", async () => {
+    const { history: h, emit, spans } = await setup();
+    h.turn();
+    // 4 + 2 × 19,990 events: more than the rest of the first read, less than a whole read.
+    h.request("req-big").start("big", "req-big");
+    for (let index = 0; index < 19_990; index++) {
+      h.item("big", { type: "commandExecution", id: `b${index}`, command: "ls" }, 1);
+    }
+    h.complete("big");
+    h.turn();
+    await emit("thread.idle");
+    const agents = spans().filter((span) => span.name.startsWith("invoke_agent"));
+    expect(agents.map((span) => attr(span, "bb.turn.id"))).toEqual(["turn-2"]);
+  }, 30_000);
+
+  it("sends the turns after a waiting turn at once, and the waiting turn when it is done", async () => {
+    const { history, emit, tick, clock, spans } = await setup();
+    const finish = backgroundTurn(history, "slow");
+    await emit("thread.idle");
+    for (let turn = 0; turn < 30; turn++) {
+      history.turn();
+      await emit("thread.idle");
+    }
+    expect(agentTurns(spans())).toEqual(Array.from({ length: 30 }, (_, index) => index + 2));
+    finish();
+    clock.now += 20 * 60_000;
+    await tick();
+    const all = agentTurns(spans());
+    expect(all).toHaveLength(31);
+    expect(new Set(all).size).toBe(31);
+    expect(all.at(-1)).toBe(1);
+  }, 30_000);
+
+  it("keeps a waiting turn's tokens off the turns sent before it", async () => {
+    const { history, emit, tick, clock, spans } = await setup();
+    await emit("thread.active");
+    history.turn();
+    await emit("thread.idle");
+    // Two turns go out together; the second waits on its subagent.
+    history.turn();
+    const finish = backgroundTurn(history, "slow");
+    history.usage(CLAUDE_TOTAL);
+    await emit("thread.idle");
+    const usageOf = () => spans().filter((span) => attr(span, "gen_ai.usage.input_tokens") !== undefined);
+    expect(agentTurns(spans())).toEqual([1, 2]);
+    expect(usageOf()).toHaveLength(0);
+
+    finish();
+    clock.now += 20 * 60_000;
+    await tick();
+    expect(usageOf()).toHaveLength(1);
+    expect(attr(usageOf()[0], "bb.turn.id")).toBe("slow");
+    expect(attr(usageOf()[0], "gen_ai.usage.input_tokens")).toBe(10_100);
+    expect(attr(usageOf()[0], "bb.usage.turns")).toBe(2);
+  });
+
+  it("sends a new thread's first usage when its first export has to be retried", async () => {
+    let status = 503;
+    const { history, emit, tick, clock, spans } = await setup({ respond: () => status });
+    // The thread was never seen starting, and its first prompt is not its first event.
+    history.push("thread/started", {});
+    history.turn();
+    history.usage(CLAUDE_TOTAL);
+    await emit("thread.idle");
+    expect(spans()).toHaveLength(0);
+    status = 200;
+    clock.now += 2 * 60_000;
+    await tick();
+    const withUsage = spans().filter((span) => attr(span, "gen_ai.usage.input_tokens") !== undefined);
+    expect(withUsage).toHaveLength(1);
+    expect(attr(withUsage[0], "gen_ai.usage.input_tokens")).toBe(10_100);
+  });
+
+  it("sends a long thread's newest finished turn when the turn after it never finishes", async () => {
+    const { history: h, emit, spans } = await setup();
+    h.turn();
+    h.request("req-open").start("open", "req-open");
+    for (let index = 0; index < 20_000; index++) {
+      h.item("open", { type: "commandExecution", id: `o${index}`, command: "ls" }, 1);
+    }
+    await emit("thread.failed");
+    const agents = spans().filter((span) => span.name.startsWith("invoke_agent"));
+    expect(agents.map((span) => attr(span, "bb.turn.id"))).toEqual(["turn-1"]);
+  }, 30_000);
+
+  it("sends a turn longer than one read, and the turns after it", async () => {
+    const { history: h, emit, spans } = await setup();
+    h.turn();
+    await emit("thread.idle");
+    turnOf(h, "long", 20_000);
+    h.turn();
+    await emit("thread.idle");
+    expect(turnIndexes(spans())).toEqual([1, 2, 3]);
+    expect(spans().filter((span) => attr(span, "bb.turn.id") === "long").length).toBeGreaterThan(20_000);
+  }, 60_000);
+
+  it("starts a thread never sent before at its newest turn, past a turn longer than one read", async () => {
+    const { history: h, emit, spans } = await setup();
+    h.turn();
+    turnOf(h, "long", 20_000);
+    h.turn();
+    h.turn();
+    await emit("thread.idle");
+    expect(turnIndexes(spans())).toEqual([4]);
+    h.turn();
+    await emit("thread.idle");
+    expect(turnIndexes(spans())).toEqual([4, 5]);
+  }, 60_000);
+
+  it("sends a first turn's usage from a state that never read a total", async () => {
+    const { bb, history, emit, spans } = await setup();
+    // As left by a first export that failed before this state recorded what it knew.
+    await bb.storage.kv.set(`thread:${THREAD}`, {
+      sentTurn: 0,
+      resumeSeq: 0,
+      turnsBefore: 0,
+      usage: null,
+      usageKnown: false,
+      partial: null,
+      updatedAt: 0,
+    });
+    history.turn();
+    history.usage(CLAUDE_TOTAL);
+    await emit("thread.idle");
+    const withUsage = spans().filter((span) => attr(span, "gen_ai.usage.input_tokens") !== undefined);
+    expect(withUsage).toHaveLength(1);
+    expect(attr(withUsage[0], "gen_ai.usage.input_tokens")).toBe(10_100);
+  });
+
+  it("reads on after a turn longer than one read without waiting for the thread's next event", async () => {
+    const { bb, history: h, emit, tick, spans } = await setup();
+    h.turn();
+    await emit("thread.idle");
+    turnOf(h, "long", 20_000);
+    // Too long to end in the page the long turn ends in.
+    turnOf(h, "after", 150);
+    await emit("thread.idle");
+    expect(turnIndexes(spans())).toEqual([1, 2]);
+    await tick();
+    expect(turnIndexes(spans())).toEqual([1, 2, 3]);
+    expect(await bb.storage.kv.list("retry:")).toEqual([]);
+  }, 60_000);
+
+  it("starts a thread never sent before at its newest turn when a long turn ends its read exactly", async () => {
+    const { history: h, emit, spans } = await setup();
+    h.turn();
+    // 4 + 2 × 19,998 events: read from its own start, this turn ends on the read's last
+    // event, so the read shows no later turn although one has finished.
+    turnOf(h, "long", 19_998);
+    // Long enough that the first read, from the thread's start, is cut short too.
+    turnOf(h, "after", 150);
+    h.turn();
+    await emit("thread.idle");
+    expect(turnIndexes(spans())).toEqual([4]);
+  }, 60_000);
 });
 
 describe("content capture", () => {
@@ -456,6 +755,56 @@ describe("content capture", () => {
     const tool = spans().find((span) => span.name === "execute_tool shell")!;
     expect(attr(tool, "gen_ai.tool.call.arguments")).toBe(SECRETS.command);
     expect(attr(tool, "gen_ai.tool.call.result")).toBe(SECRETS.output);
+  });
+
+  it("keeps the end of a long reply and the true size of each cut", async () => {
+    const { history, emit, spans } = await setup({ settings: { captureContent: true } });
+    history.request("req-1").start("turn-1", "req-1");
+    history.item(
+      "turn-1",
+      { type: "toolCall", id: "t1", tool: "mcp__docs__search", arguments: { query: "q".repeat(6_000) } },
+      100,
+      { result: "r".repeat(6_000) },
+    );
+    history.item("turn-1", { type: "agentMessage", id: "m1", text: `${"a".repeat(20_000)}THE-END` }, 100);
+    history.complete("turn-1");
+    await emit("thread.idle");
+
+    const chat = spans().find((span) => attr(span, "gen_ai.output.messages") !== undefined)!;
+    const output = String(attr(chat, "gen_ai.output.messages"));
+    expect(output).toContain("THE-END");
+    expect(output).toContain("[… 4007 earlier characters cut]");
+    const tool = spans().find((span) => span.name === "execute_tool mcp__docs__search")!;
+    expect(String(attr(tool, "gen_ai.tool.call.arguments"))).toMatch(/\[… 2012 more characters cut\]$/);
+    expect(String(attr(tool, "gen_ai.tool.call.result"))).toMatch(/\[… 2000 more characters cut\]$/);
+  });
+
+  it("sends tool arguments scrubbed string by string, with their JSON whole", async () => {
+    const { history, emit, spans } = await setup({ settings: { captureContent: true } });
+    history.request("req-1").start("turn-1", "req-1");
+    history.item(
+      "turn-1",
+      {
+        type: "toolCall",
+        id: "t1",
+        tool: "Grep",
+        arguments: { pattern: "API_KEY=", path: "src", env: { GH_TOKEN: "ghs-not-a-known-shape" } },
+      },
+      100,
+      { result: { matches: ["src/a.ts: const x = 'API_KEY=' + key"], count: 1 } },
+    );
+    history.item("turn-1", { type: "fileRead", id: "f1", path: "/tmp/x?token=abc123" }, 100);
+    history.complete("turn-1");
+    await emit("thread.idle");
+    const tool = spans().find((span) => span.name === "execute_tool Grep")!;
+    expect(attr(tool, "gen_ai.tool.call.arguments")).toBe(
+      '{"pattern":"API_KEY=","path":"src","env":{"GH_TOKEN":"[redacted]"}}',
+    );
+    expect(attr(tool, "gen_ai.tool.call.result")).toBe(
+      `{"matches":["src/a.ts: const x = 'API_KEY=[redacted]"],"count":1}`,
+    );
+    const read = spans().find((span) => span.name === "execute_tool Read")!;
+    expect(attr(read, "gen_ai.tool.call.arguments")).toBe("/tmp/x?token=[redacted]");
   });
 });
 
@@ -589,11 +938,23 @@ describe("failures", () => {
       expect(await bb.storage.kv.get(`thread:${THREAD}`)).toBeUndefined(),
     );
   });
+
+  it("sends a failed first turn with the next one, not just the next one", async () => {
+    let status = 503;
+    const { history, emit, spans } = await setup({ respond: () => status });
+    await emit("thread.active");
+    history.turn();
+    await emit("thread.idle");
+    expect(spans()).toHaveLength(0);
+    status = 200;
+    history.turn();
+    await emit("thread.idle");
+    const agents = spans().filter((span) => span.name.startsWith("invoke_agent"));
+    expect(agents.map((span) => attr(span, "bb.turn.index"))).toEqual([1, 2]);
+  });
 });
 
 describe("trace providers", () => {
-  const P = "orchestrator";
-  const KEY = "run_42";
   const traceOf = { key: KEY, pipeline: "feature", attributes: { "orchestrator.run_id": KEY } };
   const context = (extra: Record<string, unknown> = {}, trace: Record<string, unknown> = {}) => ({
     trace: { ...traceOf, ...trace },
@@ -927,6 +1288,194 @@ describe("trace providers", () => {
       expect(sent).toHaveLength(before);
     });
   });
+
+  it("waits out a provider that stops answering instead of moving its thread out of its trace", async () => {
+    const orchestrator = { contexts: { [THREAD]: { trace: { key: KEY } } } };
+    const providers: Record<string, typeof orchestrator> = { [P]: orchestrator };
+    const { history, emit, tick, clock, spans } = await setup({ providers });
+    history.turn();
+    await emit("thread.idle");
+    const traceId = providerTraceId(P, KEY);
+    expect(new Set(spans().map((span) => span.traceId))).toEqual(new Set([traceId]));
+
+    // The provider reloads and misses one call.
+    delete providers[P];
+    history.turn();
+    await emit("thread.idle");
+    const before = spans().length;
+    providers[P] = orchestrator;
+    clock.now += 6 * 60_000;
+    await tick();
+    const later = spans().slice(before);
+    expect(later.length).toBeGreaterThan(0);
+    expect(new Set(later.map((span) => span.traceId))).toEqual(new Set([traceId]));
+    expect(later.some((span) => attr(span, "bb.turn.index") === 2)).toBe(true);
+  });
+
+  it("takes a provider that stays gone to be gone, and exports on its own", async () => {
+    const orchestrator = { contexts: { [THREAD]: { trace: { key: KEY } } } };
+    const providers: Record<string, typeof orchestrator> = { [P]: orchestrator };
+    const { history, emit, tick, clock, spans } = await setup({ providers });
+    history.turn();
+    await emit("thread.idle");
+    delete providers[P];
+    history.turn();
+    await emit("thread.idle");
+    const before = spans().length;
+    for (let step = 0; step < 8; step++) {
+      clock.now += 6 * 60_000;
+      await tick();
+    }
+    const later = spans().slice(before);
+    expect(later.length).toBeGreaterThan(0);
+    expect(later.some((span) => span.traceId === providerTraceId(P, KEY))).toBe(false);
+  });
+
+  it("keeps a new thread's first turn when its export waits on a provider", async () => {
+    const orchestrator = { contexts: { [THREAD]: { trace: { key: KEY } } } };
+    const providers: Record<string, typeof orchestrator> = { [P]: orchestrator };
+    const { histories, history, emit, tick, clock, spans } = await setup({ providers });
+    history.turn();
+    await emit("thread.idle");
+    const before = spans().length;
+
+    // A thread this plugin has stored nothing for, while the provider reloads.
+    const other = (histories.thr_two = new History());
+    delete providers[P];
+    other.turn();
+    await emit("thread.idle", "thr_two");
+    other.turn();
+    await emit("thread.idle", "thr_two");
+    expect(spans()).toHaveLength(before);
+
+    providers[P] = orchestrator;
+    clock.now += 6 * 60_000;
+    await tick();
+    const sent = spans().slice(before).filter((span) => span.name.startsWith("invoke_agent"));
+    expect(sent.map((span) => attr(span, "bb.turn.index"))).toEqual([1, 2]);
+  });
+
+  it("exports at once when a provider answers with something it cannot read", async () => {
+    const orchestrator: { contexts: Record<string, unknown>; contract?: number } = {
+      contexts: { [THREAD]: { trace: { key: KEY } } },
+    };
+    const { history, emit, spans } = await setup({ providers: { [P]: orchestrator } });
+    history.turn();
+    await emit("thread.idle");
+    const before = spans().length;
+    orchestrator.contract = 2;
+    history.turn();
+    await emit("thread.idle");
+    const later = spans().slice(before);
+    expect(later.length).toBeGreaterThan(0);
+    expect(later.some((span) => span.traceId === providerTraceId(P, KEY))).toBe(false);
+  });
+
+  it("keeps placing a provider's threads after one of its answers cannot be read", async () => {
+    const { history, emit, tick, spans } = await setup({
+      providers: {
+        [P]: {
+          contexts: { [THREAD]: { trace: { key: KEY } } },
+          // Not a list of spans: an answer this plugin cannot read.
+          trace: () => ({ key: KEY, ended: true, spans: "too many" }),
+        },
+      },
+    });
+    history.turn();
+    await emit("thread.idle");
+    await tick();
+    const before = spans().length;
+    history.turn();
+    await emit("thread.idle");
+    const later = spans().slice(before);
+    expect(later.length).toBeGreaterThan(0);
+    expect(later.every(inTrace)).toBe(true);
+  });
+
+  it("does not wait for a provider that never gave a readable answer", async () => {
+    const orchestrator = { contract: 2, contexts: { [THREAD]: { trace: { key: KEY } } } };
+    const providers: Record<string, typeof orchestrator> = { [P]: orchestrator };
+    const { history, emit, clock, spans } = await setup({ providers });
+    history.turn();
+    await emit("thread.idle");
+    expect(spans().some(inTrace)).toBe(false);
+    const before = spans().length;
+
+    delete providers[P];
+    clock.now += 6 * 60_000;
+    history.turn();
+    await emit("thread.idle");
+    expect(spans().length).toBeGreaterThan(before);
+  });
+
+  it("backs off for five minutes from when a slow call failed, not from when it began", async () => {
+    const { history, emit, clock, rpc } = await setup();
+    rpc.mockImplementationOnce(async () => {
+      clock.now += 60_000;
+      throw new Error("timed out");
+    });
+    history.turn();
+    await emit("thread.idle");
+    expect(rpc).toHaveBeenCalledTimes(1);
+    // Five and a half minutes after the call began, four and a half after it failed.
+    clock.now += 4.5 * 60_000;
+    history.turn();
+    await emit("thread.idle");
+    expect(rpc).toHaveBeenCalledTimes(1);
+  });
+
+  it("asks a provider on another contract once, not once for every thread", async () => {
+    const { histories, emit, rpc, spans } = await setup({
+      providers: { [P]: { contract: 2, contexts: { [THREAD]: { trace: { key: KEY } } } } },
+    });
+    for (const id of [THREAD, "thr_two", "thr_three"]) {
+      histories[id] ??= new History();
+      histories[id].turn();
+      await emit("thread.idle", id);
+    }
+    expect(rpc).toHaveBeenCalledTimes(1);
+    expect(turnIndexes(spans())).toEqual([1, 1, 1]);
+  });
+
+  it("keeps placing a provider's threads after an answer of its with no contract at all", async () => {
+    const { history, emit, tick, rpc, spans } = await setup({
+      providers: { [P]: { contexts: { [THREAD]: { trace: { key: KEY } } } } },
+    });
+    history.turn();
+    await emit("thread.idle");
+    // The trace's own spans are asked for at the tick: a broken answer to that one question.
+    rpc.mockImplementationOnce(async () => null as never);
+    await tick();
+    const before = spans().length;
+    history.turn();
+    await emit("thread.idle");
+    const later = spans().slice(before);
+    expect(later.length).toBeGreaterThan(0);
+    expect(later.every(inTrace)).toBe(true);
+  });
+
+  it("asks a provider again right after its back-off, however long its call took to fail", async () => {
+    const { bb, history, emit, tick, clock, rpc, spans } = await setup({
+      providers: { [P]: { contexts: { [THREAD]: { trace: { key: KEY } } } } },
+    });
+    history.turn();
+    await emit("thread.idle");
+    const before = spans().length;
+    rpc.mockImplementationOnce(async () => {
+      clock.now += 60_000;
+      throw new Error("timed out");
+    });
+    history.turn();
+    await emit("thread.idle");
+    expect(spans()).toHaveLength(before);
+    const retry = (await bb.storage.kv.get(`retry:${THREAD}`)) as { nextAt: number };
+    expect(retry.nextAt).toBeGreaterThan(clock.now + 5 * 60_000);
+    clock.now = retry.nextAt;
+    await tick();
+    const later = spans().slice(before);
+    expect(later.length).toBeGreaterThan(0);
+    expect(later.every(inTrace)).toBe(true);
+  });
 });
 
 describe("the Orchestrator's real answers", () => {
@@ -941,7 +1490,6 @@ describe("the Orchestrator's real answers", () => {
     contexts: { contexts: Record<string, { trace: { key: string } } | null> };
     trace: { trace: { key: string; spans: Array<{ key: string; name: string }> } };
   };
-  const P = "orchestrator";
   const KEY = real.trace.trace.key;
 
   it("are accepted as they are, and place a run's threads and workflow", async () => {
@@ -1572,315 +2120,6 @@ describe("bb sentry-traces", () => {
     const unknown = await harness.behavior.runCli(["export", "thr_missing"]);
     expect(unknown.stderr).toContain("No thread with id thr_missing");
   });
-});
-
-describe("second review fixes", () => {
-  const P = "orchestrator";
-  const KEY = "run_42";
-
-  it("keeps the end of a long reply and the true size of each cut", async () => {
-    const { history, emit, spans } = await setup({ settings: { captureContent: true } });
-    history.request("req-1").start("turn-1", "req-1");
-    history.item(
-      "turn-1",
-      { type: "toolCall", id: "t1", tool: "mcp__docs__search", arguments: { query: "q".repeat(6_000) } },
-      100,
-      { result: "r".repeat(6_000) },
-    );
-    history.item("turn-1", { type: "agentMessage", id: "m1", text: `${"a".repeat(20_000)}THE-END` }, 100);
-    history.complete("turn-1");
-    await emit("thread.idle");
-
-    const chat = spans().find((span) => attr(span, "gen_ai.output.messages") !== undefined)!;
-    const output = String(attr(chat, "gen_ai.output.messages"));
-    expect(output).toContain("THE-END");
-    expect(output).toContain("[… 4007 earlier characters cut]");
-    const tool = spans().find((span) => span.name === "execute_tool mcp__docs__search")!;
-    expect(String(attr(tool, "gen_ai.tool.call.arguments"))).toMatch(/\[… 2012 more characters cut\]$/);
-    expect(String(attr(tool, "gen_ai.tool.call.result"))).toMatch(/\[… 2000 more characters cut\]$/);
-  });
-
-  it("sends a failed first turn with the next one, not just the next one", async () => {
-    let status = 503;
-    const { history, emit, spans } = await setup({ respond: () => status });
-    await emit("thread.active");
-    history.turn();
-    await emit("thread.idle");
-    expect(spans()).toHaveLength(0);
-    status = 200;
-    history.turn();
-    await emit("thread.idle");
-    const agents = spans().filter((span) => span.name.startsWith("invoke_agent"));
-    expect(agents.map((span) => attr(span, "bb.turn.index"))).toEqual([1, 2]);
-  });
-
-  it("sends the newest turn of a long thread when the read ends right after it", async () => {
-    const { history: h, emit, spans } = await setup();
-    // 4 + 2 × 19,998 = 40,000 events: exactly one read, ending at the turn's end.
-    h.request("req-1").start("t1", "req-1");
-    for (let index = 0; index < 19_998; index++) {
-      h.item("t1", { type: "commandExecution", id: `c${index}`, command: "ls" }, 1);
-    }
-    h.complete("t1");
-    for (let index = 0; index < 5; index++) {
-      h.push("thread/contextWindowUsage/updated", { contextWindowUsage: { usedTokens: index } });
-    }
-    await emit("thread.idle");
-    const agents = spans().filter((span) => span.name.startsWith("invoke_agent"));
-    expect(agents.map((span) => attr(span, "bb.turn.id"))).toEqual(["t1"]);
-  }, 30_000);
-
-  it.each(["local_agent", "local_subagent"])(
-    "waits for a background subagent (%s) that outlives its turn, then sends its real end",
-    async (taskType) => {
-      const { bb, history, emit, tick, clock, spans } = await setup();
-      history.request("req-1").start("turn-1", "req-1");
-      const agentCall = {
-        type: "toolCall",
-        id: "agent-1",
-        tool: "Agent",
-        arguments: { subagent_type: "Explore", run_in_background: true },
-      };
-      history.push("item/started", { item: { ...agentCall, status: "pending" } }, "turn-1");
-      history.push("turn/started", { parentToolCallId: "agent-1" }, "sub-turn");
-      history.push("item/completed", { item: { ...agentCall, status: "completed" } }, "turn-1");
-      const task = { type: "backgroundTask", id: "task-1", taskType, parentToolCallId: "agent-1" };
-      history.push("item/backgroundTask/progress", { item: { ...task, status: "pending" } }, "turn-1");
-      history.complete("turn-1");
-      await emit("thread.idle");
-      expect(spans()).toHaveLength(0);
-      expect(await bb.storage.kv.get(`retry:${THREAD}`)).toMatchObject({ attempts: 0 });
-
-      history.wait(60_000);
-      history.item("sub-turn", { type: "commandExecution", id: "sub-cmd", command: "ls" }, 200);
-      history.push("turn/completed", { status: "completed" }, "sub-turn");
-      const done = history.push("item/backgroundTask/completed", {
-        item: { ...task, status: "completed", usage: { totalTokens: 1_234 } },
-      });
-      clock.now += 20 * 60_000;
-      await tick();
-
-      const agent = spans().find((span) => span.name === "invoke_agent Explore")!;
-      expect(agent).toBeDefined();
-      expect(attr(agent, "bb.span.running")).toBeUndefined();
-      expect(attr(agent, "bb.span.status")).toBe("completed");
-      expect(attr(agent, "bb.subagent.tokens")).toBe(1_234);
-      expect(Number(agent.endTimeUnixNano)).toBe(done.createdAt * 1_000_000);
-      expect(spans().some((span) => span.name === "execute_tool Background")).toBe(false);
-      expect(await bb.storage.kv.list("retry:")).toEqual([]);
-    },
-  );
-
-  it("sends a turn whose background subagent never reports back once the wait is over", async () => {
-    const { history, emit, tick, clock, spans } = await setup();
-    history.request("req-1").start("turn-1", "req-1");
-    const agentCall = { type: "toolCall", id: "agent-1", tool: "Agent", arguments: { run_in_background: true } };
-    history.push("item/started", { item: { ...agentCall, status: "pending" } }, "turn-1");
-    history.push("item/completed", { item: { ...agentCall, status: "completed" } }, "turn-1");
-    const task = { type: "backgroundTask", id: "task-1", taskType: "local_agent", parentToolCallId: "agent-1" };
-    history.push("item/backgroundTask/progress", { item: { ...task, status: "pending" } }, "turn-1");
-    history.complete("turn-1");
-    await emit("thread.idle");
-    expect(spans()).toHaveLength(0);
-    clock.now += 3 * 60 * 60_000;
-    await tick();
-    const agent = spans().find((span) => span.name === "invoke_agent subagent")!;
-    expect(attr(agent, "bb.span.running")).toBe(true);
-  });
-
-  it("waits out a provider that stops answering instead of moving its thread out of its trace", async () => {
-    const orchestrator = { contexts: { [THREAD]: { trace: { key: KEY } } } };
-    const providers: Record<string, typeof orchestrator> = { [P]: orchestrator };
-    const { history, emit, tick, clock, spans } = await setup({ providers });
-    history.turn();
-    await emit("thread.idle");
-    const traceId = providerTraceId(P, KEY);
-    expect(new Set(spans().map((span) => span.traceId))).toEqual(new Set([traceId]));
-
-    // The provider reloads and misses one call.
-    delete providers[P];
-    history.turn();
-    await emit("thread.idle");
-    const before = spans().length;
-    providers[P] = orchestrator;
-    clock.now += 6 * 60_000;
-    await tick();
-    const later = spans().slice(before);
-    expect(later.length).toBeGreaterThan(0);
-    expect(new Set(later.map((span) => span.traceId))).toEqual(new Set([traceId]));
-    expect(later.some((span) => attr(span, "bb.turn.index") === 2)).toBe(true);
-  });
-
-  it("takes a provider that stays gone to be gone, and exports on its own", async () => {
-    const orchestrator = { contexts: { [THREAD]: { trace: { key: KEY } } } };
-    const providers: Record<string, typeof orchestrator> = { [P]: orchestrator };
-    const { history, emit, tick, clock, spans } = await setup({ providers });
-    history.turn();
-    await emit("thread.idle");
-    delete providers[P];
-    history.turn();
-    await emit("thread.idle");
-    const before = spans().length;
-    for (let step = 0; step < 8; step++) {
-      clock.now += 6 * 60_000;
-      await tick();
-    }
-    const later = spans().slice(before);
-    expect(later.length).toBeGreaterThan(0);
-    expect(later.some((span) => span.traceId === providerTraceId(P, KEY))).toBe(false);
-  });
-});
-
-describe("follow-up review fixes", () => {
-  const P = "orchestrator";
-  const KEY = "run_42";
-
-  /** A turn that starts a background subagent which is still working when the turn ends. */
-  function backgroundTurn(history: History, turnId: string, taskId = `${turnId}-task`) {
-    history.request(`${turnId}-req`).start(turnId, `${turnId}-req`);
-    const call = {
-      type: "toolCall",
-      id: `${turnId}-agent`,
-      tool: "Agent",
-      arguments: { subagent_type: "Explore", run_in_background: true },
-    };
-    history.push("item/started", { item: { ...call, status: "pending" } }, turnId);
-    history.push("turn/started", { parentToolCallId: call.id }, `${turnId}-sub`);
-    history.push("item/completed", { item: { ...call, status: "completed" } }, turnId);
-    const task = { type: "backgroundTask", id: taskId, taskType: "local_agent", parentToolCallId: call.id };
-    history.push("item/backgroundTask/progress", { item: { ...task, status: "pending" } }, turnId);
-    history.complete(turnId);
-    return () =>
-      history.push("item/backgroundTask/completed", {
-        item: { ...task, status: "completed", usage: { totalTokens: 99 } },
-      });
-  }
-
-  const agentTurns = (spans: Array<{ name: string; attributes: unknown }>) =>
-    spans
-      .filter((span) => span.name.startsWith("invoke_agent") && attr(span as never, "bb.turn.id"))
-      .filter((span) => !span.name.includes("Explore"))
-      .map((span) => attr(span as never, "bb.turn.index"));
-
-  it("keeps a long thread's newest turn when it waits after the catch-up read", async () => {
-    const { history: h, emit, tick, clock, spans } = await setup();
-    // 4 + 2 × 19,991 events, then the 8 of a waiting turn: 39,994, then 10 more.
-    h.request("req-1").start("t1", "req-1");
-    for (let index = 0; index < 19_991; index++) {
-      h.item("t1", { type: "commandExecution", id: `c${index}`, command: "ls" }, 1);
-    }
-    h.complete("t1");
-    const finish = backgroundTurn(h, "t2");
-    for (let index = 0; index < 10; index++) {
-      h.push("thread/contextWindowUsage/updated", { contextWindowUsage: { usedTokens: index } });
-    }
-    await emit("thread.idle");
-    expect(spans()).toHaveLength(0);
-    finish();
-    clock.now += 20 * 60_000;
-    await tick();
-    const agents = spans().filter((span) => span.name.startsWith("invoke_agent"));
-    expect(agents.filter((span) => attr(span, "bb.turn.id") === "t2")).not.toHaveLength(0);
-    expect(agents.some((span) => attr(span, "bb.turn.id") === "t1")).toBe(false);
-    const sub = agents.find((span) => span.name === "invoke_agent Explore")!;
-    expect(attr(sub, "bb.span.status")).toBe("completed");
-  }, 30_000);
-
-  it("reads on past an old turn when a later turn fills the rest of the read", async () => {
-    const { history: h, emit, spans } = await setup();
-    h.turn();
-    // 4 + 2 × 19,990 events: more than the rest of the first read, less than a whole read.
-    h.request("req-big").start("big", "req-big");
-    for (let index = 0; index < 19_990; index++) {
-      h.item("big", { type: "commandExecution", id: `b${index}`, command: "ls" }, 1);
-    }
-    h.complete("big");
-    h.turn();
-    await emit("thread.idle");
-    const agents = spans().filter((span) => span.name.startsWith("invoke_agent"));
-    expect(agents.map((span) => attr(span, "bb.turn.id"))).toEqual(["turn-2"]);
-  }, 30_000);
-
-  it("keeps a new thread's first turn when its export waits on a provider", async () => {
-    const orchestrator = { contexts: { [THREAD]: { trace: { key: KEY } } } };
-    const providers: Record<string, typeof orchestrator> = { [P]: orchestrator };
-    const { histories, history, emit, tick, clock, spans } = await setup({ providers });
-    history.turn();
-    await emit("thread.idle");
-    const before = spans().length;
-
-    // A thread this plugin has stored nothing for, while the provider reloads.
-    const other = (histories.thr_two = new History());
-    delete providers[P];
-    other.turn();
-    await emit("thread.idle", "thr_two");
-    other.turn();
-    await emit("thread.idle", "thr_two");
-    expect(spans()).toHaveLength(before);
-
-    providers[P] = orchestrator;
-    clock.now += 6 * 60_000;
-    await tick();
-    const sent = spans().slice(before).filter((span) => span.name.startsWith("invoke_agent"));
-    expect(sent.map((span) => attr(span, "bb.turn.index"))).toEqual([1, 2]);
-  });
-
-  it("sends the turns after a waiting turn at once, and the waiting turn when it is done", async () => {
-    const { history, emit, tick, clock, spans } = await setup();
-    const finish = backgroundTurn(history, "slow");
-    await emit("thread.idle");
-    for (let turn = 0; turn < 30; turn++) {
-      history.turn();
-      await emit("thread.idle");
-    }
-    expect(agentTurns(spans())).toEqual(Array.from({ length: 30 }, (_, index) => index + 2));
-    finish();
-    clock.now += 20 * 60_000;
-    await tick();
-    const all = agentTurns(spans());
-    expect(all).toHaveLength(31);
-    expect(new Set(all).size).toBe(31);
-    expect(all.at(-1)).toBe(1);
-  }, 30_000);
-
-  it("keeps a waiting turn's tokens off the turns sent before it", async () => {
-    const { history, emit, tick, clock, spans } = await setup();
-    await emit("thread.active");
-    history.turn();
-    await emit("thread.idle");
-    // Two turns go out together; the second waits on its subagent.
-    history.turn();
-    const finish = backgroundTurn(history, "slow");
-    history.usage(CLAUDE_TOTAL);
-    await emit("thread.idle");
-    const usageOf = () => spans().filter((span) => attr(span, "gen_ai.usage.input_tokens") !== undefined);
-    expect(agentTurns(spans())).toEqual([1, 2]);
-    expect(usageOf()).toHaveLength(0);
-
-    finish();
-    clock.now += 20 * 60_000;
-    await tick();
-    expect(usageOf()).toHaveLength(1);
-    expect(attr(usageOf()[0], "bb.turn.id")).toBe("slow");
-    expect(attr(usageOf()[0], "gen_ai.usage.input_tokens")).toBe(10_100);
-    expect(attr(usageOf()[0], "bb.usage.turns")).toBe(2);
-  });
-
-  it("exports at once when a provider answers with something it cannot read", async () => {
-    const orchestrator: { contexts: Record<string, unknown>; contract?: number } = {
-      contexts: { [THREAD]: { trace: { key: KEY } } },
-    };
-    const { history, emit, spans } = await setup({ providers: { [P]: orchestrator } });
-    history.turn();
-    await emit("thread.idle");
-    const before = spans().length;
-    orchestrator.contract = 2;
-    history.turn();
-    await emit("thread.idle");
-    const later = spans().slice(before);
-    expect(later.length).toBeGreaterThan(0);
-    expect(later.some((span) => span.traceId === providerTraceId(P, KEY))).toBe(false);
-  });
 
   it("export says when a provider did not answer, rather than showing a placement as final", async () => {
     const orchestrator = { contexts: { [THREAD]: { trace: { key: KEY } } } };
@@ -1899,279 +2138,3 @@ describe("follow-up review fixes", () => {
   });
 });
 
-describe("third review fixes", () => {
-  const P = "orchestrator";
-  const KEY = "run_42";
-  const inTrace = (span: { traceId: string }) => span.traceId === providerTraceId(P, KEY);
-
-  it("keeps placing a provider's threads after one of its answers cannot be read", async () => {
-    const { history, emit, tick, spans } = await setup({
-      providers: {
-        [P]: {
-          contexts: { [THREAD]: { trace: { key: KEY } } },
-          // Not a list of spans: an answer this plugin cannot read.
-          trace: () => ({ key: KEY, ended: true, spans: "too many" }),
-        },
-      },
-    });
-    history.turn();
-    await emit("thread.idle");
-    await tick();
-    const before = spans().length;
-    history.turn();
-    await emit("thread.idle");
-    const later = spans().slice(before);
-    expect(later.length).toBeGreaterThan(0);
-    expect(later.every(inTrace)).toBe(true);
-  });
-
-  it("does not wait for a provider that never gave a readable answer", async () => {
-    const orchestrator = { contract: 2, contexts: { [THREAD]: { trace: { key: KEY } } } };
-    const providers: Record<string, typeof orchestrator> = { [P]: orchestrator };
-    const { history, emit, clock, spans } = await setup({ providers });
-    history.turn();
-    await emit("thread.idle");
-    expect(spans().some(inTrace)).toBe(false);
-    const before = spans().length;
-
-    delete providers[P];
-    clock.now += 6 * 60_000;
-    history.turn();
-    await emit("thread.idle");
-    expect(spans().length).toBeGreaterThan(before);
-  });
-
-  it("sends a new thread's first usage when its first export has to be retried", async () => {
-    let status = 503;
-    const { history, emit, tick, clock, spans } = await setup({ respond: () => status });
-    // The thread was never seen starting, and its first prompt is not its first event.
-    history.push("thread/started", {});
-    history.turn();
-    history.usage(CLAUDE_TOTAL);
-    await emit("thread.idle");
-    expect(spans()).toHaveLength(0);
-    status = 200;
-    clock.now += 2 * 60_000;
-    await tick();
-    const withUsage = spans().filter((span) => attr(span, "gen_ai.usage.input_tokens") !== undefined);
-    expect(withUsage).toHaveLength(1);
-    expect(attr(withUsage[0], "gen_ai.usage.input_tokens")).toBe(10_100);
-  });
-
-  it("sends a long thread's newest finished turn when the turn after it never finishes", async () => {
-    const { history: h, emit, spans } = await setup();
-    h.turn();
-    h.request("req-open").start("open", "req-open");
-    for (let index = 0; index < 20_000; index++) {
-      h.item("open", { type: "commandExecution", id: `o${index}`, command: "ls" }, 1);
-    }
-    await emit("thread.failed");
-    const agents = spans().filter((span) => span.name.startsWith("invoke_agent"));
-    expect(agents.map((span) => attr(span, "bb.turn.id"))).toEqual(["turn-1"]);
-  }, 30_000);
-});
-
-describe("fourth review fixes", () => {
-  const P = "orchestrator";
-  const KEY = "run_42";
-  const turnIndexes = (spans: Array<{ name: string }>) =>
-    spans
-      .filter((span) => span.name.startsWith("invoke_agent"))
-      .map((span) => attr(span as never, "bb.turn.index"));
-
-  /** A finished turn with more events than one read covers. */
-  function longTurn(h: History, turnId: string) {
-    h.request(`${turnId}-req`).start(turnId, `${turnId}-req`);
-    for (let index = 0; index < 20_000; index++) {
-      h.item(turnId, { type: "commandExecution", id: `${turnId}-${index}`, command: "ls" }, 1);
-    }
-    h.complete(turnId);
-  }
-
-  it("sends a turn longer than one read, and the turns after it", async () => {
-    const { history: h, emit, spans } = await setup();
-    h.turn();
-    await emit("thread.idle");
-    longTurn(h, "long");
-    h.turn();
-    await emit("thread.idle");
-    expect(turnIndexes(spans())).toEqual([1, 2, 3]);
-    expect(spans().filter((span) => attr(span, "bb.turn.id") === "long").length).toBeGreaterThan(20_000);
-  }, 60_000);
-
-  it("starts a thread never sent before at its newest turn, past a turn longer than one read", async () => {
-    const { history: h, emit, spans } = await setup();
-    h.turn();
-    longTurn(h, "long");
-    h.turn();
-    h.turn();
-    await emit("thread.idle");
-    expect(turnIndexes(spans())).toEqual([4]);
-    h.turn();
-    await emit("thread.idle");
-    expect(turnIndexes(spans())).toEqual([4, 5]);
-  }, 60_000);
-
-  it("backs off for five minutes from when a slow call failed, not from when it began", async () => {
-    const { history, emit, clock, rpc } = await setup();
-    rpc.mockImplementationOnce(async () => {
-      clock.now += 60_000;
-      throw new Error("timed out");
-    });
-    history.turn();
-    await emit("thread.idle");
-    expect(rpc).toHaveBeenCalledTimes(1);
-    // Five and a half minutes after the call began, four and a half after it failed.
-    clock.now += 4.5 * 60_000;
-    history.turn();
-    await emit("thread.idle");
-    expect(rpc).toHaveBeenCalledTimes(1);
-  });
-
-  it("asks a provider on another contract once, not once for every thread", async () => {
-    const { histories, emit, rpc, spans } = await setup({
-      providers: { [P]: { contract: 2, contexts: { [THREAD]: { trace: { key: KEY } } } } },
-    });
-    for (const id of [THREAD, "thr_two", "thr_three"]) {
-      histories[id] ??= new History();
-      histories[id].turn();
-      await emit("thread.idle", id);
-    }
-    expect(rpc).toHaveBeenCalledTimes(1);
-    expect(turnIndexes(spans())).toEqual([1, 1, 1]);
-  });
-
-  it("sends a first turn's usage from a state that never read a total", async () => {
-    const { bb, history, emit, spans } = await setup();
-    // As left by a first export that failed before this state recorded what it knew.
-    await bb.storage.kv.set(`thread:${THREAD}`, {
-      sentTurn: 0,
-      resumeSeq: 0,
-      turnsBefore: 0,
-      usage: null,
-      usageKnown: false,
-      partial: null,
-      updatedAt: 0,
-    });
-    history.turn();
-    history.usage(CLAUDE_TOTAL);
-    await emit("thread.idle");
-    const withUsage = spans().filter((span) => attr(span, "gen_ai.usage.input_tokens") !== undefined);
-    expect(withUsage).toHaveLength(1);
-    expect(attr(withUsage[0], "gen_ai.usage.input_tokens")).toBe(10_100);
-  });
-});
-
-describe("fifth review fixes", () => {
-  const P = "orchestrator";
-  const KEY = "run_42";
-  const inTrace = (span: { traceId: string }) => span.traceId === providerTraceId(P, KEY);
-  const turnIndexes = (spans: Array<{ name: string }>) =>
-    spans
-      .filter((span) => span.name.startsWith("invoke_agent"))
-      .map((span) => attr(span as never, "bb.turn.index"));
-
-  /** A finished turn of `items` commands. */
-  function turnOf(h: History, turnId: string, items: number) {
-    h.request(`${turnId}-req`).start(turnId, `${turnId}-req`);
-    for (let index = 0; index < items; index++) {
-      h.item(turnId, { type: "commandExecution", id: `${turnId}-${index}`, command: "ls" }, 1);
-    }
-    h.complete(turnId);
-  }
-
-  it("reads on after a turn longer than one read without waiting for the thread's next event", async () => {
-    const { bb, history: h, emit, tick, spans } = await setup();
-    h.turn();
-    await emit("thread.idle");
-    turnOf(h, "long", 20_000);
-    // Too long to end in the page the long turn ends in.
-    turnOf(h, "after", 150);
-    await emit("thread.idle");
-    expect(turnIndexes(spans())).toEqual([1, 2]);
-    await tick();
-    expect(turnIndexes(spans())).toEqual([1, 2, 3]);
-    expect(await bb.storage.kv.list("retry:")).toEqual([]);
-  }, 60_000);
-
-  it("starts a thread never sent before at its newest turn when a long turn ends its read exactly", async () => {
-    const { history: h, emit, spans } = await setup();
-    h.turn();
-    // 4 + 2 × 19,998 events: read from its own start, this turn ends on the read's last
-    // event, so the read shows no later turn although one has finished.
-    turnOf(h, "long", 19_998);
-    // Long enough that the first read, from the thread's start, is cut short too.
-    turnOf(h, "after", 150);
-    h.turn();
-    await emit("thread.idle");
-    expect(turnIndexes(spans())).toEqual([4]);
-  }, 60_000);
-
-  it("sends tool arguments scrubbed string by string, with their JSON whole", async () => {
-    const { history, emit, spans } = await setup({ settings: { captureContent: true } });
-    history.request("req-1").start("turn-1", "req-1");
-    history.item(
-      "turn-1",
-      {
-        type: "toolCall",
-        id: "t1",
-        tool: "Grep",
-        arguments: { pattern: "API_KEY=", path: "src", env: { GH_TOKEN: "ghs-not-a-known-shape" } },
-      },
-      100,
-      { result: { matches: ["src/a.ts: const x = 'API_KEY=' + key"], count: 1 } },
-    );
-    history.item("turn-1", { type: "fileRead", id: "f1", path: "/tmp/x?token=abc123" }, 100);
-    history.complete("turn-1");
-    await emit("thread.idle");
-    const tool = spans().find((span) => span.name === "execute_tool Grep")!;
-    expect(attr(tool, "gen_ai.tool.call.arguments")).toBe(
-      '{"pattern":"API_KEY=","path":"src","env":{"GH_TOKEN":"[redacted]"}}',
-    );
-    expect(attr(tool, "gen_ai.tool.call.result")).toBe(
-      `{"matches":["src/a.ts: const x = 'API_KEY=[redacted]"],"count":1}`,
-    );
-    const read = spans().find((span) => span.name === "execute_tool Read")!;
-    expect(attr(read, "gen_ai.tool.call.arguments")).toBe("/tmp/x?token=[redacted]");
-  });
-
-  it("keeps placing a provider's threads after an answer of its with no contract at all", async () => {
-    const { history, emit, tick, rpc, spans } = await setup({
-      providers: { [P]: { contexts: { [THREAD]: { trace: { key: KEY } } } } },
-    });
-    history.turn();
-    await emit("thread.idle");
-    // The trace's own spans are asked for at the tick: a broken answer to that one question.
-    rpc.mockImplementationOnce(async () => null as never);
-    await tick();
-    const before = spans().length;
-    history.turn();
-    await emit("thread.idle");
-    const later = spans().slice(before);
-    expect(later.length).toBeGreaterThan(0);
-    expect(later.every(inTrace)).toBe(true);
-  });
-
-  it("asks a provider again right after its back-off, however long its call took to fail", async () => {
-    const { bb, history, emit, tick, clock, rpc, spans } = await setup({
-      providers: { [P]: { contexts: { [THREAD]: { trace: { key: KEY } } } } },
-    });
-    history.turn();
-    await emit("thread.idle");
-    const before = spans().length;
-    rpc.mockImplementationOnce(async () => {
-      clock.now += 60_000;
-      throw new Error("timed out");
-    });
-    history.turn();
-    await emit("thread.idle");
-    expect(spans()).toHaveLength(before);
-    const retry = (await bb.storage.kv.get(`retry:${THREAD}`)) as { nextAt: number };
-    expect(retry.nextAt).toBeGreaterThan(clock.now + 5 * 60_000);
-    clock.now = retry.nextAt;
-    await tick();
-    const later = spans().slice(before);
-    expect(later.length).toBeGreaterThan(0);
-    expect(later.every(inTrace)).toBe(true);
-  });
-});

@@ -2,9 +2,10 @@
 
 ## Agent Traces (bb-plugin-agent-traces)
 
-`src/trace.ts`, `src/breakdown.ts` and `src/util.ts` are adapted from
-<https://github.com/charpeni/bb-plugins>, `plugins/agent-traces`. Each file's
-header says what was changed.
+`src/core/trace/` (from `trace.ts`), `src/core/breakdown.ts` and
+`src/core/text.ts` (from `util.ts`) are adapted from
+<https://github.com/charpeni/bb-plugins>, `plugins/agent-traces`. The headers
+of `builder.ts`, `breakdown.ts` and `text.ts` say what was changed.
 
 MIT License
 

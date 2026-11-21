@@ -8,7 +8,7 @@
  * plugins/agent-traces/breakdown.ts), MIT License, Copyright (c) 2026 Nicolas
  * Charpentier. See THIRD_PARTY_NOTICES.md. Trimmed to the timing sweep.
  */
-import type { Span, SpanKind, Turn } from "./trace.js";
+import type { Span, SpanKind, Turn } from "./trace/types.js";
 
 /** Most to least specific: when two overlap, the earlier one names the moment. */
 export const PHASES = [

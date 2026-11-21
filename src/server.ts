@@ -10,10 +10,11 @@
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { CLI_NAME, registerCli } from "./cli.js";
-import { Exporter, type ExportSettings } from "./exporter.js";
-import { parseProviders } from "./providers.js";
+import { Exporter } from "./export/exporter.js";
+import { type ExportSettings } from "./export/types.js";
+import { parseProviders } from "./integrations/providers/client.js";
 import { parseDsn, type Fetch } from "./sentry.js";
-import { toThreadInfo } from "./util.js";
+import { toThreadInfo } from "./thread.js";
 
 /** How often failed exports are retried and ended traces and workflow runs are sent. */
 const TICK_MS = 60_000;

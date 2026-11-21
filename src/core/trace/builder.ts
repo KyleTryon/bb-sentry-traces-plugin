@@ -31,177 +31,28 @@
  * - A turn remembers when the turn before it ended even when that turn began
  *   before this fold did, so a queued prompt's wait is not counted as startup.
  */
-import { scrub, scrubLine, scrubTail, scrubValue } from "./scrub.js";
-import { record, text, type Json } from "./util.js";
-
-/** The only event types the trace reads, so history can be filtered. */
-export const TRACE_EVENT_TYPES = [
-  "client/turn/requested",
-  "turn/started",
-  "turn/input/accepted",
-  "turn/completed",
-  "item/started",
-  "item/completed",
-  "item/backgroundTask/progress",
-  "item/backgroundTask/completed",
-  "system/interaction/lifecycle",
-  "provider/error",
-  "system/error",
-  "system/thread/interrupted",
-  "provider/modelFallback",
-  "provider/rateLimits/updated",
-  "thread/contextWindowUsage/updated",
-] as const;
-
-export const SPAN_KINDS = [
-  "command",
-  "tool",
-  "read",
-  "edit",
-  "search",
-  "web",
-  "subagent",
-  "background",
-  "waiting",
-  "compaction",
-  "startup",
-  "error",
-] as const;
-export const STATUSES = ["running", "completed", "failed", "interrupted"] as const;
-export const ACTIVITY_KINDS = ["thinking", "writing"] as const;
-
-export type SpanKind = (typeof SPAN_KINDS)[number];
-export type Status = (typeof STATUSES)[number];
-export type ActivityKind = (typeof ACTIVITY_KINDS)[number];
-
-/** A low-cardinality reason a span failed. Safe to send without content capture. */
-export type ErrorType =
-  | "tool_error"
-  | "interrupted"
-  | "provider_error"
-  | "bb_error"
-  | "never_finished";
-
-export interface Span {
-  id: string;
-  /** The subagent this ran inside, or null for the turn's own agent. */
-  parentId: string | null;
-  kind: SpanKind;
-  /**
-   * A name with no user or model content in it: the tool's own name
-   * (`shell`, `Read`, `mcp__docs__search`), `subagent`, `Question`, and so on.
-   */
-  toolName: string;
-  /** A display name. Equal to `toolName` unless content capture is on. */
-  name: string;
-  /** A short description. Empty unless content capture is on. */
-  detail: string;
-  start: number;
-  /** Null while it runs. */
-  end: number | null;
-  status: Status;
-  /** Runs alongside its agent instead of blocking it, like a dev server or a background subagent. */
-  background: boolean;
-  /** Tokens a subagent has reported so far; null when the provider reports none. */
-  tokens: number | null;
-  /**
-   * For a subagent: the kind of agent it is, such as `Explore`. One of a small
-   * set of names, never the task it was given. Null for everything else.
-   */
-  agent: string | null;
-  /** For a subagent: when the tool call that started it returned. The agent may work on after. */
-  callEnd: number | null;
-  /** The command's exit code, when it reported one. */
-  exitCode: number | null;
-  errorType: ErrorType | null;
-  /**
-   * What went wrong. A tool's own error text is tool output, so it is kept
-   * only with content capture; provider and bb errors are always kept.
-   */
-  error: string | null;
-  /** The call's arguments as text. Null unless content capture is on. */
-  args: string | null;
-  /** The call's output as text. Null unless content capture is on. */
-  result: string | null;
-  /** The event that started the span. */
-  seq: number;
-  /** The event that ended it. */
-  endSeq: number | null;
-}
-
-/** When an agent was visibly thinking or writing its reply. */
-export interface Activity {
-  id: string;
-  /** The subagent it belongs to, or null for the turn's own agent. */
-  lane: string | null;
-  kind: ActivityKind;
-  start: number;
-  end: number | null;
-}
-
-export interface Turn {
-  id: string;
-  /** 1-based position among the thread's top-level turns. */
-  index: number;
-  /** The thread that sent the prompt, or `bb` for bb's own notices; null when the user did. */
-  sender: string | null;
-  /** The model the turn was requested with, as bb recorded it. */
-  model: string | null;
-  reasoningLevel: string | null;
-  serviceTier: string | null;
-  permissionMode: string | null;
-  /** Who started the turn: `user`, `agent` or `system`. */
-  initiator: string | null;
-  /** How the prompt reached the thread, such as `spawn`. */
-  source: string | null;
-  /** The model the provider switched to mid-turn, when it did. */
-  fallback: { model: string; reason: string | null; at: number } | null;
-  /** The provider's latest rate limit status during the turn, such as `allowed` or `warning`. */
-  rateLimitStatus: string | null;
-  /** The latest context window reading during the turn. */
-  context: { usedTokens: number | null; windowTokens: number | null } | null;
-  /** The prompt. Null unless content capture is on. */
-  input: string | null;
-  /** The turn's own agent's replies, oldest first. Empty unless content capture is on. */
-  replies: string[];
-  start: number;
-  /** Null while it runs. */
-  end: number | null;
-  status: Status;
-  /** The provider's error for a failed turn. */
-  error: string | null;
-  spans: Span[];
-  activity: Activity[];
-  /** The prompt's event. A queued prompt comes before `firstSeq`. */
-  requestSeq: number | null;
-  /** The stretch of history the turn ran over, from its `turn/started` to its `turn/completed`. */
-  firstSeq: number;
-  lastSeq: number;
-}
-
-/** The slice of a bb thread event row the trace reads. */
-export interface TraceEvent {
-  seq: number;
-  createdAt: number;
-  type: string;
-  scope: { kind: string; turnId?: string };
-  data: unknown;
-}
-
-export interface TraceBuilderOptions {
-  /** Keep prompts, replies, arguments and outputs. Off keeps none of them. */
-  content: boolean;
-  /** How many top-level turns came before the first event this builder will see. */
-  indexOffset?: number;
-}
+import { basename, programOf } from "./shell.js";
+import {
+  MAX_ARGS,
+  MAX_INPUT,
+  MAX_REPLY,
+  MAX_RESULT,
+  type Activity,
+  type ActivityKind,
+  type Span,
+  type SpanKind,
+  type Status,
+  type Turn,
+  type TraceBuilderOptions,
+  type TraceEvent,
+} from "./types.js";
+import { scrub, scrubLine, scrubTail } from "../scrub/cut.js";
+import { scrubValue } from "../scrub/value.js";
+import { record, text, type Json } from "../text.js";
 
 const MAX_TEXT = 160;
 const MAX_ERROR = 300;
-/** Per-field caps for captured content, in characters. */
-export const MAX_INPUT = 16_000;
-export const MAX_REPLY = 16_000;
-export const MAX_ARGS = 4_000;
-export const MAX_RESULT = 4_000;
+
 // Shorter startups are just the provider's own latency.
 const MIN_STARTUP_MS = 300;
 // After this long without a single event, nothing in the thread is still running.
@@ -249,10 +100,6 @@ function clip(value: string, max = MAX_TEXT): string {
   return scrubLine(value, max);
 }
 
-export function basename(path: string): string {
-  return path.split(/[\\/]/).filter(Boolean).pop() ?? path;
-}
-
 function itemStatus(value: unknown): Status {
   if (value === "pending") return "running";
   if (value === "failed" || value === "interrupted") return value;
@@ -266,139 +113,11 @@ function unwrapCommand(command: unknown): string {
   return wrapped ? wrapped[2] : raw;
 }
 
-const SETUP_COMMANDS = new Set(["cd", "export", "set", "source", ".", "mkdir", "true", ":"]);
-const SHELL_KEYWORDS = new Set(["for", "while", "until", "if", "case", "do", "then", "{", "("]);
-const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
-// A heredoc's body is data, not commands to name the span after. The rest of
-// its first line stays (`cat <<EOF > file`, `cat <<EOF | kubectl apply -f -`),
-// and the marker becomes a `<<…` word that no heredoc pattern matches again.
-const HEREDOC =
-  /<<-?[ \t]*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1([^\n]*)\n[\s\S]*?\n[ \t]*\2[ \t]*(?=\n|$)/g;
-// A heredoc whose terminator was cut off, as in a clipped command, runs to the end.
-const UNTERMINATED_HEREDOC = /<<-?[ \t]*(['"]?)[A-Za-z_][A-Za-z0-9_]*\1([^\n]*)\n[\s\S]*$/;
-const HEREDOC_WORD = "<<…";
 const THREAD_MESSAGE_PREFIX = /^\s*\[bb message from thread:([^\]\s]+)\]\s*/;
 // bb's own notices, such as a spawned thread finishing, arrive as prompts too.
 const SYSTEM_MESSAGE_PREFIX = /^\s*\[bb system\]\s*/;
 /** The sender of a prompt that bb itself sent. */
 export const BB_SENDER = "bb";
-
-/**
- * `cat > file`, `echo … > file`, and `tee` only write a file for the next
- * step, and `cat <<EOF | …` only hands text to the next program.
- */
-function writesFile(words: string[]): boolean {
-  if (words[0] === "tee") return true;
-  if (words[0] === "cat" && words.includes(HEREDOC_WORD)) return true;
-  return ["cat", "echo", "printf"].includes(words[0]) && words.some((word) => word.startsWith(">"));
-}
-
-/**
- * Splits a command line into simple commands, each a list of words, the way a
- * shell would: quotes, `$(…)`, backticks, and line continuations keep their
- * contents together, and `&&`, `||`, `|`, `;`, `&`, and newlines separate.
- */
-export function shellCommands(command: string): string[][] {
-  const commands: string[][] = [];
-  let words: string[] = [];
-  let word = "";
-  let inWord = false;
-  const endWord = () => {
-    if (inWord) words.push(word);
-    word = "";
-    inWord = false;
-  };
-  const endCommand = () => {
-    endWord();
-    if (words.length > 0) commands.push(words);
-    words = [];
-  };
-  for (let index = 0; index < command.length; index++) {
-    const char = command[index];
-    const next = command[index + 1];
-    if (char === "'") {
-      const close = command.indexOf(char, index + 1);
-      const end = close === -1 ? command.length : close;
-      word += command.slice(index + 1, end);
-      inWord = true;
-      index = end;
-    } else if (char === '"') {
-      // Inside double quotes, a backslash escapes `"`, `\\`, `$`, and backticks.
-      let end = index + 1;
-      for (; end < command.length && command[end] !== '"'; end++) {
-        if (command[end] === "\\" && '"\\$`'.includes(command[end + 1] ?? "x")) end++;
-        word += command[end] ?? "";
-      }
-      inWord = true;
-      index = end;
-    } else if ((char === "$" && next === "(") || char === "`") {
-      // Command substitution stays one word, nested parentheses included.
-      let depth = 0;
-      let end = index;
-      for (; end < command.length; end++) {
-        const current = command[end];
-        if (char === "`" ? current === "`" && end > index : current === ")" && --depth === 0) break;
-        if (char !== "`" && current === "(") depth++;
-      }
-      word += command.slice(index, end + 1);
-      inWord = true;
-      index = end;
-    } else if (char === "\\") {
-      if (next !== "\n") {
-        word += next ?? "";
-        inWord = true;
-      }
-      index++;
-    } else if (char === "&" && (command[index - 1] === ">" || next === ">")) {
-      // A redirection such as `2>&1` or `&>`, not a separator.
-      word += char;
-      inWord = true;
-    } else if (char === "\n" || char === ";" || char === "&" || char === "|") {
-      endCommand();
-      if ((char === "&" || char === "|") && next === char) index++;
-    } else if (/\s/.test(char)) {
-      endWord();
-    } else if ((char === "(" || char === ")" || char === "{" || char === "}") && !inWord) {
-      endCommand();
-    } else {
-      word += char;
-      inWord = true;
-    }
-  }
-  endCommand();
-  return commands;
-}
-
-/**
- * The words of the part of a command line that matters, past `cd x &&`,
- * `VAR=value`, and file setup. Empty for a shell loop or conditional.
- */
-export function commandWords(command: string): string[] {
-  for (const words of shellCommands(
-    command
-      .replace(HEREDOC, `${HEREDOC_WORD}$3`)
-      .replace(UNTERMINATED_HEREDOC, `${HEREDOC_WORD}$2`),
-  )) {
-    const meaningful = words.filter((word) => !ASSIGNMENT.test(word));
-    const program = meaningful[0];
-    if (
-      !program ||
-      program.startsWith("-") ||
-      SETUP_COMMANDS.has(program) ||
-      writesFile(meaningful)
-    )
-      continue;
-    // A loop, a conditional, or a function definition (`spawn() {`) is shell code, not one program.
-    return SHELL_KEYWORDS.has(program) || program.endsWith("()") ? [] : meaningful;
-  }
-  return [];
-}
-
-/** The program a command line is about. */
-function programOf(command: string): string {
-  const [program] = commandWords(command);
-  return (program && basename(program)) || "shell";
-}
 
 interface Description {
   kind: SpanKind;

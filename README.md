@@ -252,8 +252,8 @@ bb plugin dev     # rebuild and reload on save
 
 ## Credits
 
-The event-to-trace folding (`src/trace.ts`, `src/breakdown.ts`,
-`src/util.ts`) is adapted from
+The event-to-trace folding (`src/core/trace/`, `src/core/breakdown.ts`,
+`src/core/text.ts`) is adapted from
 [Agent Traces](https://github.com/charpeni/bb-plugins/tree/main/plugins/agent-traces)
 by Nicolas Charpentier, MIT License. See
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

@@ -1,5 +1,5 @@
-import type { OtlpSpan, OtlpTraces } from "../src/otlp.js";
-import type { TraceEvent } from "../src/trace.js";
+import type { OtlpSpan, OtlpTraces } from "../src/core/otlp.js";
+import type { TraceEvent } from "../src/core/trace/types.js";
 
 /** Text that must never leave the machine while content capture is off. */
 export const SECRETS = {
