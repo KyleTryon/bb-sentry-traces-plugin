@@ -1,0 +1,143 @@
+{
+  "coordinatorThreadId": "thr_2",
+  "workerThreadId": "thr_5",
+  "scriptName": "orch-run-0309b64b-b-develop-1",
+  "contexts": {
+    "contract": 1,
+    "contexts": {
+      "thr_5": null,
+      "thr_2": {
+        "trace": {
+          "key": "run_0309b64b-b",
+          "endedAt": null,
+          "pipeline": "task-loop",
+          "attributes": {
+            "orchestrator.run_id": "run_0309b64b-b",
+            "orchestrator.workflow_id": "task-loop",
+            "orchestrator.task_key": "TASK-1"
+          }
+        },
+        "parent": null,
+        "agent": {
+          "id": "coordinator",
+          "name": "Coordinator"
+        },
+        "attributes": {
+          "orchestrator.role": "coordinator"
+        }
+      }
+    }
+  },
+  "trace": {
+    "contract": 1,
+    "trace": {
+      "key": "run_0309b64b-b",
+      "ended": false,
+      "pipeline": "task-loop",
+      "attributes": {
+        "orchestrator.run_id": "run_0309b64b-b",
+        "orchestrator.workflow_id": "task-loop",
+        "orchestrator.task_key": "TASK-1"
+      },
+      "spans": [
+        {
+          "key": "root",
+          "parentKey": null,
+          "name": "orchestrator.run task-loop",
+          "op": "orchestrator.run",
+          "start": 1795228462423,
+          "end": 1795228462650,
+          "status": "ok",
+          "kind": "internal",
+          "attributes": {
+            "orchestrator.run_id": "run_0309b64b-b",
+            "orchestrator.workflow_id": "task-loop",
+            "orchestrator.task_key": "TASK-1",
+            "orchestrator.state": "active",
+            "orchestrator.attempts_used": 1,
+            "orchestrator.failures": 1,
+            "orchestrator.coordinator_thread_id": "thr_2"
+          }
+        },
+        {
+          "key": "step:run_0309b64b-b#develop#1",
+          "parentKey": "root",
+          "name": "orchestrator.step develop#1",
+          "op": "orchestrator.step",
+          "start": 1795228462607,
+          "end": 1795228462607,
+          "status": "ok",
+          "kind": "internal",
+          "attributes": {
+            "orchestrator.run_id": "run_0309b64b-b",
+            "orchestrator.workflow_id": "task-loop",
+            "orchestrator.task_key": "TASK-1",
+            "orchestrator.step": "develop",
+            "orchestrator.attempt": 1,
+            "orchestrator.attempt_id": "run_0309b64b-b#develop#1",
+            "orchestrator.state": "done",
+            "orchestrator.agent_id": "developer"
+          },
+          "workflowName": "orch-run-0309b64b-b-develop-1"
+        },
+        {
+          "key": "pick:2",
+          "parentKey": "root",
+          "name": "orchestrator.pick developer",
+          "op": "orchestrator.pick",
+          "start": 1795228462604,
+          "end": 1795228462604,
+          "status": "ok",
+          "kind": "internal",
+          "attributes": {
+            "orchestrator.run_id": "run_0309b64b-b",
+            "orchestrator.workflow_id": "task-loop",
+            "orchestrator.task_key": "TASK-1",
+            "orchestrator.agent_id": "developer",
+            "orchestrator.pick.provider_id": "prov-a",
+            "orchestrator.pick.model": "model-a2",
+            "orchestrator.pick.reasoning_level": "medium"
+          }
+        },
+        {
+          "key": "pick:3",
+          "parentKey": "root",
+          "name": "orchestrator.pick reviewer",
+          "op": "orchestrator.pick",
+          "start": 1795228462605,
+          "end": 1795228462605,
+          "status": "ok",
+          "kind": "internal",
+          "attributes": {
+            "orchestrator.run_id": "run_0309b64b-b",
+            "orchestrator.workflow_id": "task-loop",
+            "orchestrator.task_key": "TASK-1",
+            "orchestrator.agent_id": "reviewer",
+            "orchestrator.pick.provider_id": "prov-b",
+            "orchestrator.pick.model": "model-b1",
+            "orchestrator.pick.reasoning_level": "high"
+          }
+        },
+        {
+          "key": "verify:1",
+          "parentKey": "step:run_0309b64b-b#develop#1",
+          "name": "orchestrator.verify",
+          "op": "orchestrator.verify",
+          "start": 1795228462642,
+          "end": 1795228462642,
+          "status": "error",
+          "errorType": "verify_failed",
+          "kind": "internal",
+          "attributes": {
+            "orchestrator.run_id": "run_0309b64b-b",
+            "orchestrator.workflow_id": "task-loop",
+            "orchestrator.task_key": "TASK-1",
+            "orchestrator.attempt_id": "run_0309b64b-b#develop#1",
+            "orchestrator.verify.passed": false,
+            "process.exit.code": 0
+          }
+        }
+      ]
+    }
+  }
+}
