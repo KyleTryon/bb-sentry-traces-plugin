@@ -20,9 +20,9 @@ import { placeThread } from "./location.js";
 import { fold, readUsage, readsOn, resumePoint } from "./read.js";
 import { clearRetry, scheduleCheck, scheduleRetry } from "./retries.js";
 import { noteTrace, noteWorkflow } from "./runs.js";
-import { resourceOf, targetOf } from "./settings.js";
+import { resourceOf, stillSending, targetOf } from "./settings.js";
 import { type TurnUsage, turnSpans } from "./spans.js";
-import { kv, recordFailure, recordSuccess } from "./store.js";
+import { fromBeforeGap, kv, recordFailure, recordSuccess, sendingSince } from "./store.js";
 import type { ExportContext, ExportOutcome, Folded, ThreadState } from "./types.js";
 import { UNAVAILABLE_MS } from "../integrations/providers/client.js";
 import { contextForTurn } from "../integrations/providers/placement.js";
@@ -111,15 +111,40 @@ interface Read {
   folded: Folded;
 }
 
-/** Turns held back for a background agent, then the finished turns after the last one sent. */
-function dueTurns(finished: Turn[], sentTurn: number | null, waitedBefore: ReadonlySet<number>): Turn[] {
+/**
+ * Turns held back for a background agent, then the finished turns after the
+ * last one sent. After a long gap only the newest go; `skipped` counts the
+ * others, whose tokens are still in the thread's total.
+ */
+function dueTurns(
+  finished: Turn[],
+  sentTurn: number | null,
+  waitedBefore: ReadonlySet<number>,
+): { due: Turn[]; skipped: number } {
   const held = finished.filter(
     (turn) => sentTurn !== null && turn.index <= sentTurn && waitedBefore.has(turn.index),
   );
-  const fresh = (
-    sentTurn !== null ? finished.filter((turn) => turn.index > sentTurn) : finished.slice(-1)
-  ).slice(-MAX_TURNS_PER_EXPORT);
-  return [...held, ...fresh];
+  const after = sentTurn !== null ? finished.filter((turn) => turn.index > sentTurn) : finished.slice(-1);
+  const fresh = after.slice(-MAX_TURNS_PER_EXPORT);
+  return { due: [...held, ...fresh], skipped: after.length - fresh.length };
+}
+
+/**
+ * A state from before sending was last turned on is read as a thread never
+ * sent, still reading on from where it got to.
+ */
+function afterGap(state: ThreadState | undefined, since: number | null): ThreadState | undefined {
+  if (!state || !fromBeforeGap(state, since)) return state;
+  return { ...state, sentTurn: null, usage: null, usageKnown: false, usageTurns: 0, waiting: null, partial: null };
+}
+
+/**
+ * For a thread nothing of which was sent: the newest turn that finished
+ * before sending was last turned on. It and the turns before it are not owed.
+ */
+function finishedBefore(finished: Turn[], since: number | null): number | null {
+  if (since === null) return null;
+  return finished.filter((turn) => turn.end !== null && turn.end < since).at(-1)?.index ?? null;
 }
 
 /**
@@ -221,6 +246,7 @@ async function settleIdle(
   if (state) {
     await kv(ctx).set(key, {
       ...state,
+      sentTurn,
       waiting: null,
       ...point,
       updatedAt: ctx.now(),
@@ -280,6 +306,8 @@ interface Sending {
   cut: { turnId: string; spanIds: string[] } | null;
   failure: SendResult | null;
   refused: SendResult | null;
+  /** Sending was turned off, moved to another DSN or the plugin unloaded part way. */
+  stopped: boolean;
   usageSent: boolean;
   turnsSent: number;
   spansSent: number;
@@ -288,7 +316,9 @@ interface Sending {
 
 /**
  * Sends the due turns one at a time, so a failure leaves the turns before it
- * sent and the spans Sentry already took are never sent again.
+ * sent and the spans Sentry already took are never sent again. The settings
+ * are read again before each turn: sending stops, with nothing counted as
+ * failed, once they no longer send to the same place.
  */
 async function sendTurns(ctx: ExportContext, plan: Plan): Promise<Sending> {
   const { thread, due, waits, workflow, trace, usage, partial, baseline, now } = plan;
@@ -297,6 +327,7 @@ async function sendTurns(ctx: ExportContext, plan: Plan): Promise<Sending> {
   let cut: { turnId: string; spanIds: string[] } | null = null;
   let failure: SendResult | null = null;
   let refused: SendResult | null = null;
+  let stopped = false;
   let usageSent = false;
   let turnsSent = 0;
   let spansSent = 0;
@@ -306,6 +337,10 @@ async function sendTurns(ctx: ExportContext, plan: Plan): Promise<Sending> {
       // Passed over for now; it is remembered as waiting.
       lastDone = Math.max(lastDone, turn.index);
       continue;
+    }
+    if (!(await stillSending(ctx, plan.target))) {
+      stopped = true;
+      break;
     }
     const all = turnSpans(turn, {
       thread,
@@ -344,7 +379,7 @@ async function sendTurns(ctx: ExportContext, plan: Plan): Promise<Sending> {
     };
     break;
   }
-  return { done, lastDone, cut, failure, refused, usageSent, turnsSent, spansSent, traceIds };
+  return { done, lastDone, cut, failure, refused, stopped, usageSent, turnsSent, spansSent, traceIds };
 }
 
 export async function exportThread(ctx: ExportContext, thread: ThreadInfo): Promise<ExportOutcome> {
@@ -354,7 +389,8 @@ export async function exportThread(ctx: ExportContext, thread: ThreadInfo): Prom
   if ("reason" in resolved) return { kind: "not-configured" };
 
   const key = THREAD_KEY + thread.id;
-  const start = await kv(ctx).get<ThreadState>(key);
+  const since = await sendingSince(ctx);
+  const start = afterGap(await kv(ctx).get<ThreadState>(key), since);
   const caught = await catchUp(
     ctx,
     thread,
@@ -369,9 +405,10 @@ export async function exportThread(ctx: ExportContext, thread: ThreadInfo): Prom
   }
 
   const finished = folded.turns.filter((turn) => turn.end !== null);
-  const sentTurn = state?.sentTurn ?? null;
+  // Turning the plugin on sends the turns that finish from then on.
+  const sentTurn = state?.sentTurn ?? finishedBefore(finished, since);
   const waitedBefore = new Set(state?.waiting ?? []);
-  const due = dueTurns(finished, sentTurn, waitedBefore);
+  const { due, skipped } = dueTurns(finished, sentTurn, waitedBefore);
   const [oldestDue] = due;
   if (oldestDue === undefined) return settleIdle(ctx, thread, state, folded, sentTurn);
 
@@ -406,7 +443,7 @@ export async function exportThread(ctx: ExportContext, thread: ThreadInfo): Prom
       // One span of one turn carries it, so cost is never counted twice.
       usage.set(newestPending.id, {
         usage: toSentryUsage(delta),
-        turns: pending.length + usageTurns,
+        turns: pending.length + usageTurns + skipped,
       });
     }
   }
@@ -425,7 +462,7 @@ export async function exportThread(ctx: ExportContext, thread: ThreadInfo): Prom
     baseline,
     now,
   });
-  const { done, lastDone, cut, failure, refused, usageSent, turnsSent, spansSent, traceIds } = sending;
+  const { done, lastDone, cut, failure, refused, stopped, usageSent, turnsSent, spansSent, traceIds } = sending;
 
   // Turns at or before the last one done that are not done: they wait, or
   // waited and could not be sent this time.
@@ -454,23 +491,34 @@ export async function exportThread(ctx: ExportContext, thread: ThreadInfo): Prom
     if (trace && inTrace) await noteTrace(ctx, trace);
     if (workflow) await noteWorkflow(ctx, workflow, inTrace ? trace : null);
   }
-  if (failure) return failed(ctx, thread.id, failure);
-  // Finished turns may sit in the events this read did not take in.
-  const checkAt = readsOn(folded, state, point) ? now : waitUntil;
-  if (checkAt !== null) await scheduleCheck(ctx, thread.id, checkAt);
+  if (failure) return failed(ctx, thread.id, failure, waitUntil);
+  // Finished turns may sit in the events this read did not take in, and
+  // turns a stop left unsent go once sending is on again.
+  const checkAt = stopped || readsOn(folded, state, point) ? now : waitUntil;
+  if (checkAt !== null) await scheduleCheck(ctx, thread.id, checkAt, turnsSent > 0);
   else await clearRetry(ctx, thread.id);
   if (turnsSent === 0 && refused) {
     return { kind: "failed", message: refused.message, retryable: false };
   }
-  if (pending.length === 0) return { kind: "nothing" };
+  if (pending.length === 0 || (stopped && turnsSent === 0)) return { kind: "nothing" };
   return { kind: "sent", turns: turnsSent, spans: spansSent, traceIds: [...traceIds] };
 }
 
-async function failed(ctx: ExportContext, threadId: string, result: SendResult): Promise<ExportOutcome> {
+/**
+ * A failed send: retried later, backing off. A rejected key fails the same
+ * way again, so it is not retried, and the next turn tries anyway; turns
+ * waiting on a background agent are still looked at by `waitUntil`.
+ */
+async function failed(
+  ctx: ExportContext,
+  threadId: string,
+  result: SendResult,
+  waitUntil: number | null,
+): Promise<ExportOutcome> {
   ctx.bb.log.warn(`Could not send the trace of ${threadId}: ${result.message}`);
   await recordFailure(ctx, result.message);
-  // A rejected key fails the same way again; the next turn tries anyway.
-  if (result.retryable) await scheduleRetry(ctx, threadId);
+  if (result.retryable) await scheduleRetry(ctx, threadId, waitUntil);
+  else if (waitUntil !== null) await scheduleCheck(ctx, threadId, waitUntil);
   else await clearRetry(ctx, threadId);
   return { kind: "failed", message: result.message, retryable: result.retryable };
 }

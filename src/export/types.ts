@@ -123,4 +123,6 @@ export interface ExportContext {
   locks: Map<string, Promise<unknown>>;
   /** Whether 0.1.0's one-map-per-kind records have been moved over this run. */
   migrated: boolean;
+  /** Set when the plugin unloads: work still running stops at its next turn or entry. */
+  disposed: boolean;
 }
