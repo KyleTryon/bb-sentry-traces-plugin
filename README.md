@@ -7,6 +7,8 @@ agent provider (Claude Code, Codex, Pi, ACP agents) and needs no other plugin.
 
 This is a community plugin. It is not made or supported by Sentry.
 
+![Sentry's Agents dashboard showing bb agent runs, cost, duration, LLM calls by model, tokens used, tool calls and a list of traces](docs/images/agents-dashboard.png)
+
 ## Install
 
 ```sh
@@ -42,6 +44,8 @@ Agent Monitoring. A DSN on plain `http://` is accepted, but `status` warns
 unless the host is `localhost`: traces and the key would travel unencrypted.
 
 ### Settings
+
+![The plugin's settings in bb: Sentry DSN, Send traces to Sentry, Also send prompts, replies, tool arguments and outputs, and Environment label](docs/images/settings.png)
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
@@ -85,6 +89,11 @@ Each turn's `invoke_agent` span also says where and how it ran:
 
 A subagent is named by its kind (`Explore`, `general-purpose`,
 `code-review`) when bb records one, and `subagent` when it does not.
+
+![One turn in Sentry's Agent Activity timeline: the claude-code agent span with its chat and shell spans, and the prompt under Input](docs/images/trace-timeline.png)
+
+One turn in a trace, with `captureContent` on. Without it, the same spans
+are sent, but with no command lines, prompt or replies.
 
 ## What is sent
 
