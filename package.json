@@ -5,6 +5,15 @@
   "type": "module",
   "description": "Unofficial bb plugin that sends agent traces to Sentry Agent Monitoring over OTLP.",
   "license": "MIT",
+  "author": "Kyle Tryon",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/KyleTryon/bb-sentry-traces-plugin-unofficial.git"
+  },
+  "homepage": "https://github.com/KyleTryon/bb-sentry-traces-plugin-unofficial#readme",
+  "bugs": {
+    "url": "https://github.com/KyleTryon/bb-sentry-traces-plugin-unofficial/issues"
+  },
   "keywords": [
     "bb-plugin",
     "sentry",
@@ -13,7 +22,7 @@
     "agent-monitoring"
   ],
   "engines": {
-    "bb": ">=0.50",
+    "bb": ">=0.50.0",
     "bbPluginSdk": ">=0.6.157"
   },
   "bb": {
@@ -32,7 +41,8 @@
     "lint": "oxlint --type-aware --type-check --deny-warnings -c .oxlintrc.json .",
     "test": "vitest run --config vitest.config.ts",
     "build": "bb plugin build .",
-    "check": "npm run typecheck && npm run lint && npm test"
+    "check": "npm run typecheck && npm run lint && npm run knip && npm test",
+    "knip": "knip --no-config-hints"
   },
   "dependencies": {
     "zod": "^4.6.5"
@@ -44,6 +54,7 @@
     "better-sqlite3": "^12.0.0",
     "cron-parser": "^5.5.0",
     "hono": "^4.11.9",
+    "knip": "^6.48.0",
     "oxlint": "^1.94.0",
     "oxlint-tsgolint": "^7.0.2007",
     "typescript": "^5.7.0",
@@ -59,7 +70,8 @@
     "LICENSE",
     "THIRD_PARTY_NOTICES.md",
     "CHANGELOG.md",
-    "SECURITY.md"
+    "SECURITY.md",
+    "AGENTS.md"
   ],
   "allowScripts": {
     "better-sqlite3@12.11.1": true,

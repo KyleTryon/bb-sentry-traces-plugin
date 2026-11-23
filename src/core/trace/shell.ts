@@ -35,7 +35,7 @@ function writesFile(words: string[]): boolean {
  * shell would: quotes, `$(…)`, backticks, and line continuations keep their
  * contents together, and `&&`, `||`, `|`, `;`, `&`, and newlines separate.
  */
-export function shellCommands(command: string): string[][] {
+function shellCommands(command: string): string[][] {
   const commands: string[][] = [];
   let words: string[] = [];
   let word = "";
@@ -110,7 +110,7 @@ export function shellCommands(command: string): string[][] {
  * The words of the part of a command line that matters, past `cd x &&`,
  * `VAR=value`, and file setup. Empty for a shell loop or conditional.
  */
-export function commandWords(command: string): string[] {
+function commandWords(command: string): string[] {
   for (const words of shellCommands(
     command
       .replace(HEREDOC, `${HEREDOC_WORD}$3`)

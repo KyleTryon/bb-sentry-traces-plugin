@@ -119,7 +119,7 @@ Input: at most 200 threads per call.
 | `trace.pipeline` | optional | The workflow or pipeline the trace belongs to. Sent as `gen_ai.pipeline.name`. |
 | `trace.attributes` | optional | Attributes for every span of the trace, including spans the plugin builds itself. |
 | `parent` | optional | The `key` of the span this thread's turns hang under. `null` means the root. |
-| `agent.id`, `agent.name` | optional | The agent the thread runs as. `name` becomes `gen_ai.agent.name`, the name Sentry lists agents by; `id` is sent as `bb.agent.id`. Without either, the thread is named by its bb provider, such as `claude-code`. |
+| `agent.id`, `agent.name` | optional | The agent the thread runs as. `name` (one line, cut to 80 characters) becomes `gen_ai.agent.name`, the name Sentry lists agents by; `id` is sent as `bb.agent.id`. Without either, the thread is named by its bb provider, such as `claude-code`. |
 | `model` | optional | The model to report when bb recorded none for a turn. |
 | `attributes` | optional | Attributes for this thread's spans only. |
 
@@ -253,8 +253,8 @@ Output:
 | `spans[].op` | optional | The span's operation, such as `example.step` or `gen_ai.decide`. |
 | `spans[].start`, `.end` | yes | The span's times. |
 | `spans[].status` | optional | `ok` or `error`. |
-| `spans[].errorType` | optional | A short, fixed reason for an error, such as `verify_failed`. |
-| `spans[].errorMessage` | optional | Free text about the error. Kept and sent only as [content](#content). |
+| `spans[].errorType` | optional | A short, fixed reason for an error, such as `verify_failed`: up to 64 letters, digits, `_`, `.` and `-`, starting with a letter. Anything else is sent as `error`. |
+| `spans[].errorMessage` | optional | Free text about the error. Kept and sent only as [content](#content), cut to 300 characters. |
 | `spans[].kind` | optional | `client` for a call to a model, else `internal`. |
 | `spans[].attributes` | optional | The span's attributes. |
 | `spans[].content` | optional | Attributes that hold user or model text. See [Content](#content). |
@@ -264,6 +264,8 @@ Output:
 ### Limits
 
 - At most 2,000 spans, refused with `invalid_input` past that.
+- Times are milliseconds since the epoch, from 0 to 10,000,000,000,000; a
+  time outside that range is refused with `invalid_input`.
 - At most 4 MB for the whole trace as sent, and 192 KB for one span once
   checked; past either, the call is refused with `invalid`.
 - While export is off (`sending: false`), the plugin keeps no snapshot. Report
@@ -347,7 +349,7 @@ anything else, and:
 - keeps at most 64 attributes per span, and 2,000 characters per value;
 - drops a key that is not a plain name (letters, digits, `.`, `_`, `-`);
 - drops keys starting with `sentry.`, `bb.thread.`, `bb.turn.` or `bb.trace.`,
-  and `gen_ai.conversation.id`;
+  and `gen_ai.conversation.id`, in any case (`SENTRY.op` too);
 - drops keys for user or model text, such as `gen_ai.input.messages`, outside
   `content`;
 - drops keys for one model call's usage and cost from trace and thread

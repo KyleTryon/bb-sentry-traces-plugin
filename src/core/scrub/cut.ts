@@ -21,7 +21,7 @@ export function endMarker(cut: number): string {
 }
 
 /** The marker a cut leaves before the text it kept, at the start. */
-export function startMarker(cut: number): string {
+function startMarker(cut: number): string {
   return `[… ${cut} earlier characters cut]\n`;
 }
 

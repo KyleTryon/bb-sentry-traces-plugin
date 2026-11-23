@@ -26,15 +26,15 @@ export interface Kv {
   list(prefix?: string): Promise<string[]>;
 }
 
-export const CLAIM_PREFIX = "claim:";
-export const SNAPSHOT_PREFIX = "snapshot:";
-export const PART_PREFIX = "snapshot-part:";
-export const PROVIDER_PREFIX = "provider:";
+const CLAIM_PREFIX = "claim:";
+const SNAPSHOT_PREFIX = "snapshot:";
+const PART_PREFIX = "snapshot-part:";
+const PROVIDER_PREFIX = "provider:";
 
 /** A stored value may be 256 KB; a part of a snapshot stays well under that. */
 const MAX_PART_BYTES = 192 * 1024;
 /** A claim lands on every span of its thread, so it is kept small. */
-export const MAX_CLAIM_BYTES = 64 * 1024;
+const MAX_CLAIM_BYTES = 64 * 1024;
 /** A part no snapshot names, this old, is left from a write that stopped part way. */
 const STRAY_PART_MS = 60 * 60_000;
 

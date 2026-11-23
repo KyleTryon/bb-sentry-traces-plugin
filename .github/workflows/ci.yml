@@ -6,6 +6,9 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+  schedule:
+    # Weekly, so a new bb release that breaks the build shows up without a push.
+    - cron: "23 7 * * 1"
 
 permissions:
   contents: read
@@ -38,6 +41,7 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm run lint
+      - run: npm run knip
       - run: npm test
       - name: Check the version matches package.json
         if: startsWith(github.ref, 'refs/tags/v')
@@ -50,11 +54,18 @@ jobs:
             exit 1
           fi
 
-  install:
-    # What `bb plugin install` of a Git source does: production dependencies only.
-    name: production install
+  build:
+    # What `bb plugin install` of a Git source does: production dependencies
+    # only, then `bb plugin build`. Built with the oldest bb this plugin
+    # supports (engines.bb), the latest release and the nightly.
+    name: build (bb ${{ matrix.bb }})
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+    continue-on-error: ${{ matrix.bb == 'nightly' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        bb: ["0.50.0", latest, nightly]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -65,11 +76,21 @@ jobs:
           cache: npm
       - run: npm ci --omit=dev --ignore-scripts
       - run: npm audit --omit=dev --audit-level=moderate
-      - name: Check the published files exist
+      - name: Install bb ${{ matrix.bb }}
+        run: npm install --global --ignore-scripts "bb-app@${{ matrix.bb }}"
+      - name: Check the SDK pin matches the oldest supported bb
+        if: matrix.bb == '0.50.0'
+        run: bb plugin types --check .
+      - run: bb plugin build .
+      - name: Check the build output
         run: |
           node -e '
             const fs = require("node:fs");
             const pkg = require("./package.json");
+            const meta = JSON.parse(fs.readFileSync("dist/server.meta.json", "utf8"));
             const missing = [...pkg.files, pkg.bb.server, pkg.bb.branding.icon].filter((f) => !fs.existsSync(f));
-            if (missing.length) { console.error("Missing:", missing.join(", ")); process.exit(1); }
+            if (missing.length) throw new Error("Missing: " + missing.join(", "));
+            if (meta.pluginId !== "sentry-traces") throw new Error("Unexpected plugin id " + meta.pluginId);
+            if (meta.pluginVersion !== pkg.version) throw new Error("Built version " + meta.pluginVersion + " is not " + pkg.version);
+            console.log("Built", meta.pluginId, meta.pluginVersion, "with SDK", meta.sdkVersion);
           '

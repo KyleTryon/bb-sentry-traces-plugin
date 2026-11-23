@@ -61,7 +61,7 @@ export interface TurnSpanOptions {
  * A provider's trace holds everything in it. A workflow started outside one
  * gets a trace of its own. Any other turn is its own trace.
  */
-export function turnTraceId(
+function turnTraceId(
   threadId: string,
   turnId: string,
   trace: TraceContext | null,
@@ -129,7 +129,7 @@ const MAX_AGENT_NAME = 80;
  * provider. A provider's name may have spaces ("Senior Dev"), so it is only
  * kept to one short line.
  */
-export function agentNameFor(thread: ThreadInfo, trace: TraceContext | null): string {
+function agentNameFor(thread: ThreadInfo, trace: TraceContext | null): string {
   const given = oneLine(trace?.agentName || trace?.agentId || "", MAX_AGENT_NAME);
   return given || thread.providerId || "bb-agent";
 }

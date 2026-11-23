@@ -49,21 +49,35 @@ Change settings with `bb plugin config sentry-traces set <key> <value>`.
 
 ## Troubleshooting
 
-1. Run `bb sentry-traces status`. `Sending: no` names what is missing.
+1. Run `bb sentry-traces status`. `Sending: no` names what is missing. It
+   also warns when the DSN uses plain `http://` to a host other than
+   localhost.
 2. If sending is on but nothing arrives, run `bb sentry-traces test`. A 401 or
    403 means the DSN is wrong or belongs to another project.
 3. Read `bb plugin logs sentry-traces` for send failures. Sends that could
    not reach Sentry, or that got a 429 or 5xx, retry with backoff for up to 8
    attempts. A refused key (401, 403) is not retried; the next turn tries
-   again. A turn Sentry refuses as it is (400, 413, 422) is skipped and logged,
-   so the turns after it still go.
+   again, and a turn waiting on a background subagent is still looked at
+   again. A DSN that answers with a redirect is refused, not followed. A
+   turn Sentry refuses as it is (400, 413, 422) is skipped and logged, so
+   the turns after it still go.
 4. A turn is sent when its thread goes idle or fails, not while it runs.
 5. Token usage is missing on a thread's first exported turn when the thread
-   already had history, and for providers that report no usage to bb.
-6. A workflow run's workers share one trace, read from the Workflows plugin's
+   already had history, on the first turn after export was turned back on,
+   and for providers that report no usage to bb. ACP agents (OpenCode,
+   Antigravity, Grok) report no tokens; where one reports its own cost in
+   USD, that is sent as the cost instead.
+6. Conversations show as untitled while `captureContent` is off, since the
+   title comes from the first prompt, which is content. Do not turn it on to
+   fix that unless the user asks.
+7. Error messages without content capture are sent only when they are a
+   short code such as `overloaded_error`; other error text needs
+   `captureContent`.
+8. A workflow run's workers share one trace, read from the Workflows plugin's
    thread metadata and its `workflowRunView` RPC. If either is unreadable, each
-   worker exports on its own. The run's own spans are sent when the run ends.
-7. Threads join another plugin's trace only when that plugin claims them by
+   worker exports on its own, including while Workflows is disabled. The
+   run's own spans are sent when the run ends.
+9. Threads join another plugin's trace only when that plugin claims them by
    calling this plugin's `report_threads` RPC, before the thread's turn ends.
    `status` lists each provider that reported in the last 30 days, with the
    threads it claims and its open traces. A provider's own spans are sent

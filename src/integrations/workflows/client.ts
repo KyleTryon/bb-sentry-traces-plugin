@@ -18,7 +18,7 @@ import type { ThreadInfo } from "../../thread.js";
 import type { WorkflowContext } from "./ids.js";
 import { allCalls, runViewResultSchema, type WorkflowRunView } from "./schema.js";
 
-export const WORKFLOWS_PLUGIN_ID = "workflows";
+const WORKFLOWS_PLUGIN_ID = "workflows";
 
 /** How long to stop asking after Workflows failed to answer. */
 const UNAVAILABLE_MS = 5 * 60 * 1_000;

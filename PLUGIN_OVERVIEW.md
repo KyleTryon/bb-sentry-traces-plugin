@@ -1,6 +1,7 @@
 Send your bb agents' traces to Sentry Agent Monitoring: every turn as an agent
 run, with its tool calls, model time and token usage, grouped into one
-conversation per thread. This is a community plugin, not made by Sentry.
+conversation per thread. It works with every bb agent provider and needs no
+other plugin. This is a community plugin, not made by Sentry.
 
 ## What you get
 
@@ -10,7 +11,8 @@ conversation per thread. This is a community plugin, not made by Sentry.
   handoff: the tool call that started it, with the subagent's own run nested
   under it.
 - **Tokens and cost.** A turn's token usage is sent once, in the form Sentry
-  uses to work out cost.
+  uses to work out cost. Agents that report a cost but no tokens send their
+  own cost.
 - **Conversations.** Turns of one thread group into one Sentry conversation.
 - **Workflow runs as one trace.** The worker threads of a Workflows run are
   tied back together under the run, its phases and its calls.
@@ -24,8 +26,9 @@ conversation per thread. This is a community plugin, not made by Sentry.
 
 Nothing leaves your machine until you set a Sentry DSN and turn on `enabled`.
 By default the plugin sends only names, timing, status and token counts.
-Prompts, replies, command lines, tool arguments and outputs are sent only if
-you also turn on `captureContent`, and then pass through a secret scrubber.
+Prompts, replies, command lines, tool arguments, outputs and error text are
+sent only if you also turn on `captureContent`, and then pass through a secret
+scrubber.
 
 ## How it works
 

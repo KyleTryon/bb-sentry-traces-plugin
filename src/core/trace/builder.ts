@@ -191,7 +191,7 @@ const THREAD_MESSAGE_PREFIX = /^\s*\[bb message from thread:([^\]\s]+)\]\s*/;
 // bb's own notices, such as a spawned thread finishing, arrive as prompts too.
 const SYSTEM_MESSAGE_PREFIX = /^\s*\[bb system\]\s*/;
 /** The sender of a prompt that bb itself sent. */
-export const BB_SENDER = "bb";
+const BB_SENDER = "bb";
 
 interface Description {
   kind: SpanKind;
@@ -207,7 +207,7 @@ interface Description {
 export const SUBAGENT = "subagent";
 
 /** The tool name of a handoff bb records as a `delegation` row rather than a tool call. */
-export const HANDOFF_TOOL = "Agent";
+const HANDOFF_TOOL = "Agent";
 
 /**
  * A subagent's kind, when it is a plain identifier. It becomes an agent name

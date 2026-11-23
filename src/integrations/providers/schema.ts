@@ -11,9 +11,9 @@ import { MAX_TIME_MS, type AttributeValue } from "../../core/otlp.js";
 import { head } from "../../core/text.js";
 import { ROOT_KEY, type TraceContext } from "./types.js";
 
-export const MAX_SPANS = 2_000;
+const MAX_SPANS = 2_000;
 /** Threads one `report_threads` call may report. */
-export const MAX_THREADS_PER_CALL = 200;
+const MAX_THREADS_PER_CALL = 200;
 const MAX_ATTRIBUTES = 64;
 const MAX_ATTRIBUTE_CHARS = 2_000;
 const MAX_CONTENT_CHARS = 8_000;
@@ -30,7 +30,7 @@ const attributeMap = z.record(z.string(), z.unknown()).nullish();
  */
 const time = z.number().min(0).max(MAX_TIME_MS);
 
-export const contextSchema = z
+const contextSchema = z
   .object({
     trace: z
       .object({

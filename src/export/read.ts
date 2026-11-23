@@ -15,7 +15,7 @@ type ThreadEventTypes = NonNullable<
 // Checked by the compiler: every trace event type must be one the SDK lists.
 const EVENT_TYPES: ThreadEventTypes = TRACE_EVENT_TYPES;
 
-export async function readEvents(ctx: ExportContext, threadId: string, afterSeq: number, builder: TraceBuilder) {
+async function readEvents(ctx: ExportContext, threadId: string, afterSeq: number, builder: TraceBuilder) {
   let cursor = afterSeq;
   // The turn a full read ended inside, which the read goes on to the end of.
   let inside: string | null = null;

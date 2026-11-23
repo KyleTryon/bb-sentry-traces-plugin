@@ -95,4 +95,15 @@ describe("architecture", () => {
       if (node.packages.includes("@get-bb/plugin-sdk")) expect(allowed.has(file), file).toBe(true);
     }
   });
+
+  it("calls no plugin but bb's bundled Workflows: other plugins report to this one", () => {
+    const callers = [...graph.keys()].filter((file) =>
+      readFileSync(join(ROOT, file), "utf8").includes("callRpc"),
+    );
+    expect(callers).toEqual(["integrations/workflows/client.ts"]);
+    const client = readFileSync(join(ROOT, "integrations/workflows/client.ts"), "utf8");
+    const ids = [...client.matchAll(/pluginId:\s*([^,}\s]+)/g)].map((match) => match[1]);
+    expect(new Set(ids)).toEqual(new Set(["WORKFLOWS_PLUGIN_ID"]));
+    expect(client).toContain('const WORKFLOWS_PLUGIN_ID = "workflows";');
+  });
 });

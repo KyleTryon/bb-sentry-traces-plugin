@@ -26,7 +26,7 @@ export function fromBeforeGap(state: ThreadState, since: number | null): boolean
 }
 
 /** Changes a shared storage record in place; `change` returns false to leave it as it was. */
-export function mutate<T>(ctx: ExportContext, key: string, empty: () => T, change: (value: T) => boolean | void): Promise<void> {
+function mutate<T>(ctx: ExportContext, key: string, empty: () => T, change: (value: T) => boolean | void): Promise<void> {
   return queue(ctx.locks, key, async () => {
     const value = (await kv(ctx).get<T>(key)) ?? empty();
     if (change(value) !== false) await kv(ctx).set(key, value);

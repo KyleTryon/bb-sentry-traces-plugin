@@ -25,7 +25,7 @@ export const TRACE_EVENT_TYPES = [
   "thread/contextWindowUsage/updated",
 ] as const;
 
-export const SPAN_KINDS = [
+const SPAN_KINDS = [
   "command",
   "tool",
   "read",
@@ -39,15 +39,15 @@ export const SPAN_KINDS = [
   "startup",
   "error",
 ] as const;
-export const STATUSES = ["running", "completed", "failed", "interrupted"] as const;
-export const ACTIVITY_KINDS = ["thinking", "writing"] as const;
+const STATUSES = ["running", "completed", "failed", "interrupted"] as const;
+const ACTIVITY_KINDS = ["thinking", "writing"] as const;
 
 export type SpanKind = (typeof SPAN_KINDS)[number];
 export type Status = (typeof STATUSES)[number];
 export type ActivityKind = (typeof ACTIVITY_KINDS)[number];
 
 /** A low-cardinality reason a span failed. Safe to send without content capture. */
-export type ErrorType =
+type ErrorType =
   | "tool_error"
   | "interrupted"
   | "provider_error"

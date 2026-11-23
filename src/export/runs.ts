@@ -92,7 +92,7 @@ export function traceEntries(ctx: ExportContext): Promise<Record<string, TraceEn
   return entries<TraceEntry>(ctx, TRACE_PREFIX);
 }
 
-export function traceRef(trace: TraceContext): TraceRef {
+function traceRef(trace: TraceContext): TraceRef {
   return {
     provider: trace.provider,
     traceKey: trace.traceKey,

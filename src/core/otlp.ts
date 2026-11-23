@@ -5,7 +5,7 @@
 import { createHash } from "node:crypto";
 import { head, wellFormed } from "./text.js";
 
-export type AnyValue =
+type AnyValue =
   | { stringValue: string }
   | { intValue: string }
   | { doubleValue: number }
@@ -35,14 +35,13 @@ export interface OtlpTraces {
   }>;
 }
 
-export const SPAN_KIND_INTERNAL = 1;
-export const SPAN_KIND_CLIENT = 3;
-export const STATUS_UNSET = 0;
-export const STATUS_OK = 1;
-export const STATUS_ERROR = 2;
+const SPAN_KIND_INTERNAL = 1;
+const SPAN_KIND_CLIENT = 3;
+const STATUS_OK = 1;
+const STATUS_ERROR = 2;
 
 /** Sentry stores long attribute values, but one runaway value should not sink a request. */
-export const MAX_ATTRIBUTE_CHARS = 32_000;
+const MAX_ATTRIBUTE_CHARS = 32_000;
 
 export type AttributeValue = string | number | boolean | null | undefined;
 
@@ -144,7 +143,7 @@ export interface ResourceInfo {
   environment?: string | null;
 }
 
-export const SCOPE_NAME = "bb-plugin-sentry-traces";
+const SCOPE_NAME = "bb-plugin-sentry-traces";
 
 /** One OTLP/JSON request body holding `spans`. */
 export function envelope(spans: OtlpSpan[], resource: ResourceInfo): OtlpTraces {
@@ -164,10 +163,4 @@ export function envelope(spans: OtlpSpan[], resource: ResourceInfo): OtlpTraces 
       },
     ],
   };
-}
-
-export function spansOf(payload: OtlpTraces): OtlpSpan[] {
-  return payload.resourceSpans.flatMap((resource) =>
-    resource.scopeSpans.flatMap((scope) => scope.spans),
-  );
 }

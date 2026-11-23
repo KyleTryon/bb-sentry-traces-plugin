@@ -28,7 +28,7 @@ import { SnapshotTooLarge, type ProviderStore } from "./store.js";
 import { CONTRACT_VERSION } from "./types.js";
 
 /** A snapshot larger than this, as sent, is refused: it would fill storage, and Sentry would refuse it too. */
-export const MAX_SNAPSHOT_BYTES = 4 * 1024 * 1024;
+const MAX_SNAPSHOT_BYTES = 4 * 1024 * 1024;
 
 const DOCS = "See docs/trace-provider-contract.md in the Sentry Traces plugin.";
 
@@ -54,7 +54,7 @@ function standard<T>(schema: z.ZodType<T>): StandardSchemaV1<T, T> {
   };
 }
 
-export const traceProviderContract = defineRpcContract({
+const traceProviderContract = defineRpcContract({
   report_threads: {
     experimental_description:
       "Claim threads for a trace of yours, or clear your claim with a null context. " +

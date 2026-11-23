@@ -177,7 +177,7 @@ export function attr(span: OtlpSpan, key: string): string | number | boolean | u
   return value.boolValue;
 }
 
-export interface Sent {
+interface Sent {
   url: string;
   headers: Record<string, string>;
   body: OtlpTraces;

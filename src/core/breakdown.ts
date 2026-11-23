@@ -11,7 +11,7 @@
 import type { Span, SpanKind, Turn } from "./trace/types.js";
 
 /** Most to least specific: when two overlap, the earlier one names the moment. */
-export const PHASES = [
+const PHASES = [
   "waiting",
   "startup",
   "compaction",
@@ -21,10 +21,10 @@ export const PHASES = [
   "thinking",
   "model",
 ] as const;
-export type Phase = (typeof PHASES)[number];
+type Phase = (typeof PHASES)[number];
 
 /** The phases that are the model's own time. */
-export const MODEL_PHASES: ReadonlySet<Phase> = new Set(["writing", "thinking", "model"]);
+const MODEL_PHASES: ReadonlySet<Phase> = new Set(["writing", "thinking", "model"]);
 
 const SPAN_PHASES: Partial<Record<SpanKind, Phase>> = {
   waiting: "waiting",
@@ -39,7 +39,7 @@ const SPAN_PHASES: Partial<Record<SpanKind, Phase>> = {
   web: "tools",
 };
 
-export interface Segment {
+interface Segment {
   phase: Phase;
   start: number;
   end: number;
@@ -53,7 +53,7 @@ export type TimedTurn = Pick<Turn, "start" | "end" | "spans" | "activity">;
  * for the turn's own agent. Background work runs alongside the agent, so it
  * never takes a moment away from what the agent itself was doing.
  */
-export function laneBreakdown(turn: TimedTurn, lane: string | null, now: number): Segment[] {
+function laneBreakdown(turn: TimedTurn, lane: string | null, now: number): Segment[] {
   const owner = lane === null ? turn : turn.spans.find((span) => span.id === lane);
   if (!owner) return [];
   const from = owner.start;
@@ -130,7 +130,7 @@ export function modelStretches(turn: TimedTurn, now: number): ModelStretch[] {
 }
 
 /** Unexplained gaps shorter than this are not reported as model time. */
-export const MIN_UNEXPLAINED_MS = 250;
+const MIN_UNEXPLAINED_MS = 250;
 
 function joinModelSegments(turn: TimedTurn, now: number): ModelStretch[] {
   const stretches: ModelStretch[] = [];

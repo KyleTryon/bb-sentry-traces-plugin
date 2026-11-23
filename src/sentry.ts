@@ -86,7 +86,7 @@ export interface SendResult {
   spans: number;
 }
 
-export const SEND_TIMEOUT_MS = 10_000;
+const SEND_TIMEOUT_MS = 10_000;
 /** Spans per request, so one long turn cannot build an oversized body. */
 export const MAX_SPANS_PER_REQUEST = 400;
 /** Bytes of spans per request, since captured content can make a few spans large. */
