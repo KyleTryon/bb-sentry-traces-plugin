@@ -51,7 +51,7 @@
     "@get-bb/plugin-sdk": "0.6.157",
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.0.0",
-    "better-sqlite3": "^12.0.0",
+    "better-sqlite3": "^13.2.0",
     "cron-parser": "^5.5.0",
     "hono": "^4.11.9",
     "knip": "^6.48.0",
