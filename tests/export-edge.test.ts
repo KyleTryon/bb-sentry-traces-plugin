@@ -17,7 +17,7 @@ import { attr, DSN, eventsList, History, SECRETS } from "./helpers.js";
 
 const THREAD = "thr_one";
 const OTHER_DSN = "https://fedcba9876543210fedcba9876543210@o42.ingest.us.sentry.io/4500000000000002";
-const P = "orchestrator";
+const P = "example-provider";
 const DAY = 24 * 60 * 60_000;
 
 interface Post {
@@ -71,7 +71,7 @@ async function setup(options: Setup = {}) {
     makeThreadResponse({ id, title: SECRETS.title, providerId: "claude-code", projectId: "proj_1" });
   const { bb, harness } = createFakePluginHost({
     pluginId: "sentry-traces",
-    settings: { dsn: DSN, enabled: true, ...options.settings },
+    settings: { dsn: DSN, enabled: true, providers: options.provider ? P : "", ...options.settings },
     sdk: {
       threads: {
         events: { list: eventsList(histories) },

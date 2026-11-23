@@ -4,8 +4,9 @@
  * happened inside it, plus when its agents were visibly thinking or writing.
  *
  * Subagents run as turns of their own whose `turn/started` points at the
- * delegating tool call, so their work folds back into the turn that spawned
- * them.
+ * delegating tool call, or as items and agent tasks that point at it, so
+ * their work folds back into the turn that spawned them. A call is a
+ * subagent by that shape, whatever its provider names the tool.
  *
  * Adapted from bb-plugin-agent-traces (https://github.com/charpeni/bb-plugins,
  * plugins/agent-traces/trace.ts), MIT License, Copyright (c) 2026 Nicolas
@@ -33,6 +34,8 @@
  * - Captured text is scrubbed for secrets before it is cut.
  * - A turn remembers when the turn before it ended even when that turn began
  *   before this fold did, so a queued prompt's wait is not counted as startup.
+ * - Subagents are found by what runs under a call rather than by tool name,
+ *   and `delegation` rows' own progress and completion events are read.
  */
 import { basename, programOf } from "./shell.js";
 import {
@@ -66,9 +69,33 @@ const ACTIVITY_ITEMS: Record<string, ActivityKind> = {
   reasoning: "thinking",
   agentMessage: "writing",
 };
-const SUBAGENT_TOOLS = new Set(["Agent", "Task"]);
+/**
+ * Tool calls that hand work to another agent even when nothing in the thread
+ * points back at them: Claude Code's older `Agent` and `Task`, Antigravity's
+ * `invoke_subagent` (whose agents run out of sight) and Grok's
+ * `spawn_subagent`. Any other call becomes a subagent by what points at it.
+ */
+const SUBAGENT_TOOLS = new Set(["Agent", "Task", "invoke_subagent", "spawn_subagent"]);
+/**
+ * OpenCode's subagent tool. `task` is a common enough name that only its
+ * `subagent_type` argument says the call hands off.
+ */
+const LOWERCASE_TASK_TOOL = "task";
+/** Arguments that name the kind of agent a call hands work to, by provider. */
+const AGENT_KIND_KEYS = [
+  "subagent_type",
+  "subagentType",
+  "agent_type",
+  "agentType",
+  "TypeName",
+  "agent",
+  // A forked Skill runs as an agent named after its skill.
+  "skill",
+] as const;
 /** Background task types that are a subagent's own run, as bb's `isBackgroundAgentTaskType` says. */
 const AGENT_TASK_TYPES = new Set(["local_agent", "local_subagent"]);
+/** Span kinds a later event can turn into a subagent: calls, not commands or edits. */
+const DELEGATING_KINDS = new Set<SpanKind>(["tool"]);
 
 interface Request {
   input: string | null;
@@ -110,11 +137,54 @@ function itemStatus(value: unknown): Status {
   return "completed";
 }
 
-/** Codex wraps commands in `/bin/bash -lc "…"`; show what actually ran. */
-function unwrapCommand(command: unknown): string {
-  const raw = Array.isArray(command) ? command.map(text).join(" ") : text(command);
-  const wrapped = /^\/bin\/(?:ba|z)?sh -lc (["'])([\s\S]*)\1$/.exec(raw.trim());
-  return wrapped?.[2] ?? raw;
+/** A POSIX shell asked to run a script: `/bin/bash -lc`, `sh -c`, `zsh -c`. */
+const POSIX_SHELL = /^(?:\S*\/)?(?:ba|z|da|k)?sh(?:\.exe)?$/i;
+const POSIX_SCRIPT_FLAG = /^-l?c$/;
+/** PowerShell asked to run a script, with any options before `-Command`. */
+const POWERSHELL = /^(?:\S*[\\/])?(?:powershell|pwsh)(?:\.exe)?$/i;
+const POWERSHELL_SCRIPT_FLAG = /^-(?:command|c)$/i;
+const CMD = /^(?:\S*[\\/])?cmd(?:\.exe)?$/i;
+const CMD_SCRIPT_FLAG = /^\/c$/i;
+const WRAPPED_POSIX = /^(\S+)\s+(-l?c)\s+([\s\S]+)$/;
+const WRAPPED_POWERSHELL = /^(\S+)((?:\s+-\S+(?:\s+[^-\s"']\S*)?)*?)\s+(-(?:command|c))\s+([\s\S]+)$/i;
+const WRAPPED_CMD = /^(\S+)\s+(\/c)\s+([\s\S]+)$/i;
+
+/** Where the script starts in a command given as words, or -1 when no shell wraps it. */
+function scriptStart(words: readonly string[]): number {
+  const [shell = "", flag = ""] = words;
+  if (POSIX_SHELL.test(shell) && POSIX_SCRIPT_FLAG.test(flag)) return 2;
+  if (CMD.test(shell) && CMD_SCRIPT_FLAG.test(flag)) return 2;
+  if (!POWERSHELL.test(shell)) return -1;
+  const at = words.findIndex((word, index) => index > 0 && POWERSHELL_SCRIPT_FLAG.test(word));
+  return at === -1 ? -1 : at + 1;
+}
+
+function unquote(script: string): string {
+  const trimmed = script.trim();
+  const quoted = /^(["'])([\s\S]*)\1$/.exec(trimmed);
+  return quoted?.[2] ?? trimmed;
+}
+
+/**
+ * Providers often wrap a command in the shell that runs it (Codex's
+ * `/bin/bash -lc "…"`, `sh -c`, `pwsh -Command`, `cmd /c`); show what
+ * actually ran. Only the span's content changes, never its tool name.
+ */
+export function unwrapCommand(command: unknown): string {
+  if (Array.isArray(command)) {
+    const words = command.map(text);
+    const start = scriptStart(words);
+    return (start > 0 && start < words.length ? words.slice(start) : words).join(" ");
+  }
+  const raw = text(command);
+  const line = raw.trim();
+  const posix = WRAPPED_POSIX.exec(line);
+  if (posix && POSIX_SHELL.test(posix[1] ?? "")) return unquote(posix[3] ?? "");
+  const powershell = WRAPPED_POWERSHELL.exec(line);
+  if (powershell && POWERSHELL.test(powershell[1] ?? "")) return unquote(powershell[4] ?? "");
+  const cmd = WRAPPED_CMD.exec(line);
+  if (cmd && CMD.test(cmd[1] ?? "")) return unquote(cmd[3] ?? "");
+  return raw;
 }
 
 const THREAD_MESSAGE_PREFIX = /^\s*\[bb message from thread:([^\]\s]+)\]\s*/;
@@ -136,14 +206,46 @@ interface Description {
 /** The fallback name of a subagent whose kind is unknown. */
 export const SUBAGENT = "subagent";
 
+/** The tool name of a handoff bb records as a `delegation` row rather than a tool call. */
+export const HANDOFF_TOOL = "Agent";
+
 /**
  * A subagent's kind, when it is a plain identifier. It becomes an agent name
- * in Sentry, which has to be one of a small set, so free text is refused.
+ * in Sentry, which has to be one of a small set, so free text, paths and
+ * anything with spaces are refused.
  */
-function agentKind(value: unknown, content: boolean): string {
+function agentKind(value: unknown): string | null {
   const kind = text(value).trim();
-  if (/^[\w.:@-]{1,64}$/.test(kind)) return kind;
-  return content && kind ? clip(kind, 64) : SUBAGENT;
+  return /^[\w.:@-]{1,64}$/.test(kind) ? kind : null;
+}
+
+/** The first plain kind among the arguments that name one. */
+function agentKindIn(args: Json): string | null {
+  for (const key of AGENT_KIND_KEYS) {
+    const kind = agentKind(args[key]);
+    if (kind) return kind;
+  }
+  return null;
+}
+
+/**
+ * A `delegation` row's kind. bb does not record it as a field; its providers
+ * put it in the row's detail line instead: Claude Code as
+ * `general-purpose agent · model …`, Grok as the bare kind. Only a plain
+ * identifier survives, so the line's other parts cannot leak through.
+ */
+function delegationKind(item: Json): string | null {
+  const own = agentKindIn(item);
+  if (own) return own;
+  const detail = text(record(item['presentation'])['detail']);
+  const [first = ""] = detail.split(" · ");
+  return agentKind(first.replace(/\s+agent$/, ""));
+}
+
+/** A tool call that hands work to another agent by its name alone. */
+function isSubagentTool(tool: string, args: Json): boolean {
+  if (SUBAGENT_TOOLS.has(tool)) return true;
+  return tool === LOWERCASE_TASK_TOOL && agentKind(args['subagent_type']) !== null;
 }
 
 /**
@@ -223,7 +325,8 @@ function describe(item: Json, content: boolean): Description {
       return plain("compaction", "Compaction");
     case "delegation": {
       const background = item['background'] === true;
-      const base = { ...plain("subagent", "delegation"), name: SUBAGENT, agent: SUBAGENT, background };
+      const agent = delegationKind(item) ?? SUBAGENT;
+      const base = { ...plain("subagent", HANDOFF_TOOL), name: agent, agent, background };
       return content ? { ...base, detail: clip(text(item['label']) || title) } : base;
     }
     case "backgroundTask": {
@@ -234,9 +337,9 @@ function describe(item: Json, content: boolean): Description {
     case "toolCall": {
       const tool = nameOfTool(text(item['tool']), content, "tool");
       const args = record(item['arguments']);
-      if (SUBAGENT_TOOLS.has(tool)) {
+      if (isSubagentTool(tool, args)) {
         const background = args['run_in_background'] === true;
-        const agent = agentKind(args['subagent_type'], content);
+        const agent = agentKindIn(args) ?? SUBAGENT;
         const base = { ...plain("subagent", tool), name: agent, agent, background };
         if (!content) return base;
         return {
@@ -335,6 +438,14 @@ export class TraceBuilder {
   private readonly pendingTokens = new Map<string, number>();
   /** Subagents whose agent is still working after its tool call returned. */
   private readonly runningAgents = new Set<string>();
+  /**
+   * Calls that something ran under: a subagent turn, an agent task, or items
+   * of their own. Whatever the tool is called, such a call handed work to
+   * another agent. Kept by id, since the pointer can come before the call.
+   */
+  private readonly delegators = new Set<string>();
+  /** The agent kind a tool call's arguments name, for when it turns out to be a subagent. */
+  private readonly kindHints = new Map<string, string>();
   /**
    * A span or activity to the tool call it ran under. Its subagent is looked
    * up when the trace is read, so a call recorded before its subagent's own
@@ -497,6 +608,8 @@ export class TraceBuilder {
       case "item/completed":
       case "item/backgroundTask/progress":
       case "item/backgroundTask/completed":
+      case "item/delegation/progress":
+      case "item/delegation/completed":
         this.foldItem(turnId, record(data['item']), event);
         return;
       case "system/interaction/lifecycle":
@@ -581,6 +694,7 @@ export class TraceBuilder {
     const parentTurn = parentToolCallId
       ? (this.spanTurn.get(parentToolCallId) ?? this.activeTurn ?? undefined)
       : undefined;
+    if (parentToolCallId) this.noteDelegator(parentToolCallId);
     if (parentTurn) {
       this.rootTurn.set(turnId, parentTurn);
       this.turnParent.set(turnId, parentToolCallId);
@@ -765,6 +879,13 @@ export class TraceBuilder {
     if (!turn) return;
     this.touch(turn, event.seq, event.createdAt);
 
+    const agentTask = type === "backgroundTask" && AGENT_TASK_TYPES.has(text(item['taskType']));
+    // A command's own background task, such as a dev server, is not the work
+    // of another agent; anything else that ran under a call is.
+    if (parentToolCallId && (type !== "backgroundTask" || agentTask)) {
+      this.noteDelegator(parentToolCallId);
+    }
+
     const activity = ACTIVITY_ITEMS[type];
     if (activity !== undefined) {
       this.foldActivity(turn, id, activity, parentToolCallId, event);
@@ -780,14 +901,15 @@ export class TraceBuilder {
       }
       return;
     }
-    if (type === "backgroundTask" && AGENT_TASK_TYPES.has(text(item['taskType']))) {
+    if (agentTask) {
       this.foldSubagentTask(parentToolCallId, item, event);
       return;
     }
     // Only completions of other background tasks matter; their progress does not.
     if (event.type === "item/backgroundTask/progress") return;
 
-    const finished = event.type !== "item/started";
+    // A delegation's progress says it is still running, as bb's own timeline reads it.
+    const finished = event.type !== "item/started" && event.type !== "item/delegation/progress";
     const existing = this.spans.get(id);
     if (existing) {
       if (!finished) return;
@@ -807,11 +929,39 @@ export class TraceBuilder {
       tokens: this.pendingTokens.get(id) ?? null,
     };
     this.pendingTokens.delete(id);
+    if (type === "toolCall") {
+      const hint = agentKindIn(record(item['arguments']));
+      if (hint) this.kindHints.set(id, hint);
+    }
     this.addSpan(turn, span);
+    if (this.delegators.has(id)) this.promote(span);
     if (finished) {
       this.noteCallEnd(span, event);
       this.finish(span, item, event);
     }
+  }
+
+  /** Something ran under the call `id`, so that call handed work to another agent. */
+  private noteDelegator(id: string): void {
+    this.delegators.add(id);
+    const span = this.spans.get(id);
+    if (span) this.promote(span);
+  }
+
+  /**
+   * Turns a tool call into a subagent once something is seen running under
+   * it, whatever the provider calls the tool: a forked Skill, OpenCode's
+   * `task`, a tool this plugin has never heard of. Its kind comes from its
+   * arguments, else it is a plain `subagent`.
+   */
+  private promote(span: Span): void {
+    if (!DELEGATING_KINDS.has(span.kind)) return;
+    const agent = this.kindHints.get(span.id) ?? SUBAGENT;
+    span.kind = "subagent";
+    span.agent = agent;
+    span.name = agent;
+    // Its call already returned: that is when the handoff ended.
+    if (span.end !== null) span.callEnd = span.end;
   }
 
   /** A subagent's tool call returned; its agent may still be working. */
