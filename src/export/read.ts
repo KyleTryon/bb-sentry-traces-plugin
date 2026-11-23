@@ -5,7 +5,7 @@
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { TraceBuilder } from "../core/trace/builder.js";
 import { TRACE_EVENT_TYPES } from "../core/trace/types.js";
-import { type RawUsage, readTotal } from "../core/usage.js";
+import { type RawUsage, readCost, readTotal } from "../core/usage.js";
 import { MAX_PAGES, MAX_PAGES_LONG_TURN, PAGE_SIZE, REQUEST_WINDOW_MS } from "./constants.js";
 import { type ExportContext, type Folded, type ThreadState } from "./types.js";
 
@@ -53,6 +53,21 @@ export async function readUsage(ctx: ExportContext, threadId: string): Promise<R
   });
   const [latest] = rows;
   return latest ? readTotal(latest.data) : null;
+}
+
+/**
+ * The thread's running cost in USD, for agents that report a cost but no
+ * tokens (ACP agents such as OpenCode put it on the context window event).
+ */
+export async function readCostTotal(ctx: ExportContext, threadId: string): Promise<number | null> {
+  const rows = await ctx.bb.sdk.threads.events.list({
+    threadId,
+    order: "desc",
+    limit: "1",
+    types: ["thread/contextWindowUsage/updated"],
+  });
+  const [latest] = rows;
+  return latest ? readCost(latest.data) : null;
 }
 
 /**

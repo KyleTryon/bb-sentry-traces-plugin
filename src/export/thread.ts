@@ -5,7 +5,7 @@
 
 import type { OtlpSpan, ResourceInfo } from "../core/otlp.js";
 import type { Turn } from "../core/trace/types.js";
-import { isEmptyUsage, toSentryUsage, usageDelta } from "../core/usage.js";
+import { costDelta, isEmptyUsage, toSentryUsage, usageDelta } from "../core/usage.js";
 import {
   BACKGROUND_AGENT_WAIT_MS,
   MAX_CATCH_UP_READS,
@@ -17,7 +17,7 @@ import {
   WAIT_CHECK_MIN_MS,
 } from "./constants.js";
 import { placeThread } from "./location.js";
-import { fold, readUsage, readsOn, resumePoint } from "./read.js";
+import { fold, readCostTotal, readUsage, readsOn, resumePoint } from "./read.js";
 import { clearRetry, scheduleCheck, scheduleRetry } from "./retries.js";
 import { noteTrace, noteWorkflow } from "./runs.js";
 import { resourceOf, stillSending, targetOf } from "./settings.js";
@@ -70,6 +70,9 @@ export async function previewThread(
         usage: toSentryUsage(total, thread.providerId),
         turns: picked.length,
       });
+    } else {
+      const cost = await readCostTotal(ctx, thread.id);
+      if (cost) usage.set(newest.id, { usage: null, turns: picked.length, costUsd: cost });
     }
   }
   const { workflow, trace } = await placeThread(ctx, thread);
@@ -117,7 +120,7 @@ function dueTurns(
  */
 function afterGap(state: ThreadState | undefined, since: number | null): ThreadState | undefined {
   if (!state || !fromBeforeGap(state, since)) return state;
-  return { ...state, sentTurn: null, usage: null, usageKnown: false, usageTurns: 0, waiting: null, partial: null };
+  return { ...state, sentTurn: null, usage: null, cost: null, usageKnown: false, usageTurns: 0, waiting: null, partial: null };
 }
 
 /**
@@ -385,17 +388,20 @@ export async function exportThread(ctx: ExportContext, thread: ThreadInfo): Prom
   const usageWaitsForTurn = pending.length < due.length;
   const usageTurns = state?.usageTurns ?? 0;
   const current = pending.length > 0 ? await readUsage(ctx, thread.id) : null;
+  // Without tokens, an agent's own running cost stands in for them.
+  const currentCost = pending.length > 0 && !current ? await readCostTotal(ctx, thread.id) : null;
   const usage = new Map<string, TurnUsage>();
   const newestPending = pending.at(-1);
+  const covered = pending.length + usageTurns + skipped;
   if (newestPending && !usageWaitsForTurn && current && knownTotal) {
     const delta = usageDelta(current, state?.usage ?? null);
     if (delta && !isEmptyUsage(delta)) {
       // One span of one turn carries it, so cost is never counted twice.
-      usage.set(newestPending.id, {
-        usage: toSentryUsage(delta, thread.providerId),
-        turns: pending.length + usageTurns + skipped,
-      });
+      usage.set(newestPending.id, { usage: toSentryUsage(delta, thread.providerId), turns: covered });
     }
+  } else if (newestPending && !usageWaitsForTurn && currentCost !== null && knownTotal) {
+    const delta = costDelta(currentCost, state?.cost ?? null);
+    if (delta) usage.set(newestPending.id, { usage: null, turns: covered, costUsd: delta });
   }
 
   const sending = await sendTurns(ctx, {
@@ -429,6 +435,7 @@ export async function exportThread(ctx: ExportContext, thread: ThreadInfo): Prom
     waiting: waiting.length > 0 ? waiting : null,
     ...point,
     usage: usageStays ? (state?.usage ?? null) : (current ?? state?.usage ?? null),
+    cost: usageStays ? (state?.cost ?? null) : (currentCost ?? state?.cost ?? null),
     usageKnown: usageStays ? knownTotal : true,
     usageTurns: usageStays ? usageTurns + done.size : 0,
     partial: cut && cut.spanIds.length > 0 ? cut : null,

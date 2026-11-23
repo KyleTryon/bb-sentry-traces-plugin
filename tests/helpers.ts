@@ -138,6 +138,14 @@ export class History {
     this.push("thread/tokenUsage/updated", { tokenUsage: { total, last: total } });
     return this;
   }
+
+  /** A running cost, as ACP agents that report no tokens put on the context window event. */
+  cost(amount: number, currency = "USD"): this {
+    this.push("thread/contextWindowUsage/updated", {
+      contextWindowUsage: { usedTokens: 1_000, modelContextWindow: 200_000, cost: { amount, currency } },
+    });
+    return this;
+  }
 }
 
 type ListArgs = {

@@ -30,6 +30,8 @@ export interface ThreadState {
   usage: RawUsage | null;
   /** Whether `usage` was actually read, so a null means "none yet", not "unknown". */
   usageKnown: boolean;
+  /** The thread's running cost in USD when it was last looked at, for agents that report no tokens. */
+  cost?: number | null;
   /**
    * Turns at or before `sentTurn` that are not sent yet: held back for a
    * background subagent still at work, or waiting to be sent again.

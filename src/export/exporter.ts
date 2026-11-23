@@ -27,7 +27,7 @@ import {
   THREAD_KEY,
   TRACE_PREFIX,
 } from "./constants.js";
-import { readUsage } from "./read.js";
+import { readCostTotal, readUsage } from "./read.js";
 import { clearRetry, retries, scheduleRetry } from "./retries.js";
 import { previewThread, exportThread } from "./thread.js";
 import { sweepTraces, sweepWorkflows, traceEntries, workflowEntries } from "./runs.js";
@@ -152,6 +152,7 @@ export class Exporter {
           resumeSeq: state?.resumeSeq ?? 0,
           turnsBefore: state?.turnsBefore ?? 0,
           usage: await readUsage(this.ctx, threadId),
+          cost: await readCostTotal(this.ctx, threadId),
           usageKnown: true,
           updatedAt: this.ctx.now(),
         } satisfies ThreadState);

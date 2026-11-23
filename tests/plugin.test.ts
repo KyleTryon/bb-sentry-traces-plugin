@@ -283,6 +283,39 @@ describe("exporting a thread", () => {
     expect(attr(must(withUsage[0], "span with usage"), "gen_ai.usage.total_tokens")).toBe(11_000);
   });
 
+  it("sends an agent's own cost when it reports no tokens, once per stretch", async () => {
+    const { history, emit, spans } = await setup();
+    await emit("thread.active");
+    history.turn();
+    history.cost(0.25);
+    await emit("thread.idle");
+    history.turn();
+    history.cost(0.4);
+    await emit("thread.idle");
+
+    const costs = spans()
+      .map((span) => attr(span, "gen_ai.cost.total_tokens"))
+      .filter((value) => value !== undefined);
+    expect(costs).toHaveLength(2);
+    expect(costs[0]).toBeCloseTo(0.25);
+    expect(costs[1]).toBeCloseTo(0.15);
+    expect(spans().some((span) => attr(span, "gen_ai.usage.input_tokens") !== undefined)).toBe(false);
+  });
+
+  it("sends no cost in another currency, and none beside token usage", async () => {
+    const { history, emit, spans } = await setup();
+    await emit("thread.active");
+    history.turn();
+    history.cost(3, "EUR");
+    await emit("thread.idle");
+    history.turn();
+    history.usage(CLAUDE_TOTAL);
+    history.cost(1);
+    await emit("thread.idle");
+
+    expect(spans().some((span) => attr(span, "gen_ai.cost.total_tokens") !== undefined)).toBe(false);
+  });
+
   it("charges each later turn only with what it added", async () => {
     const { history, emit, spans } = await setup();
     await emit("thread.active");
