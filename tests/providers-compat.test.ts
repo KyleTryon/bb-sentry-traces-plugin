@@ -3,17 +3,14 @@
  * the shapes real threads record (Claude Code, Codex, OpenCode, Antigravity,
  * Grok), with every prompt, path, label and id replaced by a placeholder.
  */
-import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import type { OtlpSpan } from "../src/core/otlp.js";
 import { TraceBuilder, unwrapCommand } from "../src/core/trace/builder.js";
 import { TRACE_EVENT_TYPES, type Span, type TraceEvent, type Turn } from "../src/core/trace/types.js";
 import { costDelta, parseRawUsage, readCost, toSentryUsage, type RawUsage } from "../src/core/usage.js";
 import { genAiProvider, modelName, turnSpans, type TurnUsage } from "../src/export/spans.js";
-import { parseProviders } from "../src/integrations/providers/client.js";
-import { createPlugin } from "../src/server.js";
 import type { ThreadInfo } from "../src/thread.js";
-import { attr, DSN, fakeFetch } from "./helpers.js";
+import { attr } from "./helpers.js";
 
 const T0 = 1_800_000_000_000;
 
@@ -425,32 +422,6 @@ describe("model and vendor names", () => {
     for (const chat of spans.filter((span) => span.name.startsWith("chat "))) {
       expect(chat.name).toBe("chat claude-opus-5-5");
       expect(attr(chat, "gen_ai.response.model")).toBe("claude-opus-5-5");
-    }
-  });
-});
-
-describe("trace providers setting", () => {
-  it("asks none when empty", () => {
-    expect(parseProviders("", "sentry-traces")).toEqual([]);
-    expect(parseProviders(" , ", "sentry-traces")).toEqual([]);
-  });
-
-  it("asks none by default", async () => {
-    const rpc = vi.fn(async () => {
-      throw new Error("no plugin should be asked");
-    });
-    const { bb, harness } = createFakePluginHost({
-      pluginId: "sentry-traces",
-      settings: { dsn: DSN, enabled: true },
-      sdk: { plugins: { callRpc: rpc } },
-    });
-    await createPlugin({ fetch: fakeFetch().fetchImpl })(bb);
-    try {
-      const status = await harness.behavior.runCli(["status"]);
-      expect(status.stdout).toContain("Trace providers: none");
-      expect(rpc).not.toHaveBeenCalled();
-    } finally {
-      await harness.lifecycle.dispose();
     }
   });
 });

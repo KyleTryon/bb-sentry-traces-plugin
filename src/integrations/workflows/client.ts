@@ -7,14 +7,16 @@
  *   and the thread that started the run (no secrets are kept there);
  * - the `workflowRunView` RPC, which gives the run's phases and calls.
  *
- * That RPC is internal to the Workflows plugin and can change. Any failed read
- * means "not a workflow worker" and the thread exports on its own.
+ * That RPC is internal to the Workflows plugin and can change, and the user
+ * may disable or remove Workflows. Any failed read means "not a workflow
+ * worker": the thread exports on its own at once, nothing waits for
+ * Workflows, and a failure is logged once until Workflows answers again.
  */
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { errorMessage, identifier, record, text } from "../../core/text.js";
 import type { ThreadInfo } from "../../thread.js";
 import type { WorkflowContext } from "./ids.js";
-import { allCalls, callFacts, runViewResultSchema, type WorkflowRunView } from "./schema.js";
+import { allCalls, runViewResultSchema, type WorkflowRunView } from "./schema.js";
 
 export const WORKFLOWS_PLUGIN_ID = "workflows";
 
@@ -23,6 +25,8 @@ const UNAVAILABLE_MS = 5 * 60 * 1_000;
 
 export class WorkflowsClient {
   private unavailableUntil = 0;
+  /** Whether a failure was logged since Workflows last answered, so it is logged once. */
+  private failing = false;
 
   constructor(
     private readonly bb: Pick<BbPluginApi, "sdk" | "log">,
@@ -43,12 +47,20 @@ export class WorkflowsClient {
         outputSchema: runViewResultSchema,
       });
       // Parsed here too, so the schema's defaults hold whatever the transport does.
-      return runViewResultSchema.parse(result).run;
+      const run = runViewResultSchema.parse(result).run;
+      this.failing = false;
+      return run;
     } catch (cause) {
       this.unavailableUntil = this.now() + UNAVAILABLE_MS;
-      this.bb.log.debug(`Workflows workflowRunView is not available: ${errorMessage(cause)}`);
+      this.logOnce(`Workflows workflowRunView is not available: ${errorMessage(cause)}`);
       return undefined;
     }
+  }
+
+  private logOnce(message: string): void {
+    if (this.failing) return;
+    this.failing = true;
+    this.bb.log.debug(message);
   }
 
   /** Where a worker thread sits in a workflow run, or null when it is not a worker. */
@@ -63,7 +75,7 @@ export class WorkflowsClient {
         }),
       );
     } catch (cause) {
-      this.bb.log.debug(`Could not read Workflows metadata of ${thread.id}: ${errorMessage(cause)}`);
+      this.logOnce(`Could not read Workflows metadata of ${thread.id}: ${errorMessage(cause)}`);
       return null;
     }
     // Any client can write thread metadata, so only well-formed values count.
@@ -73,15 +85,16 @@ export class WorkflowsClient {
     if (!runId || !callId || !originThreadId) return null;
 
     const run = await this.runView(originThreadId, runId);
+    // Workflows is disabled, removed or not answering: nothing would ever send
+    // the run's own spans, so the worker's turns go out as its own.
+    if (run === undefined) return null;
     const call = run ? allCalls(run).find((candidate) => candidate.id === callId) : undefined;
     return {
       runId,
       callId,
       originThreadId,
       name: run ? identifier(run.name) : null,
-      scriptName: run?.name ?? null,
       callIndex: call?.index ?? null,
-      call: call ? callFacts(call) : null,
     };
   }
 }

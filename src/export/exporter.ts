@@ -11,11 +11,13 @@
  * every retry, provider trace and workflow run is stored under a key of its
  * own, and the one shared record, the stats, is only changed under a lock.
  */
+import { queue } from "../core/queue.js";
 import { errorMessage } from "../core/text.js";
-import { TraceProviders } from "../integrations/providers/client.js";
+import { ProviderStore } from "../integrations/providers/store.js";
 import { WorkflowsClient } from "../integrations/workflows/client.js";
 import {
   DISPOSE_WAIT_MS,
+  OPEN_RUN_KEEP_MS,
   PRUNE_EVERY_MS,
   PRUNED_AT_KEY,
   RETRY_PREFIX,
@@ -23,6 +25,7 @@ import {
   STATS_KEY,
   THREAD_KEEP_MS,
   THREAD_KEY,
+  TRACE_PREFIX,
 } from "./constants.js";
 import { readUsage } from "./read.js";
 import { clearRetry, retries, scheduleRetry } from "./retries.js";
@@ -34,12 +37,12 @@ import {
   fromBeforeGap,
   kv,
   migrate,
-  queue,
   recordFailure,
   recordSuccess,
   sendingSince,
 } from "./store.js";
 import type { ExportContext, ExportOutcome, ExporterDeps, Stats, ThreadState } from "./types.js";
+import { type SentryTarget } from "../sentry.js";
 import { toThreadInfo, type ThreadInfo } from "../thread.js";
 
 /** Waits for `work`, but no longer than `ms`. */
@@ -53,7 +56,8 @@ async function atMost(ms: number, work: Promise<unknown>): Promise<void> {
 }
 
 export class Exporter {
-  readonly providers: TraceProviders;
+  /** What trace providers reported. */
+  readonly providers: ProviderStore;
   readonly workflows: WorkflowsClient;
   private readonly ctx: ExportContext;
   /** One export at a time per thread, so back-to-back events never send a turn twice. */
@@ -65,7 +69,7 @@ export class Exporter {
 
   constructor(deps: ExporterDeps) {
     const now = deps.now ?? Date.now;
-    this.providers = new TraceProviders(deps.bb, async () => (await deps.settings()).providers, now);
+    this.providers = new ProviderStore(deps.bb.storage.kv, now);
     this.workflows = new WorkflowsClient(deps.bb, now);
     this.ctx = {
       bb: deps.bb,
@@ -163,6 +167,7 @@ export class Exporter {
       try {
         await kv(this.ctx).delete(THREAD_KEY + threadId);
         await kv(this.ctx).delete(RETRY_PREFIX + threadId);
+        await this.providers.deleteClaim(threadId);
       } catch (cause) {
         this.ctx.bb.log.debug(`Could not forget ${threadId}: ${errorMessage(cause)}`);
       }
@@ -188,40 +193,50 @@ export class Exporter {
     if (this.ctx.disposed) return;
     try {
       const settings = await this.ctx.settings();
-      if (!settings.enabled) return;
       const resolved = targetOf(settings);
-      if ("reason" in resolved) return;
-      await migrate(this.ctx);
-
-      const queued = await retries(this.ctx);
-      const now = this.ctx.now();
-      for (const [threadId, entry] of Object.entries(queued)) {
-        if (entry.nextAt > now || this.ctx.disposed) continue;
-        const thread = await this.threadInfo(threadId);
-        if (!thread) {
-          await clearRetry(this.ctx, threadId);
-          continue;
-        }
-        await this.enqueue(thread);
-      }
-      await sweepTraces(this.ctx, resolved.target);
-      await sweepWorkflows(this.ctx, resolved.target);
+      if (settings.enabled && "target" in resolved) await this.send(resolved.target);
+      // Providers report while export is off too, so storage is kept in check either way.
       await this.prune();
     } catch (cause) {
       this.ctx.bb.log.warn(`Periodic export work failed: ${errorMessage(cause)}`);
     }
   }
 
+  /** Retries exports that are due, and sends what is due of provider traces and workflow runs. */
+  private async send(target: SentryTarget): Promise<void> {
+    await migrate(this.ctx);
+    const queued = await retries(this.ctx);
+    const now = this.ctx.now();
+    for (const [threadId, entry] of Object.entries(queued)) {
+      if (entry.nextAt > now || this.ctx.disposed) continue;
+      const thread = await this.threadInfo(threadId);
+      if (!thread) {
+        await clearRetry(this.ctx, threadId);
+        continue;
+      }
+      await this.enqueue(thread);
+    }
+    await sweepTraces(this.ctx, target);
+    await sweepWorkflows(this.ctx, target);
+  }
+
   /**
    * At most once a day, drops what is kept of threads untouched for months
-   * and not waiting on a retry: storage otherwise only grows, since only a
-   * deleted thread is forgotten. Such a thread used again starts afresh.
+   * and not waiting on a retry, and what providers reported that nothing
+   * needs any more: storage otherwise only grows, since only a deleted thread
+   * is forgotten. Such a thread used again starts afresh.
    */
   private async prune(): Promise<void> {
     const now = this.ctx.now();
     const last = await kv(this.ctx).get<number>(PRUNED_AT_KEY);
     if (last !== undefined && now - last < PRUNE_EVERY_MS) return;
     await kv(this.ctx).set(PRUNED_AT_KEY, now);
+    await this.pruneThreads(now);
+    await this.pruneClaims(now);
+    await this.pruneSnapshots(now);
+  }
+
+  private async pruneThreads(now: number): Promise<void> {
     const retrying = new Set(await kv(this.ctx).list(RETRY_PREFIX));
     for (const key of await kv(this.ctx).list(THREAD_KEY)) {
       if (this.ctx.disposed) return;
@@ -235,6 +250,34 @@ export class Exporter {
         if (!latest || this.ctx.now() - latest.updatedAt <= THREAD_KEEP_MS) return;
         if ((await kv(this.ctx).get(RETRY_PREFIX + threadId)) === undefined) await kv(this.ctx).delete(key);
       });
+    }
+  }
+
+  /** A claim made months ago, of a thread not exported since, is dropped with the thread's state. */
+  private async pruneClaims(now: number): Promise<void> {
+    for (const [threadId, claim] of await this.providers.claims()) {
+      if (this.ctx.disposed) return;
+      if (now - claim.reportedAt <= THREAD_KEEP_MS) continue;
+      const state = await kv(this.ctx).get<ThreadState>(THREAD_KEY + threadId);
+      if (state && now - state.updatedAt <= THREAD_KEEP_MS) continue;
+      await this.serialize(threadId, () => this.providers.deleteClaim(threadId));
+    }
+  }
+
+  /**
+   * A snapshot of a trace no turn was ever sent into is dropped after the
+   * time an open trace is kept; so is a provider not heard from in that time.
+   */
+  private async pruneSnapshots(now: number): Promise<void> {
+    for (const head of await this.providers.heads()) {
+      if (this.ctx.disposed) return;
+      if (now - head.reportedAt <= OPEN_RUN_KEEP_MS) continue;
+      const entry = await kv(this.ctx).get(`${TRACE_PREFIX}${head.provider}/${head.traceKey}`);
+      if (entry === undefined) await this.providers.deleteSnapshot(head.provider, head.traceKey);
+    }
+    await this.providers.dropStrayParts();
+    for (const [provider, record] of await this.providers.reporters()) {
+      if (now - record.lastReportAt > OPEN_RUN_KEEP_MS) await this.providers.forgetReporter(provider);
     }
   }
 
@@ -260,6 +303,27 @@ export class Exporter {
       openTraces: open(await traceEntries(this.ctx)),
       openWorkflows: open(await workflowEntries(this.ctx)),
     };
+  }
+
+  /**
+   * The providers that reported in the last 30 days: how many threads each
+   * claims, how many of its traces have not ended, and when it last reported.
+   */
+  async providerStatus(): Promise<
+    Array<{ provider: string; claimedThreads: number; openTraces: number; lastReportAt: number }>
+  > {
+    const now = this.ctx.now();
+    const claims = [...(await this.providers.claims()).values()];
+    const heads = await this.providers.heads();
+    return [...(await this.providers.reporters())]
+      .filter(([, record]) => now - record.lastReportAt <= OPEN_RUN_KEEP_MS)
+      .map(([provider, record]) => ({
+        provider,
+        claimedThreads: claims.filter((claim) => claim.context.provider === provider).length,
+        openTraces: heads.filter((head) => head.provider === provider && !head.ended).length,
+        lastReportAt: record.lastReportAt,
+      }))
+      .sort((a, b) => a.provider.localeCompare(b.provider));
   }
 
   recordSuccess(sent: { turns: number; spans: number; traces?: number; workflows?: number }): Promise<void> {

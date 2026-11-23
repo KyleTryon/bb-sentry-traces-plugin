@@ -58,7 +58,7 @@ export function registerCli(bb: Pick<BbPluginApi, "cli">, deps: CliDeps): void {
             const dsn = parseDsn(settings.dsn);
             const stats = await deps.exporter.stats();
             const queues = await deps.exporter.queueSizes();
-            const providers = await deps.exporter.providers.status();
+            const providers = await deps.exporter.providerStatus();
             const report = {
               version: VERSION,
               enabled: settings.enabled,
@@ -93,16 +93,11 @@ export function registerCli(bb: Pick<BbPluginApi, "cli">, deps: CliDeps): void {
               `  workflow runs in progress: ${queues.openWorkflows}`,
               `  provider traces in progress: ${queues.openTraces}`,
               ...(providers.length === 0
-                ? ["Trace providers: none"]
+                ? ["Trace providers: none reported in the last 30 days"]
                 : providers.map(
                     (provider) =>
-                      `Trace provider ${provider.provider}: ${
-                        provider.available === null
-                          ? "not asked yet"
-                          : provider.available
-                            ? "answering"
-                            : "no answer (its threads export on their own)"
-                      }`,
+                      `Trace provider ${provider.provider}: ${provider.claimedThreads} threads claimed, ` +
+                      `${provider.openTraces} traces open, last report ${ago(provider.lastReportAt, at)}`,
                   )),
             ];
             if (!report.sending) {
@@ -224,10 +219,6 @@ export function registerCli(bb: Pick<BbPluginApi, "cli">, deps: CliDeps): void {
                 hint: "Add --running to include the turn in progress.",
               });
             }
-            const unknownTrace = preview.traceUnknown
-              ? "A trace provider did not answer, so this shows the thread on its own. " +
-                "A real export would wait for it and may place the thread in its trace."
-              : null;
             if (input.options.summary) {
               const traces = new Set(preview.spans.map((span) => span.traceId)).size;
               return {
@@ -236,7 +227,6 @@ export function registerCli(bb: Pick<BbPluginApi, "cli">, deps: CliDeps): void {
                   `${preview.turns} turns, ${preview.spans.length} spans, ${traces} traces` +
                     (preview.workflow ? `, workflow run ${preview.workflow.runId}` : "") +
                     (preview.trace ? `, ${preview.trace.provider} trace ${preview.trace.traceKey}` : ""),
-                  ...(unknownTrace ? [unknownTrace] : []),
                   ...preview.spans.map(describeSpan),
                 ].join("\n"),
               };
@@ -258,7 +248,7 @@ export function registerCli(bb: Pick<BbPluginApi, "cli">, deps: CliDeps): void {
                 },
               );
             }
-            return { exitCode: 0, stdout: body, ...(unknownTrace ? { stderr: `${unknownTrace}\n` } : {}) };
+            return { exitCode: 0, stdout: body };
           },
         }),
       },

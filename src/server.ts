@@ -12,7 +12,7 @@ import { CLI_NAME, registerCli } from "./cli.js";
 import { Exporter } from "./export/exporter.js";
 import { sends } from "./export/settings.js";
 import { type ExportSettings } from "./export/types.js";
-import { parseProviders } from "./integrations/providers/client.js";
+import { registerProviderRpc } from "./integrations/providers/rpc.js";
 import { parseDsn, type Fetch } from "./sentry.js";
 import { toThreadInfo } from "./thread.js";
 
@@ -78,13 +78,6 @@ export function createPlugin(options: PluginOptions = {}) {
         default: "",
         experimental_schema: maxLength(64, "Use at most 64 characters"),
       },
-      providers: {
-        type: "string",
-        label: "Trace providers: plugin ids that group threads into traces, separated by commas",
-        // None by default: a provider adds spans to your Sentry project, so it is named on purpose.
-        default: "",
-        experimental_schema: maxLength(200, "Use at most 200 characters"),
-      },
     });
 
     const readSettings = async (): Promise<ExportSettings> => {
@@ -94,7 +87,6 @@ export function createPlugin(options: PluginOptions = {}) {
         enabled: values['enabled'],
         captureContent: values['captureContent'],
         environment: values['environment'],
-        providers: parseProviders(values['providers'], bb.pluginId),
       };
     };
 
@@ -119,6 +111,16 @@ export function createPlugin(options: PluginOptions = {}) {
     });
     // Waits a few seconds for an export still running to save what it sent.
     bb.onDispose(() => exporter.dispose());
+
+    // Trace providers push where their threads belong and what their traces
+    // hold; the export reads what they stored.
+    registerProviderRpc(bb, {
+      store: exporter.providers,
+      sending: async () => {
+        const values = await readSettings();
+        return { sending: sends(values), captureContent: values.captureContent };
+      },
+    });
 
     settings.onChange((next, previous) => {
       if (next['dsn'] !== previous['dsn']) checkDsn(typeof next['dsn'] === "string" ? next['dsn'] : undefined);

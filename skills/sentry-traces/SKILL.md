@@ -17,7 +17,7 @@ It sends nothing until a DSN is set and `enabled` is on.
 
 | Command | Effect |
 | --- | --- |
-| `bb sentry-traces status` | Shows whether export is on, the Sentry host and project, counts, the last failure, and whether the Orchestrator's telemetry is available. Add `--json` for code. |
+| `bb sentry-traces status` | Shows whether export is on, the Sentry host and project, counts, the last failure, and the trace providers that reported in the last 30 days. Add `--json` for code. |
 | `bb sentry-traces test` | Sends one synthetic trace with fixed text and prints its trace id. Works while `enabled` is off. |
 | `bb sentry-traces export [thread-id]` | Prints the OTLP JSON the thread would send. Sends nothing. Defaults to the current thread and its newest finished turn. |
 
@@ -35,7 +35,6 @@ Change settings with `bb plugin config sentry-traces set <key> <value>`.
 | `enabled` | `false` | Send traces. |
 | `captureContent` | `false` | Also send prompts, replies, tool arguments and outputs. |
 | `environment` | none | Environment label in Sentry. |
-| `providers` | `orchestrator` | Plugin ids allowed to group threads into traces and name agents. |
 
 ## Rules
 
@@ -64,7 +63,11 @@ Change settings with `bb plugin config sentry-traces set <key> <value>`.
 6. A workflow run's workers share one trace, read from the Workflows plugin's
    thread metadata and its `workflowRunView` RPC. If either is unreadable, each
    worker exports on its own. The run's own spans are sent when the run ends.
-7. Threads join another plugin's trace only when that plugin is listed in the
-   `providers` setting and answers `telemetry_thread_context` and
-   `telemetry_trace`. `status` shows each provider and whether it answers.
-   Otherwise each turn is its own trace.
+7. Threads join another plugin's trace only when that plugin claims them by
+   calling this plugin's `report_threads` RPC, before the thread's turn ends.
+   `status` lists each provider that reported in the last 30 days, with the
+   threads it claims and its open traces. A provider's own spans are sent
+   from what it reports with `report_trace`: final spans within a minute or
+   so, the rest once it reports the trace ended. Otherwise each turn is its
+   own trace. The contract is in the plugin's
+   `docs/trace-provider-contract.md`.

@@ -1,0 +1,174 @@
+{
+  "coordinatorThreadId": "thr_2",
+  "workerThreadId": "thr_5",
+  "scriptName": "example-run-c2c691a0-b-develop-1",
+  "report_threads": {
+    "contract": 2,
+    "threads": [
+      {
+        "threadId": "thr_2",
+        "context": {
+          "trace": {
+            "key": "run_c2c691a0-b",
+            "endedAt": null,
+            "pipeline": "task-loop",
+            "attributes": {
+              "example.run_id": "run_c2c691a0-b",
+              "example.workflow_id": "task-loop",
+              "example.task_key": "TASK-1"
+            }
+          },
+          "parent": null,
+          "agent": {
+            "id": "coordinator",
+            "name": "Coordinator"
+          },
+          "attributes": {
+            "example.role": "coordinator"
+          }
+        }
+      }
+    ]
+  },
+  "report_trace": {
+    "contract": 2,
+    "trace": {
+      "key": "run_c2c691a0-b",
+      "ended": false,
+      "pipeline": "task-loop",
+      "attributes": {
+        "example.run_id": "run_c2c691a0-b",
+        "example.workflow_id": "task-loop",
+        "example.task_key": "TASK-1"
+      },
+      "spans": [
+        {
+          "key": "root",
+          "parentKey": null,
+          "name": "example.run task-loop",
+          "op": "example.run",
+          "start": 1795303414915,
+          "end": 1795303415112,
+          "status": "ok",
+          "kind": "internal",
+          "attributes": {
+            "example.run_id": "run_c2c691a0-b",
+            "example.workflow_id": "task-loop",
+            "example.task_key": "TASK-1",
+            "example.state": "active",
+            "example.attempts_used": 1,
+            "example.failures": 1,
+            "example.coordinator_thread_id": "thr_2"
+          },
+          "final": false
+        },
+        {
+          "key": "step:run_c2c691a0-b#develop#1",
+          "parentKey": "root",
+          "name": "example.step develop#1",
+          "op": "example.step",
+          "start": 1795303415076,
+          "end": 1795303415076,
+          "status": "ok",
+          "kind": "internal",
+          "attributes": {
+            "example.run_id": "run_c2c691a0-b",
+            "example.workflow_id": "task-loop",
+            "example.task_key": "TASK-1",
+            "example.step": "develop",
+            "example.attempt": 1,
+            "example.attempt_id": "run_c2c691a0-b#develop#1",
+            "example.state": "done",
+            "example.agent_id": "developer"
+          },
+          "workflowName": "example-run-c2c691a0-b-develop-1",
+          "final": false
+        },
+        {
+          "key": "pick:2",
+          "parentKey": "root",
+          "name": "example.pick developer",
+          "op": "example.pick",
+          "start": 1795303415074,
+          "end": 1795303415074,
+          "status": "ok",
+          "kind": "internal",
+          "attributes": {
+            "example.run_id": "run_c2c691a0-b",
+            "example.workflow_id": "task-loop",
+            "example.task_key": "TASK-1",
+            "example.agent_id": "developer",
+            "example.pick.provider_id": "prov-a",
+            "example.pick.model": "model-a2",
+            "example.pick.reasoning_level": "medium"
+          },
+          "final": true
+        },
+        {
+          "key": "pick:3",
+          "parentKey": "root",
+          "name": "example.pick reviewer",
+          "op": "example.pick",
+          "start": 1795303415074,
+          "end": 1795303415074,
+          "status": "ok",
+          "kind": "internal",
+          "attributes": {
+            "example.run_id": "run_c2c691a0-b",
+            "example.workflow_id": "task-loop",
+            "example.task_key": "TASK-1",
+            "example.agent_id": "reviewer",
+            "example.pick.provider_id": "prov-b",
+            "example.pick.model": "model-b1",
+            "example.pick.reasoning_level": "high"
+          },
+          "final": true
+        },
+        {
+          "key": "decision:1",
+          "parentKey": "root",
+          "name": "decide decider",
+          "op": "gen_ai.decide",
+          "start": 1795303415011,
+          "end": 1795303415012,
+          "status": "ok",
+          "kind": "client",
+          "attributes": {
+            "example.run_id": "run_c2c691a0-b",
+            "example.workflow_id": "task-loop",
+            "example.task_key": "TASK-1",
+            "gen_ai.operation.name": "decide",
+            "gen_ai.provider.name": "example",
+            "gen_ai.request.model": "decider-test",
+            "gen_ai.usage.input_tokens": 120,
+            "gen_ai.usage.output_tokens": 8,
+            "gen_ai.usage.total_tokens": 128,
+            "example.decision.point": "risk-check",
+            "example.decision.via": "decider"
+          },
+          "final": true
+        },
+        {
+          "key": "verify:1",
+          "parentKey": "step:run_c2c691a0-b#develop#1",
+          "name": "example.verify",
+          "op": "example.verify",
+          "start": 1795303415105,
+          "end": 1795303415105,
+          "status": "error",
+          "errorType": "verify_failed",
+          "kind": "internal",
+          "attributes": {
+            "example.run_id": "run_c2c691a0-b",
+            "example.workflow_id": "task-loop",
+            "example.task_key": "TASK-1",
+            "example.attempt_id": "run_c2c691a0-b#develop#1",
+            "example.verify.passed": false,
+            "process.exit.code": 1
+          },
+          "final": true
+        }
+      ]
+    }
+  }
+}

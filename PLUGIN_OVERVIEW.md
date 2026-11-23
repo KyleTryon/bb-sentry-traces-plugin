@@ -14,9 +14,9 @@ conversation per thread. This is a community plugin, not made by Sentry.
 - **Conversations.** Turns of one thread group into one Sentry conversation.
 - **Workflow runs as one trace.** The worker threads of a Workflows run are
   tied back together under the run, its phases and its calls.
-- **Orchestrated runs as one trace.** Another plugin, such as an orchestrator,
-  can group its threads into one trace and name its agents, through a small
-  open contract.
+- **Orchestrated runs as one trace.** Another plugin, such as an orchestration
+  plugin, can group its threads into one trace and name its agents by
+  reporting them to this one, through a small open contract.
 - **Where it ran.** Each agent run carries its environment, machine, thread
   origin, permission mode and any model fallback.
 

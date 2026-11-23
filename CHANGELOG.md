@@ -15,8 +15,9 @@ First public release.
   subagent handoffs, inferred `chat` spans, and per-turn token usage.
 - One Sentry conversation per thread (`gen_ai.conversation.id`).
 - Workflow runs exported as one trace per run, under their phases and calls.
-- Trace provider contract (version 1), so another plugin can group threads
-  into one trace and name its agents. See
+- Trace provider contract (version 2), so another plugin can group threads
+  into one trace and name its agents by reporting them through this plugin's
+  `report_threads` and `report_trace` RPC methods. See
   [docs/trace-provider-contract.md](docs/trace-provider-contract.md).
 - Off by default. Message content is a separate opt-in (`captureContent`) and
   is scrubbed for common secret shapes.

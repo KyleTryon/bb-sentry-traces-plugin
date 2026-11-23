@@ -1,52 +1,29 @@
 /**
  * Trace providers. Any bb plugin can say "these threads belong to one trace of
- * mine, and here is that trace's own structure" by answering two RPC methods,
- * described in docs/trace-provider-contract.md:
+ * mine, and here is that trace's own structure" by calling two RPC methods of
+ * this plugin, described in docs/trace-provider-contract.md:
  *
- * - `telemetry_thread_context`: which trace a thread belongs to, where its
- *   turns hang, and which agent it runs as;
- * - `telemetry_trace`: the trace's own spans.
+ * - `report_threads`: which trace a thread belongs to, where its turns hang,
+ *   and which agent it runs as;
+ * - `report_trace`: the trace's own spans, as a whole snapshot each time.
  *
- * This plugin knows nothing about what a provider's trace means. It asks the
- * plugins named in the `providers` setting, checks and caps what comes back,
- * and never reads a provider's database or thread metadata.
- *
- * A provider may be missing, disabled, or older than the contract. A provider
- * that has never answered is taken to be absent, and the thread exports on its
- * own. One that answered before and stopped is asked again for a while before
- * it is taken to be gone, so a reload does not move threads out of its traces.
+ * This plugin knows nothing about what a provider's trace means, and asks no
+ * other plugin anything. A provider pushes what it knows; the export reads
+ * what was stored when a thread goes idle and on its periodic sweep. A thread
+ * no provider claimed exports on its own.
  *
  * This file holds the contract constants and the shapes the rest of the
  * integration passes around. The wire schemas are in `schema.ts`.
  */
 import type { AttributeValue } from "../../core/otlp.js";
 
-export const CONTRACT_VERSION = 1;
+export const CONTRACT_VERSION = 2;
 /** The key of a trace's root span, and where a thread hangs when a provider names no parent. */
 export const ROOT_KEY = "root";
 
-/** What Workflows says about a worker thread, sent along so a provider can place and name it. */
-export interface WorkflowHint {
-  runId: string;
-  /** The workflow's name as its script declares it. */
-  name: string | null;
-  callId: string;
-  callIndex: number | null;
-  originThreadId: string;
-  phase: string | null;
-  provider: string | null;
-  model: string | null;
-  reasoningLevel: string | null;
-}
-
-export interface ThreadQuery {
-  threadId: string;
-  workflow?: WorkflowHint | null;
-}
-
 /** Where a thread sits in a provider's trace. */
 export interface TraceContext {
-  /** The plugin that answered. */
+  /** The plugin that claimed the thread. */
   provider: string;
   traceKey: string;
   /** When the trace ended; null while it can still grow. */
@@ -64,3 +41,13 @@ export interface TraceContext {
   attributes: Record<string, AttributeValue>;
 }
 
+/** A thread's claim as stored: whose it is, where it puts the thread, and when it was made. */
+export interface StoredClaim {
+  context: TraceContext;
+  reportedAt: number;
+}
+
+/** What is remembered of a provider, for `status`. */
+export interface ProviderRecord {
+  lastReportAt: number;
+}

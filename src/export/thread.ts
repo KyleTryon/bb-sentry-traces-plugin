@@ -24,7 +24,6 @@ import { resourceOf, stillSending, targetOf } from "./settings.js";
 import { type TurnUsage, turnSpans } from "./spans.js";
 import { fromBeforeGap, kv, recordFailure, recordSuccess, sendingSince } from "./store.js";
 import type { ExportContext, ExportOutcome, Folded, ThreadState } from "./types.js";
-import { UNAVAILABLE_MS } from "../integrations/providers/client.js";
 import { contextForTurn } from "../integrations/providers/placement.js";
 import type { TraceContext } from "../integrations/providers/types.js";
 import type { WorkflowContext } from "../integrations/workflows/ids.js";
@@ -36,19 +35,6 @@ const NO_TURNS: ReadonlySet<number> = new Set();
 /** A subagent of the turn whose agent is still working in the background. */
 function hasRunningAgent(turn: Turn): boolean {
   return turn.spans.some((span) => span.kind === "subagent" && span.end === null);
-}
-
-/** What is remembered about a thread before anything of it was read. */
-function newThreadState(now: number): ThreadState {
-  return {
-    sentTurn: null,
-    resumeSeq: 0,
-    turnsBefore: 0,
-    usage: null,
-    usageKnown: false,
-    partial: null,
-    updatedAt: now,
-  };
 }
 
 /**
@@ -68,8 +54,6 @@ export async function previewThread(
   spans: OtlpSpan[];
   turns: number;
   trace: TraceContext | null;
-  /** A trace provider that may claim the thread did not answer: a real export would wait. */
-  traceUnknown: boolean;
   workflow: WorkflowContext | null;
 }> {
   const folded = await fold(ctx, thread.id, undefined, options.captureContent);
@@ -88,9 +72,7 @@ export async function previewThread(
       });
     }
   }
-  const placed = await placeThread(ctx, thread);
-  const workflow = placed.workflow;
-  const trace = placed.trace ?? null;
+  const { workflow, trace } = await placeThread(ctx, thread);
   const now = ctx.now();
   const spans = picked.flatMap((turn) =>
     turnSpans(turn, {
@@ -102,7 +84,7 @@ export async function previewThread(
       usage,
     }),
   );
-  return { spans, turns: picked.length, trace, traceUnknown: placed.trace === undefined, workflow };
+  return { spans, turns: picked.length, trace, workflow };
 }
 
 /** The read a thread's export starts from, once its first reads are done. */
@@ -258,31 +240,6 @@ async function settleIdle(
   return { kind: "nothing" };
 }
 
-/**
- * A provider that may claim the thread did not answer: ask again later, from
- * where this export would have started.
- */
-async function waitForProvider(
-  ctx: ExportContext,
-  thread: ThreadInfo,
-  state: ThreadState | undefined,
-  folded: Folded,
-  timing: { now: number; baseline: number; waitedBefore: ReadonlySet<number>; knownTotal: boolean },
-): Promise<ExportOutcome> {
-  const { now, baseline, waitedBefore, knownTotal } = timing;
-  ctx.bb.log.debug(`A trace provider did not answer for ${thread.id}; its export waits.`);
-  await kv(ctx).set(THREAD_KEY + thread.id, {
-    ...(state ?? { ...newThreadState(now), usageKnown: knownTotal }),
-    sentTurn: baseline,
-    waiting: state?.waiting ?? null,
-    ...resumePoint(ctx, folded, state, baseline, waitedBefore),
-    updatedAt: now,
-  } satisfies ThreadState);
-  // Counted from now, after the call: a slow failure backs the provider off from its end.
-  await scheduleCheck(ctx, thread.id, ctx.now() + UNAVAILABLE_MS + 1_000);
-  return { kind: "nothing" };
-}
-
 /** What one export sends. */
 interface Plan {
   thread: ThreadInfo;
@@ -421,14 +378,7 @@ export async function exportThread(ctx: ExportContext, thread: ThreadInfo): Prom
   const pending = due.filter((turn) => !waits(turn));
   let workflow: WorkflowContext | null = null;
   let trace: TraceContext | null = null;
-  if (pending.length > 0) {
-    const placed = await placeThread(ctx, thread);
-    if (placed.trace === undefined) {
-      return waitForProvider(ctx, thread, state, folded, { now, baseline, waitedBefore, knownTotal });
-    }
-    workflow = placed.workflow;
-    trace = placed.trace;
-  }
+  if (pending.length > 0) ({ workflow, trace } = await placeThread(ctx, thread));
 
   // While a turn waits, its tokens so far are in the thread's total too, and
   // the total cannot be split by turn: the usage waits with it.

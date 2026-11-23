@@ -10,6 +10,7 @@ import { scheduleCheck } from "../src/export/retries.js";
 import { noteTrace } from "../src/export/runs.js";
 import type { ExportContext, RetryEntry, TraceEntry } from "../src/export/types.js";
 import { TraceBuilder } from "../src/core/trace/builder.js";
+import { ProviderStore } from "../src/integrations/providers/store.js";
 import type { TraceContext } from "../src/integrations/providers/types.js";
 import type { OtlpSpan, OtlpTraces } from "../src/core/otlp.js";
 import { createPlugin } from "../src/server.js";
@@ -29,11 +30,6 @@ interface Setup {
   settings?: Record<string, string | boolean>;
   /** Answers each post; may change the world before it answers. */
   respond?: (post: Post) => number | Promise<number>;
-  /** The provider's answer for a thread's context, and for a trace by its key. */
-  provider?: {
-    contexts: Record<string, unknown>;
-    trace: (traceKey: string) => unknown;
-  };
 }
 
 const disposers: Array<() => Promise<void>> = [];
@@ -52,26 +48,14 @@ async function setup(options: Setup = {}) {
     if (status === 200) posts.push(post);
     return new Response(status === 200 ? "{}" : "nope", { status });
   }) as typeof fetch;
-  const rpc = vi.fn(async ({ pluginId, method, input }: { pluginId: string; method: string; input?: unknown }) => {
-    const provider = options.provider;
-    if (pluginId !== P || !provider) throw new Error(`plugin ${pluginId} is not installed`);
-    if (method === "telemetry_thread_context") {
-      const asked = (input as { threads: Array<{ threadId: string }> }).threads;
-      return {
-        contract: 1,
-        contexts: Object.fromEntries(asked.map(({ threadId }) => [threadId, provider.contexts[threadId] ?? null])),
-      };
-    }
-    if (method === "telemetry_trace") {
-      return { contract: 1, trace: provider.trace((input as { traceKey: string }).traceKey) ?? null };
-    }
-    throw new Error(`unknown method ${method}`);
+  const rpc = vi.fn(async ({ pluginId }: { pluginId: string }) => {
+    throw new Error(`plugin ${pluginId} is not installed`);
   });
   const thread = (id: string) =>
     makeThreadResponse({ id, title: SECRETS.title, providerId: "claude-code", projectId: "proj_1" });
   const { bb, harness } = createFakePluginHost({
     pluginId: "sentry-traces",
-    settings: { dsn: DSN, enabled: true, providers: options.provider ? P : "", ...options.settings },
+    settings: { dsn: DSN, enabled: true, ...options.settings },
     sdk: {
       threads: {
         events: { list: eventsList(histories) },
@@ -120,8 +104,18 @@ async function setup(options: Setup = {}) {
     await settle();
   };
   const spans = () => posts.flatMap((post) => post.spans);
+  const caller = { experimental_caller: { kind: "plugin" as const, pluginId: P } };
+  /** The provider claims threads for traces of its own. */
+  const claim = (threads: Record<string, unknown>) =>
+    harness.behavior.callRpc(
+      "report_threads",
+      { contract: 2, threads: Object.entries(threads).map(([threadId, context]) => ({ threadId, context })) },
+      caller,
+    );
+  /** The provider reports a trace's snapshot. */
+  const report = (trace: unknown) => harness.behavior.callRpc("report_trace", { contract: 2, trace }, caller);
   const history = histories[THREAD]!;
-  return { bb, harness, histories, history, clock, posts, spans, emit, tick, setSettings, dispose };
+  return { bb, harness, histories, history, clock, posts, spans, emit, tick, setSettings, dispose, claim, report };
 }
 
 const agentSpans = (spans: OtlpSpan[]) => spans.filter((span) => span.name.startsWith("invoke_agent"));
@@ -432,7 +426,8 @@ function memoryContext(now: () => number) {
     list: async (prefix = "") => [...store.keys()].filter((key) => key.startsWith(prefix)),
   };
   const log = { debug: () => undefined, info: () => undefined, warn: () => undefined, error: () => undefined };
-  const ctx = { bb: { storage: { kv }, log }, now, locks: new Map(), migrated: true, disposed: false };
+  const providers = new ProviderStore(kv, now);
+  const ctx = { bb: { storage: { kv }, log }, now, locks: new Map(), migrated: true, disposed: false, providers };
   return { store, ctx: ctx as unknown as ExportContext };
 }
 
@@ -469,14 +464,8 @@ describe("the sweep", () => {
   const root = (key: string) => ({ key: "root", parentKey: null, name: `run ${key}`, start: 1_800_000_000_000, end: 1_800_000_400_000 });
 
   it("goes on past an entry it cannot save, and does not send that entry again", async () => {
-    const threads = { [THREAD]: context("k1"), thr_two: context("k2") };
-    const ended = { k1: false, k2: false };
-    const { bb, histories, history: h, emit, tick, posts } = await setup({
-      provider: {
-        contexts: threads,
-        trace: (key) => ({ key, ended: ended[key as "k1" | "k2"], spans: [root(key)] }),
-      },
-    });
+    const { bb, histories, history: h, emit, tick, posts, claim, report } = await setup();
+    await claim({ [THREAD]: context("k1"), thr_two: context("k2") });
     histories["thr_two"] = new History();
     h.turn();
     histories["thr_two"].turn();
@@ -487,8 +476,7 @@ describe("the sweep", () => {
       if (key === `trace:${P}/k1`) throw new Error("value too large");
       await set(key, value);
     });
-    ended.k1 = true;
-    ended.k2 = true;
+    for (const key of ["k1", "k2"]) await report({ key, ended: true, spans: [root(key)] });
     const before = posts.length;
     await tick();
     const roots = () => posts.slice(before).flatMap((post) => post.spans).filter((span) => span.name.startsWith("run "));
@@ -498,18 +486,18 @@ describe("the sweep", () => {
   });
 
   it("keeps the keys of spans sent early within what storage takes, and sends each span once", async () => {
-    let ended = false;
     const keys = Array.from({ length: 1_999 }, (_, n) => `${String(n).padStart(4, "0")}-${"k".repeat(190)}`);
-    const { bb, history: h, emit, tick, posts } = await setup({
-      provider: {
-        contexts: { [THREAD]: context("big") },
-        trace: (key) => ({
-          key,
-          ended,
-          spans: [root(key), ...keys.map((k) => ({ key: k, parentKey: "root", name: "step", start: 1_800_000_100_000, end: 1_800_000_200_000, final: true }))],
-        }),
-      },
+    const { bb, history: h, emit, tick, posts, claim, report } = await setup();
+    const trace = (ended: boolean) => ({
+      key: "big",
+      ended,
+      spans: [
+        root("big"),
+        ...keys.map((k) => ({ key: k, parentKey: "root", name: "step", start: 1_800_000_100_000, end: 1_800_000_200_000, final: true })),
+      ],
     });
+    await claim({ [THREAD]: context("big") });
+    await report(trace(false));
     h.turn();
     await emit("thread.idle");
     const before = posts.length;
@@ -518,7 +506,7 @@ describe("the sweep", () => {
     const entry = await bb.storage.kv.get<TraceEntry>(`trace:${P}/big`);
     expect(entry?.sentKeys?.length).toBeGreaterThan(0);
     expect(entry?.sentKeys?.length).toBeLessThan(keys.length);
-    ended = true;
+    await report(trace(true));
     await tick();
     const steps = posts.slice(before).flatMap((post) => post.spans).filter((span) => span.name === "step");
     expect(steps).toHaveLength(keys.length);
@@ -544,6 +532,33 @@ describe("pruning", () => {
     clock.now += DAY;
     await tick();
     expect(await bb.storage.kv.list("thread:")).not.toContain("thread:later");
+  });
+});
+
+describe("pruning what providers reported", () => {
+  it("drops claims of threads untouched for 90 days, even while export is off", async () => {
+    const { bb, tick, clock, claim } = await setup({ settings: { enabled: false } });
+    await claim({ thr_old: { trace: { key: "k" } }, thr_busy: { trace: { key: "k" } } });
+    clock.now += 91 * DAY;
+    await bb.storage.kv.set("thread:thr_busy", { sentTurn: 1, resumeSeq: 5, turnsBefore: 1, usage: null, usageKnown: true, updatedAt: clock.now - DAY });
+    await claim({ thr_new: { trace: { key: "k" } } });
+    await tick();
+    expect((await bb.storage.kv.list("claim:")).sort()).toEqual(["claim:thr_busy", "claim:thr_new"]);
+  });
+
+  it("drops snapshots no trace needs after 30 days, parts and all, and forgets quiet providers", async () => {
+    const { bb, tick, clock, report } = await setup();
+    await report({ key: "orphan", ended: false, spans: [{ key: "a", name: "a", start: 1, end: 2 }] });
+    // Left by a write that stopped part way.
+    await bb.storage.kv.set(`snapshot-part:${(clock.now - 2 * 60 * 60_000).toString(36)}-deadbeef:0`, []);
+    await tick();
+    // The stray part goes; the snapshot, still young, keeps its own.
+    expect(await bb.storage.kv.list("snapshot:")).toHaveLength(1);
+    expect(await bb.storage.kv.list("snapshot-part:")).toHaveLength(1);
+    clock.now += 31 * DAY;
+    await tick();
+    expect(await bb.storage.kv.list("snapshot")).toEqual([]);
+    expect(await bb.storage.kv.list("provider:")).toEqual([]);
   });
 });
 

@@ -18,8 +18,9 @@ This is a community plugin. It is not made or supported by Sentry.
 | The turn's token usage | On one `chat` span of the turn, so cost is counted once |
 
 A thread on its own produces one trace per turn. The workers of a
-[workflow run](#workflow-runs) share one trace, and a thread that a
-[trace provider](#trace-providers) claims joins that provider's trace.
+[workflow run](#workflow-runs) share one trace, and a thread that another
+plugin claims as a [trace provider](#trace-providers) joins that plugin's
+trace.
 
 Each turn's `invoke_agent` span also says where and how it ran:
 
@@ -69,7 +70,6 @@ bb sentry-traces status
 | `enabled` | `false` | Send traces. |
 | `captureContent` | `false` | Also send prompts, replies, tool arguments and tool outputs. |
 | `environment` | none | A label for Sentry's environment filter, such as `laptop`. |
-| `providers` | `orchestrator` | Plugin ids of [trace providers](#trace-providers), separated by commas. Empty asks none. |
 
 ## What is sent
 
@@ -109,7 +109,8 @@ bb sentry-traces export [thread-id] [--turns N | --all] [--running] [--content] 
 ```
 
 - `status` shows whether export is on, the Sentry host and project (never the
-  key), what was sent, and the last failure.
+  key), what was sent, the last failure, and the trace providers that
+  reported in the last 30 days.
 - `test` sends one synthetic trace with fixed text. It works while `enabled`
   is off.
 - `export` prints the OTLP JSON a thread would send. It sends nothing and
@@ -142,8 +143,8 @@ identifier.
 
 This reads two things from the bundled Workflows plugin: each worker thread's
 Workflows metadata, and the `workflowRunView` RPC. That RPC is internal to
-Workflows and may change; if it does, workers export on their own, one trace
-per turn.
+Workflows and may change. If it does, or Workflows is disabled or removed,
+workers export on their own, one trace per turn, without waiting.
 
 ## Trace providers
 
@@ -161,34 +162,37 @@ decisions:
 └─ invoke_agent <agent>                   turns of a thread in the trace
 ```
 
-This plugin knows nothing about what a provider's trace means. A provider is
-any bb plugin that answers two RPC methods, `telemetry_thread_context` and
-`telemetry_trace`, described in
-[docs/trace-provider-contract.md](docs/trace-provider-contract.md). The
-`providers` setting lists the plugin ids to ask; only those plugins can add
-spans to your Sentry project.
+This plugin knows nothing about what a provider's trace means, and asks no
+plugin for it. A provider is any bb plugin that calls two RPC methods of this
+one, `report_threads` and `report_trace`, described in
+[docs/trace-provider-contract.md](docs/trace-provider-contract.md). Only
+another plugin can call them; the app, the CLI and agents cannot. `bb
+sentry-traces status` lists the providers that reported in the last 30 days.
 
 - **Agents get the provider's names.** A provider can name the agent a thread
   runs as (`Senior Dev`); that becomes `gen_ai.agent.name`, with the agent's id
   in `bb.agent.id`. A thread no provider names is named by its bb provider
   (`claude-code`).
-- **Each thread keeps its own conversation**, and every span carries
+- **A thread belongs to one provider.** The first to claim it keeps it until
+  it lets go. Each thread keeps its own conversation, and every span carries
   `bb.trace.provider`, `bb.trace.key` and the provider's own attributes.
-- **A provider's spans are sent as they settle.** A span the provider marks
-  `final`, such as a model call it made, is sent within a minute or so, even
-  while the trace is open. The rest, and the root, are sent once when the
-  provider says the trace has ended; until then the trace has no root. A
-  trace still open after 30 days is sent as it stands, its root marked
-  `bb.trace.state: "open"`. A turn that starts in a thread after its trace
-  ended gets its own trace.
-- **Workflow workers need no provider answer.** A worker takes its trace from
-  the thread that started its workflow, and hangs under its workflow call.
+- **A provider's spans are sent as they settle.** A provider reports its
+  trace as a whole snapshot whenever it changes. A span it marks `final`, such
+  as a model call it made, is sent within a minute or so, even while the trace
+  is open. The rest, and the root, are sent once a snapshot says the trace has
+  ended; until then the trace has no root. A trace still open after 30 days is
+  sent as it stands, its root marked `bb.trace.state: "open"`. A turn that
+  starts in a thread after its trace ended gets its own trace.
+- **Workflow workers need no claim.** A worker takes its trace from the thread
+  that started its workflow, and hangs under its workflow call.
 - **Provider input is checked.** Attributes must be plain scalars, are capped
   in number and size, and cannot replace this plugin's own or Sentry's. Text a
-  provider marks as content is sent only with `captureContent`, scrubbed.
+  provider marks as content is kept and sent only with `captureContent`,
+  scrubbed. Reports are kept in plugin storage until sent; claims are kept
+  while export is off too, so a thread claimed then is placed right once it
+  is on.
 
-A provider that is missing, disabled or older than the contract is skipped,
-and its threads export as one trace per turn.
+A thread no provider claimed exports as one trace per turn, at once.
 
 ## Known limits
 

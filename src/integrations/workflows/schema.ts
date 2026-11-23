@@ -3,7 +3,6 @@
  * Read with defaults and loose objects, since that plugin can change.
  */
 import { z } from "zod";
-import type { WorkflowContext } from "./ids.js";
 
 const optionalText = z.string().nullish();
 const optionalTime = z.number().nullish();
@@ -59,13 +58,4 @@ export function workflowEnded(run: Pick<WorkflowRunView, "status">): boolean {
 
 export function allCalls(run: WorkflowRunView): WorkflowCall[] {
   return [...run.phases.flatMap((phase) => phase.calls), ...run.unphasedCalls];
-}
-
-export function callFacts(call: WorkflowCall): NonNullable<WorkflowContext["call"]> {
-  return {
-    phase: call.phase ?? null,
-    provider: call.provider ?? null,
-    model: call.model ?? null,
-    reasoningLevel: call.reasoningLevel ?? null,
-  };
 }

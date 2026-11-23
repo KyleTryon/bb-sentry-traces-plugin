@@ -31,11 +31,6 @@ const CLAUDE_TOTAL = {
 interface Setup {
   settings?: Record<string, string | boolean>;
   respond?: () => number | Error;
-  /** Trace providers by plugin id: what each answers. A plugin not listed is not installed. */
-  providers?: Record<
-    string,
-    { contexts?: Record<string, unknown>; trace?: () => unknown; contract?: number }
-  >;
   /** What the Workflows plugin holds: worker threads' metadata and the run view. */
   workflows?: {
     metadata: Record<string, Record<string, unknown>>;
@@ -43,6 +38,8 @@ interface Setup {
   };
   /** Fields of bb's thread record, by thread id. */
   threads?: Record<string, Record<string, unknown>>;
+  /** Reading Workflows metadata fails, as with Workflows removed. */
+  metadataFails?: boolean;
 }
 
 const disposers: Array<() => Promise<void>> = [];
@@ -50,29 +47,19 @@ afterEach(async () => {
   while (disposers.length > 0) await disposers.pop()!();
 });
 
+/** The caller a plugin's `bb.sdk.plugins.callRpc` would be. */
+const asPlugin = (pluginId: string) => ({ experimental_caller: { kind: "plugin" as const, pluginId } });
+
 async function setup(options: Setup = {}) {
   const histories: Record<string, History> = { [THREAD]: new History() };
   const clock = { now: 1_800_000_500_000 };
   const { fetchImpl, sent, spans } = fakeFetch(options.respond);
-  const rpc = vi.fn(async ({ pluginId, method, input }: { pluginId: string; method: string; input?: unknown }) => {
-    if (pluginId === "workflows") {
-      if (!options.workflows || method !== "workflowRunView") throw new Error("no such method");
+  // This plugin calls no plugin but Workflows.
+  const rpc = vi.fn(async ({ pluginId, method }: { pluginId: string; method: string; input?: unknown }) => {
+    if (pluginId === "workflows" && options.workflows && method === "workflowRunView") {
       return { run: options.workflows.view() };
     }
-    const provider = options.providers?.[pluginId];
-    if (!provider) throw new Error(`plugin ${pluginId} is not installed`);
-    const contract = provider.contract ?? 1;
-    if (method === "telemetry_thread_context") {
-      const asked = (input as { threads: Array<{ threadId: string }> }).threads;
-      return {
-        contract,
-        contexts: Object.fromEntries(
-          asked.map(({ threadId }) => [threadId, provider.contexts?.[threadId] ?? null]),
-        ),
-      };
-    }
-    if (method === "telemetry_trace") return { contract, trace: provider.trace?.() ?? null };
-    throw new Error(`unknown method ${method}`);
+    throw new Error(`plugin ${pluginId} has no method ${method}`);
   });
   const thread = (id: string) =>
     makeThreadResponse({
@@ -84,8 +71,7 @@ async function setup(options: Setup = {}) {
     });
   const { bb, harness } = createFakePluginHost({
     pluginId: "sentry-traces",
-    // No provider is asked by default; a test's providers are, unless its settings say otherwise.
-    settings: { dsn: DSN, enabled: true, providers: Object.keys(options.providers ?? {}).join(","), ...options.settings },
+    settings: { dsn: DSN, enabled: true, ...options.settings },
     sdk: {
       threads: {
         events: { list: eventsList(histories) },
@@ -93,8 +79,10 @@ async function setup(options: Setup = {}) {
           if (!histories[threadId]) throw new Error("not found");
           return thread(threadId);
         },
-        getPluginMetadata: async ({ threadId }: { threadId: string }) =>
-          options.workflows?.metadata[threadId] ?? {},
+        getPluginMetadata: async ({ threadId }: { threadId: string }) => {
+          if (options.metadataFails) throw new Error("plugin workflows is not installed");
+          return options.workflows?.metadata[threadId] ?? {};
+        },
       },
       plugins: { callRpc: rpc },
     },
@@ -126,13 +114,29 @@ async function setup(options: Setup = {}) {
     service.controller.abort();
     await service.done;
   };
+  /** A provider claims threads for its traces, or clears its claim with null. */
+  const claim = (threads: Record<string, unknown>, provider = P) =>
+    harness.behavior.callRpc(
+      "report_threads",
+      { contract: 2, threads: Object.entries(threads).map(([threadId, context]) => ({ threadId, context })) },
+      asPlugin(provider),
+    ) as Promise<{ contract: number; sending: boolean; results: Record<string, string> }>;
+  /** A provider reports a trace's snapshot. */
+  const report = (trace: unknown, provider = P) =>
+    harness.behavior.callRpc("report_trace", { contract: 2, trace }, asPlugin(provider)) as Promise<{
+      contract: number;
+      sending: boolean;
+    }>;
+  /** A provider says a trace no longer exists. */
+  const reportDeleted = (key: string, provider = P) =>
+    harness.behavior.callRpc("report_trace", { contract: 2, deleted: { key } }, asPlugin(provider));
   const history = must(histories[THREAD], "the thread's history");
-  return { bb, harness, histories, history, clock, sent, spans, rpc, emit, tick };
+  return { bb, harness, histories, history, clock, sent, spans, rpc, emit, tick, claim, report, reportDeleted };
 }
 
 const names = (spans: Array<{ name: string }>) => spans.map((span) => span.name);
 
-const P = "orchestrator";
+const P = "example-provider";
 const KEY = "run_42";
 /** A turn that starts a background subagent which is still working when the turn ends. */
 function backgroundTurn(history: History, turnId: string, taskId = `${turnId}-task`) {
@@ -159,7 +163,6 @@ const agentTurns = (spans: Array<{ name: string; attributes: unknown }>) =>
     .filter((span) => span.name.startsWith("invoke_agent") && attr(span as never, "bb.turn.id"))
     .filter((span) => !span.name.includes("Explore"))
     .map((span) => attr(span as never, "bb.turn.index"));
-const inTrace = (span: { traceId: string }) => span.traceId === providerTraceId(P, KEY);
 const turnIndexes = (spans: Array<{ name: string }>) =>
   spans
     .filter((span) => span.name.startsWith("invoke_agent"))
@@ -977,7 +980,8 @@ describe("failures", () => {
 });
 
 describe("trace providers", () => {
-  const traceOf = { key: KEY, pipeline: "feature", attributes: { "orchestrator.run_id": KEY } };
+  const PROVIDER_ERROR = "PROVIDER-ERROR-TEXT-yak";
+  const traceOf = { key: KEY, pipeline: "feature", attributes: { "example.run_id": KEY } };
   const context = (extra: Record<string, unknown> = {}, trace: Record<string, unknown> = {}) => ({
     trace: { ...traceOf, ...trace },
     ...extra,
@@ -993,65 +997,62 @@ describe("trace providers", () => {
   const trace = (ended: boolean, spans: unknown[] = []) => ({
     key: KEY,
     ended,
+    pipeline: "feature",
+    attributes: { "example.run_id": KEY },
     spans: [
-      span("root", { parentKey: null, name: "orchestrator.run feature", op: "orchestrator.run", start: 1_800_000_000_000, end: 1_800_000_400_000 }),
+      span("root", { parentKey: null, name: "example.run feature", op: "example.run", start: 1_800_000_000_000, end: 1_800_000_400_000 }),
       ...spans,
     ],
   });
 
-  it("exports a thread on its own when no provider answers, and stops asking", async () => {
-    const { history, emit, spans, rpc } = await setup({ settings: { providers: P } });
+  it("exports a thread no provider claimed on its own, at once, and asks no plugin", async () => {
+    const { history, emit, spans, rpc } = await setup();
     history.turn();
     await emit("thread.idle");
-    expect(rpc).toHaveBeenCalledTimes(1);
+    expect(rpc).not.toHaveBeenCalled();
     expect(must(spans()[0], "first span").parentSpanId).toBeUndefined();
     expect(attr(must(spans()[0], "first span"), "bb.trace.provider")).toBeUndefined();
-    // A missing provider is not asked again for every export.
-    history.turn();
-    await emit("thread.idle");
-    expect(rpc).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers its two methods for discovery", async () => {
+    const { harness } = await setup();
+    const published = harness.inspection.registrations.experimental_publishedRpcMethods;
+    expect(published.map((method) => method.method).sort()).toEqual(["report_threads", "report_trace"]);
   });
 
   it("puts every thread of a trace in it, under the span its provider names", async () => {
-    let ended = false;
-    const { histories, emit, tick, spans, sent } = await setup({
-      providers: {
-        [P]: {
-          contexts: {
-            [THREAD]: context({
-              agent: { id: "coordinator", name: "Lead" },
-              attributes: { "orchestrator.role": "coordinator" },
-            }),
-            thr_worker: context({ parent: "step-1", agent: { id: "developer", name: "Senior Dev" } }),
-            thr_sub: context({ parent: "subtask-ENG-8", agent: { id: "docs" } }),
-          },
-          trace: () =>
-            trace(ended, [
-              span("step-1", { name: "orchestrator.step develop#1", op: "orchestrator.step" }),
-              span("decision-1", {
-                name: "decide typesafe/jev-1.13",
-                op: "gen_ai.decide",
-                kind: "client",
-                attributes: {
-                  "gen_ai.operation.name": "decide",
-                  "gen_ai.request.model": "typesafe/jev-1.13",
-                  "gen_ai.usage.input_tokens": 400,
-                },
-                content: { "gen_ai.input.messages": SECRETS.toolArg },
-              }),
-              span("verify-1", {
-                parentKey: "step-1",
-                name: "orchestrator.verify",
-                status: "error",
-                errorType: "verify_failed",
-                errorMessage: SECRETS.toolError,
-              }),
-              // Its parent is not in the trace: it hangs under the root.
-              span("subtask-ENG-8", { parentKey: "nowhere", name: "orchestrator.subtask ENG-8" }),
-            ]),
-        },
-      },
+    const { histories, emit, tick, spans, sent, claim, report } = await setup();
+    const answer = await claim({
+      [THREAD]: context({ agent: { id: "coordinator", name: "Lead" }, attributes: { "example.role": "coordinator" } }),
+      thr_worker: context({ parent: "step-1", agent: { id: "developer", name: "Senior Dev" } }),
+      thr_sub: context({ parent: "subtask-ENG-8", agent: { id: "docs" } }),
     });
+    expect(answer).toEqual({ contract: 2, sending: true, results: { [THREAD]: "ok", thr_worker: "ok", thr_sub: "ok" } });
+    const spansOf = (ended: boolean) =>
+      trace(ended, [
+        span("step-1", { name: "example.step develop#1", op: "example.step" }),
+        span("decision-1", {
+          name: "decide example/decider-1",
+          op: "gen_ai.decide",
+          kind: "client",
+          attributes: {
+            "gen_ai.operation.name": "decide",
+            "gen_ai.request.model": "example/decider-1",
+            "gen_ai.usage.input_tokens": 400,
+          },
+          content: { "gen_ai.input.messages": SECRETS.toolArg },
+        }),
+        span("verify-1", {
+          parentKey: "step-1",
+          name: "example.verify",
+          status: "error",
+          errorType: "verify_failed",
+          errorMessage: SECRETS.toolError,
+        }),
+        // Its parent is not in the trace: it hangs under the root.
+        span("subtask-ENG-8", { parentKey: "nowhere", name: "example.subtask ENG-8" }),
+      ]);
+    expect(await report(spansOf(false))).toEqual({ contract: 2, sending: true });
     for (const id of ["thr_worker", "thr_sub"]) histories[id] = new History();
     for (const id of [THREAD, "thr_worker", "thr_sub"]) {
       must(histories[id], id).turn();
@@ -1069,36 +1070,32 @@ describe("trace providers", () => {
       providerSpanId(P, KEY, "subtask-ENG-8"),
     ]);
     // Each thread is still its own conversation.
-    expect(agents.map((span) => attr(span, "gen_ai.conversation.id"))).toEqual([
-      THREAD,
-      "thr_worker",
-      "thr_sub",
-    ]);
+    expect(agents.map((span) => attr(span, "gen_ai.conversation.id"))).toEqual([THREAD, "thr_worker", "thr_sub"]);
     for (const span of spans()) {
       expect(attr(span, "bb.trace.provider")).toBe(P);
       expect(attr(span, "bb.trace.key")).toBe(KEY);
-      expect(attr(span, "orchestrator.run_id")).toBe(KEY);
+      expect(attr(span, "example.run_id")).toBe(KEY);
       expect(attr(span, "gen_ai.pipeline.name")).toBe("feature");
     }
     // A thread's own attributes stay on that thread.
-    expect(attr(must(agents[0], "first agent span"), "orchestrator.role")).toBe("coordinator");
-    expect(attr(must(agents[1], "second agent span"), "orchestrator.role")).toBeUndefined();
+    expect(attr(must(agents[0], "first agent span"), "example.role")).toBe("coordinator");
+    expect(attr(must(agents[1], "second agent span"), "example.role")).toBeUndefined();
 
     // The trace's own spans wait for it to end, and are then sent once.
     const before = sent.length;
     await tick();
     expect(sent).toHaveLength(before);
-    ended = true;
+    await report(spansOf(true));
     await tick();
     await tick();
     expect(sent).toHaveLength(before + 1);
     const structure = sent.at(-1)!.spans;
     expect(names(structure)).toEqual([
-      "orchestrator.run feature",
-      "orchestrator.step develop#1",
-      "decide typesafe/jev-1.13",
-      "orchestrator.verify",
-      "orchestrator.subtask ENG-8",
+      "example.run feature",
+      "example.step develop#1",
+      "decide example/decider-1",
+      "example.verify",
+      "example.subtask ENG-8",
     ]);
     const root = must(structure[0], "root span");
     const step = must(structure[1], "step span");
@@ -1107,8 +1104,8 @@ describe("trace providers", () => {
     const subtask = must(structure[4], "subtask span");
     expect(root.spanId).toBe(providerSpanId(P, KEY, "root"));
     expect(root.parentSpanId).toBeUndefined();
-    expect(attr(root, "sentry.op")).toBe("orchestrator.run");
-    expect(attr(root, "sentry.description")).toBe("orchestrator.run feature");
+    expect(attr(root, "sentry.op")).toBe("example.run");
+    expect(attr(root, "sentry.description")).toBe("example.run feature");
     expect(step.spanId).toBe(providerSpanId(P, KEY, "step-1"));
     expect(step.parentSpanId).toBe(root.spanId);
     expect(decide.kind).toBe(3);
@@ -1119,30 +1116,22 @@ describe("trace providers", () => {
     expect(attr(verify, "error.type")).toBe("verify_failed");
     expect(subtask.spanId).toBe(providerSpanId(P, KEY, "subtask-ENG-8"));
     expect(subtask.parentSpanId).toBe(root.spanId);
-    for (const span of structure) expect(attr(span, "orchestrator.run_id")).toBe(KEY);
-    // Content capture is off: no content attributes and no error text.
-    expect(JSON.stringify(structure)).not.toContain(SECRETS.toolArg);
-    expect(JSON.stringify(structure)).not.toContain(SECRETS.toolError);
+    for (const span of structure) expect(attr(span, "example.run_id")).toBe(KEY);
   });
 
   it("sends a provider's content and error text only with content capture, scrubbed", async () => {
-    const { history, emit, tick, sent } = await setup({
-      settings: { captureContent: true },
-      providers: {
-        [P]: {
-          contexts: { [THREAD]: context() },
-          trace: () =>
-            trace(true, [
-              span("decision-1", {
-                content: { "gen_ai.input.messages": `${SECRETS.toolArg} ghp_abcdefghijklmnopqrstuvwxyz0123` },
-                status: "error",
-                errorType: "decide_failed",
-                errorMessage: SECRETS.toolError,
-              }),
-            ]),
-        },
-      },
-    });
+    const { history, emit, tick, sent, claim, report } = await setup({ settings: { captureContent: true } });
+    await claim({ [THREAD]: context() });
+    await report(
+      trace(true, [
+        span("decision-1", {
+          content: { "gen_ai.input.messages": `${SECRETS.toolArg} ghp_abcdefghijklmnopqrstuvwxyz0123` },
+          status: "error",
+          errorType: "decide_failed",
+          errorMessage: SECRETS.toolError,
+        }),
+      ]),
+    );
     history.turn();
     await emit("thread.idle");
     await tick();
@@ -1151,14 +1140,53 @@ describe("trace providers", () => {
     expect(decision.status).toEqual({ code: 2, message: SECRETS.toolError });
   });
 
+  it("neither keeps nor sends a provider's content while content capture is off", async () => {
+    const { bb, harness, history, emit, tick, sent, claim, report } = await setup();
+    await claim({ [THREAD]: context() });
+    await report(
+      trace(true, [
+        span("decision-1", {
+          content: { "gen_ai.input.messages": SECRETS.rationale },
+          status: "error",
+          errorType: "decide_failed",
+          errorMessage: PROVIDER_ERROR,
+        }),
+      ]),
+    );
+    const stored = await Promise.all((await bb.storage.kv.list()).map((key) => bb.storage.kv.get(key)));
+    expect(JSON.stringify(stored)).not.toContain(SECRETS.rationale);
+    expect(JSON.stringify(stored)).not.toContain(PROVIDER_ERROR);
+    // Turned on after the report: what was not kept is not sent either.
+    await harness.behavior.setSettings({ captureContent: true });
+    history.turn();
+    await emit("thread.idle");
+    await tick();
+    const decision = sent.at(-1)!.spans.find((span) => span.name === "decision-1")!;
+    expect(decision.status).toEqual({ code: 2, message: "decide_failed" });
+    expect(JSON.stringify(sent)).not.toContain(SECRETS.rationale);
+    expect(JSON.stringify(sent)).not.toContain(PROVIDER_ERROR);
+  });
+
+  it("drops content kept while capture was on when it is turned off before sending", async () => {
+    const { harness, history, emit, tick, sent, claim, report } = await setup({ settings: { captureContent: true } });
+    await claim({ [THREAD]: context() });
+    await report(trace(true, [span("decision-1", { content: { "gen_ai.input.messages": SECRETS.rationale } })]));
+    history.turn();
+    await harness.behavior.setSettings({ captureContent: false });
+    await emit("thread.idle");
+    await tick();
+    expect(sent.at(-1)!.spans.some((span) => span.name === "decision-1")).toBe(true);
+    expect(JSON.stringify(sent)).not.toContain(SECRETS.rationale);
+  });
+
   it("gives a turn that starts after the trace ended its own trace", async () => {
-    const contexts: Record<string, unknown> = { [THREAD]: context() };
-    const { bb, history, emit, spans } = await setup({ providers: { [P]: { contexts, trace: () => trace(false) } } });
+    const { bb, history, emit, spans, claim } = await setup();
+    await claim({ [THREAD]: context() });
     history.turn();
     await emit("thread.idle");
     // The trace ends during this turn: the turn still belongs to it.
     history.turn();
-    contexts[THREAD] = context({}, { endedAt: history.now });
+    await claim({ [THREAD]: context({}, { endedAt: history.now }) });
     await emit("thread.idle");
     // Days later, the user keeps chatting in the same thread.
     history.wait(60_000).turn();
@@ -1166,20 +1194,20 @@ describe("trace providers", () => {
 
     const agents = spans().filter((span) => span.name.startsWith("invoke_agent"));
     expect(agents.map((span) => span.traceId === providerTraceId(P, KEY))).toEqual([true, true, false]);
-    expect(must(agents[2], "third agent span").parentSpanId).toBeUndefined();
-    expect(attr(must(agents[2], "third agent span"), "bb.trace.provider")).toBeUndefined();
-    expect(attr(must(agents[2], "third agent span"), "orchestrator.run_id")).toBeUndefined();
+    const third = must(agents[2], "third agent span");
+    expect(third.parentSpanId).toBeUndefined();
+    expect(attr(third, "bb.trace.provider")).toBeUndefined();
+    expect(attr(third, "example.run_id")).toBeUndefined();
     // Still the same conversation.
-    expect(attr(must(agents[2], "third agent span"), "gen_ai.conversation.id")).toBe(THREAD);
+    expect(attr(third, "gen_ai.conversation.id")).toBe(THREAD);
     expect(await bb.storage.kv.list("trace:")).toEqual([`trace:${P}/${KEY}`]);
   });
 
-  it("sends the spans a provider says are final before the trace ends, each once", async () => {
-    let ended = false;
+  it("sends the spans a snapshot marks final before the trace ends, each once, at the next tick", async () => {
+    const { bb, history, emit, tick, sent, claim, report } = await setup();
+    await claim({ [THREAD]: context() });
     let spansNow: unknown[] = [span("decision-1", { final: true, op: "gen_ai.decide", kind: "client" })];
-    const { bb, history, emit, tick, sent } = await setup({
-      providers: { [P]: { contexts: { [THREAD]: context() }, trace: () => trace(ended, spansNow) } },
-    });
+    await report(trace(false, spansNow));
     history.turn();
     await emit("thread.idle");
     const before = sent.length;
@@ -1191,18 +1219,15 @@ describe("trace providers", () => {
     expect(names(early)).toEqual(["decision-1"]);
     expect(must(early[0], "decision span").parentSpanId).toBe(providerSpanId(P, KEY, "root"));
     expect(must(early[0], "decision span").traceId).toBe(providerTraceId(P, KEY));
-    // Nothing new: nothing is sent.
+    // Nothing new: nothing is sent, and the same snapshot is not read again.
     await tick();
     expect(sent).toHaveLength(before + 1);
 
     // A span that may still change waits for the end.
-    spansNow = [
-      ...spansNow,
-      span("step-1", { final: false }),
-      span("verify-1", { parentKey: "step-1", final: true }),
-    ];
-    const provider = (await bb.storage.kv.get(`trace:${P}/${KEY}`)) as { sentKeys: string[] };
-    expect(provider.sentKeys).toEqual(["decision-1"]);
+    spansNow = [...spansNow, span("step-1", { final: false }), span("verify-1", { parentKey: "step-1", final: true })];
+    await report(trace(false, spansNow));
+    const entry = (await bb.storage.kv.get(`trace:${P}/${KEY}`)) as { sentKeys: string[] };
+    expect(entry.sentKeys).toEqual(["decision-1"]);
     await tick();
     expect(sent).toHaveLength(before + 2);
     const second = must(sent.at(-1), "second request").spans;
@@ -1211,27 +1236,39 @@ describe("trace providers", () => {
     expect(must(second[0], "verify span").parentSpanId).toBe(providerSpanId(P, KEY, "step-1"));
 
     // At the end, the rest: the root and what was not final.
-    ended = true;
+    await report(trace(true, spansNow));
     await tick();
     expect(sent).toHaveLength(before + 3);
-    expect(names(must(sent.at(-1), "last request").spans)).toEqual(["orchestrator.run feature", "step-1"]);
+    expect(names(must(sent.at(-1), "last request").spans)).toEqual(["example.run feature", "step-1"]);
     expect(await bb.storage.kv.get(`trace:${P}/${KEY}`)).toMatchObject({ sentAt: expect.any(Number) as unknown });
+    // Reported again after it was sent: nothing goes twice.
+    await report(trace(true, spansNow));
     await tick();
     expect(sent).toHaveLength(before + 3);
   });
 
+  it("waits for a trace's first snapshot, however long, until the trace is old", async () => {
+    const { bb, history, emit, tick, sent, claim, report, clock } = await setup();
+    await claim({ [THREAD]: context() });
+    history.turn();
+    await emit("thread.idle");
+    const before = sent.length;
+    clock.now += 20 * 24 * 60 * 60_000;
+    await tick();
+    expect(sent).toHaveLength(before);
+    expect(await bb.storage.kv.get(`trace:${P}/${KEY}`)).toMatchObject({ sentAt: null });
+    await report(trace(true));
+    await tick();
+    expect(names(must(sent.at(-1), "request").spans)).toEqual(["example.run feature"]);
+  });
+
   it("never sends a root early, even one marked final", async () => {
-    const { history, emit, tick, sent } = await setup({
-      providers: {
-        [P]: {
-          contexts: { [THREAD]: context() },
-          trace: () => ({
-            key: KEY,
-            ended: false,
-            spans: [span("root", { parentKey: null, name: "orchestrator.run feature", final: true }), span("pick-1", { final: true })],
-          }),
-        },
-      },
+    const { history, emit, tick, sent, claim, report } = await setup();
+    await claim({ [THREAD]: context() });
+    await report({
+      key: KEY,
+      ended: false,
+      spans: [span("root", { parentKey: null, name: "example.run feature", final: true }), span("pick-1", { final: true })],
     });
     history.turn();
     await emit("thread.idle");
@@ -1242,11 +1279,9 @@ describe("trace providers", () => {
   });
 
   it("sends a trace still open after 30 days as it stands, its root marked open", async () => {
-    const { bb, history, emit, tick, sent, clock } = await setup({
-      providers: {
-        [P]: { contexts: { [THREAD]: context() }, trace: () => trace(false, [span("step-1")]) },
-      },
-    });
+    const { bb, history, emit, tick, sent, clock, claim, report } = await setup();
+    await claim({ [THREAD]: context() });
+    await report(trace(false, [span("step-1")]));
     history.turn();
     await emit("thread.idle");
     const before = sent.length;
@@ -1256,24 +1291,23 @@ describe("trace providers", () => {
     await tick();
     expect(sent).toHaveLength(before + 1);
     const structure = must(sent.at(-1), "request").spans;
-    expect(names(structure)).toEqual(["orchestrator.run feature", "step-1"]);
+    expect(names(structure)).toEqual(["example.run feature", "step-1"]);
     expect(attr(must(structure[0], "root span"), "bb.trace.state")).toBe("open");
     expect(attr(must(structure[1], "step span"), "bb.trace.state")).toBeUndefined();
     expect(await bb.storage.kv.get(`trace:${P}/${KEY}`)).toMatchObject({ sentAt: expect.any(Number) as unknown });
   });
 
-  it("gives a trace its provider deleted a root, then stops asking about it", async () => {
-    let gone = false;
-    const { bb, history, emit, tick, sent, rpc } = await setup({
-      providers: { [P]: { contexts: { [THREAD]: context() }, trace: () => (gone ? null : trace(false)) } },
-    });
+  it("gives a trace its provider deleted a root, once", async () => {
+    const { bb, history, emit, tick, sent, claim, report, reportDeleted } = await setup();
+    await claim({ [THREAD]: context() });
+    await report(trace(false));
     history.turn();
     await emit("thread.idle");
     const before = sent.length;
     // A trace that has not ended keeps its root waiting.
     await tick();
     expect(sent).toHaveLength(before);
-    gone = true;
+    await reportDeleted(KEY);
     await tick();
     expect(sent).toHaveLength(before + 1);
     expect(sent.at(-1)!.spans).toHaveLength(1);
@@ -1281,72 +1315,227 @@ describe("trace providers", () => {
     expect(root.spanId).toBe(providerSpanId(P, KEY, "root"));
     expect(root.traceId).toBe(providerTraceId(P, KEY));
     expect(attr(root, "bb.trace.state")).toBe("deleted");
-    expect(attr(root, "orchestrator.run_id")).toBe(KEY);
+    expect(attr(root, "example.run_id")).toBe(KEY);
     expect(await bb.storage.kv.get(`trace:${P}/${KEY}`)).toMatchObject({ sentAt: expect.any(Number) as unknown });
-    const asked = rpc.mock.calls.length;
     await tick();
-    expect(rpc.mock.calls.length).toBe(asked);
     expect(sent).toHaveLength(before + 1);
   });
 
-  it("asks providers in order and takes the first answer", async () => {
-    const { history, emit, spans, rpc } = await setup({
-      settings: { providers: "alpha, beta sentry-traces" },
-      providers: {
-        alpha: { contexts: {} },
-        beta: { contexts: { [THREAD]: { trace: { key: "b1" }, agent: { name: "Beta Agent" } } } },
-      },
-    });
+  it("drops a trace's snapshot with its entry, a day after it was sent", async () => {
+    const { bb, history, emit, tick, clock, claim, report } = await setup();
+    await claim({ [THREAD]: context() });
+    await report(trace(true, [span("step-1")]));
     history.turn();
     await emit("thread.idle");
-    // The plugin never asks itself.
-    expect(rpc.mock.calls.map(([call]) => call.pluginId)).toEqual(["alpha", "beta"]);
-    expect(must(spans()[0], "first span").traceId).toBe(providerTraceId("beta", "b1"));
-    expect(must(spans()[0], "first span").name).toBe("invoke_agent Beta Agent");
-    expect(attr(must(spans()[0], "first span"), "bb.trace.provider")).toBe("beta");
+    await tick();
+    expect(await bb.storage.kv.list("snapshot")).not.toEqual([]);
+    clock.now += 25 * 60 * 60_000;
+    await tick();
+    expect(await bb.storage.kv.list("trace:")).toEqual([]);
+    expect(await bb.storage.kv.list("snapshot")).toEqual([]);
+  });
+
+  describe("only takes reports from another plugin, on its contract", () => {
+    it("refuses the app, the CLI and agents", async () => {
+      const { bb, harness } = await setup();
+      const input = { contract: 2, threads: [{ threadId: THREAD, context: context() }] };
+      await expect(harness.behavior.callRpc("report_threads", input)).rejects.toMatchObject({ code: "forbidden" });
+      await expect(
+        harness.behavior.callRpc("report_trace", { contract: 2, trace: trace(true) }, { experimental_caller: { kind: "client" } }),
+      ).rejects.toMatchObject({ code: "forbidden" });
+      expect(await bb.storage.kv.list()).toEqual([]);
+    });
+
+    it("refuses itself", async () => {
+      const { bb, harness } = await setup();
+      const input = { contract: 2, threads: [{ threadId: THREAD, context: context() }] };
+      await expect(harness.behavior.callRpc("report_threads", input, asPlugin("sentry-traces"))).rejects.toMatchObject({
+        code: "forbidden",
+      });
+      expect(await bb.storage.kv.list("claim:")).toEqual([]);
+    });
+
+    it("refuses another contract version, naming the one it speaks", async () => {
+      const { bb, harness } = await setup();
+      const input = { contract: 1, threads: [{ threadId: THREAD, context: context() }] };
+      const refused = harness.behavior.callRpc("report_threads", input, asPlugin(P));
+      await expect(refused).rejects.toMatchObject({ code: "invalid" });
+      await expect(refused).rejects.toThrow(/contract 2/);
+      await expect(
+        harness.behavior.callRpc("report_trace", { contract: 3, trace: trace(true) }, asPlugin(P)),
+      ).rejects.toThrow(/contract 2/);
+      expect(await bb.storage.kv.list("claim:")).toEqual([]);
+    });
+
+    it("refuses a malformed report", async () => {
+      const { harness, history, emit, spans } = await setup();
+      const bad = { contract: 2, threads: [{ threadId: THREAD, context: { trace: { key: "" } } }] };
+      await expect(harness.behavior.callRpc("report_threads", bad, asPlugin(P))).rejects.toMatchObject({
+        code: "invalid_input",
+      });
+      await expect(
+        harness.behavior.callRpc("report_trace", { contract: 2 }, asPlugin(P)),
+      ).rejects.toMatchObject({ code: "invalid" });
+      history.turn();
+      await emit("thread.idle");
+      expect(must(spans()[0], "first span").parentSpanId).toBeUndefined();
+    });
+  });
+
+  describe("thread claims", () => {
+    it("keeps a thread with the provider that claimed it first, until that one lets go", async () => {
+      const { history, emit, spans, claim } = await setup();
+      expect((await claim({ [THREAD]: context() })).results).toEqual({ [THREAD]: "ok" });
+      expect((await claim({ [THREAD]: { trace: { key: "theirs" } } }, "other-provider")).results).toEqual({
+        [THREAD]: "conflict",
+      });
+      // Nor can the other one clear it.
+      expect((await claim({ [THREAD]: null }, "other-provider")).results).toEqual({ [THREAD]: "conflict" });
+      history.turn();
+      await emit("thread.idle");
+      expect(new Set(spans().map((span) => span.traceId))).toEqual(new Set([providerTraceId(P, KEY)]));
+
+      expect((await claim({ [THREAD]: null })).results).toEqual({ [THREAD]: "ok" });
+      expect((await claim({ [THREAD]: { trace: { key: "theirs" } } }, "other-provider")).results).toEqual({
+        [THREAD]: "ok",
+      });
+      const before = spans().length;
+      history.turn();
+      await emit("thread.idle");
+      const later = spans().slice(before);
+      expect(new Set(later.map((span) => span.traceId))).toEqual(new Set([providerTraceId("other-provider", "theirs")]));
+      expect(attr(must(later[0], "agent span"), "bb.trace.provider")).toBe("other-provider");
+    });
+
+    it("exports a thread whose claim was cleared on its own", async () => {
+      const { history, emit, spans, claim } = await setup();
+      await claim({ [THREAD]: context() });
+      history.turn();
+      await emit("thread.idle");
+      await claim({ [THREAD]: null });
+      const before = spans().length;
+      history.turn();
+      await emit("thread.idle");
+      const later = spans().slice(before);
+      expect(later.length).toBeGreaterThan(0);
+      expect(later.some((span) => attr(span, "bb.trace.provider") !== undefined)).toBe(false);
+    });
+
+    it("refuses a claim too large to keep, and keeps the others of the call", async () => {
+      const { claim } = await setup();
+      const attributes = Object.fromEntries(Array.from({ length: 64 }, (_, n) => [`example.a${n}`, "x".repeat(2_000)]));
+      const answer = await claim({
+        thr_big: { trace: { key: KEY, attributes }, attributes },
+        [THREAD]: context(),
+      });
+      expect(answer.results).toEqual({ thr_big: "invalid", [THREAD]: "ok" });
+    });
+
+    it("drops a deleted thread's claim", async () => {
+      const { bb, harness, claim } = await setup();
+      await claim({ [THREAD]: context() });
+      expect(await bb.storage.kv.list("claim:")).toEqual([`claim:${THREAD}`]);
+      await harness.behavior.emitThreadEvent("thread.deleted", {
+        thread: makeThreadResponse({ id: THREAD, providerId: "claude-code", projectId: "proj_1" }),
+      });
+      await vi.waitFor(async () => expect(await bb.storage.kv.list("claim:")).toEqual([]));
+    });
+
+    it("keeps a claim made while export is off, and sends from the turns after it is turned on", async () => {
+      const { harness, history, emit, spans, claim, clock } = await setup({ settings: { enabled: false } });
+      const answer = await claim({ [THREAD]: context({ agent: { name: "Lead" } }) });
+      expect(answer).toMatchObject({ sending: false, results: { [THREAD]: "ok" } });
+      history.turn();
+      await emit("thread.idle");
+      expect(spans()).toHaveLength(0);
+      await harness.behavior.setSettings({ enabled: true });
+      history.wait(clock.now - history.now + 1_000).turn();
+      await emit("thread.idle");
+      // Only the turn that finished after export was turned on, in the trace it was claimed for.
+      expect(turnIndexes(spans())).toEqual([2]);
+      expect(must(spans()[0], "agent span").name).toBe("invoke_agent Lead");
+      expect(new Set(spans().map((span) => span.traceId))).toEqual(new Set([providerTraceId(P, KEY)]));
+    });
+  });
+
+  describe("trace snapshots", () => {
+    it("keeps no snapshot while export is off, and says so", async () => {
+      const { bb, report } = await setup({ settings: { enabled: false } });
+      expect(await report(trace(true, [span("step-1")]))).toEqual({ contract: 2, sending: false });
+      expect(await bb.storage.kv.list("snapshot")).toEqual([]);
+    });
+
+    it("stores a large snapshot in parts and sends every span of it", async () => {
+      const { bb, history, emit, tick, sent, claim, report } = await setup();
+      await claim({ [THREAD]: context() });
+      const many = Array.from({ length: 1_500 }, (_, n) =>
+        span(`step-${n}`, { name: "example.step", attributes: { "example.note": "n".repeat(1_000), "example.n": n } }),
+      );
+      await report(trace(false, many));
+      const parts = await bb.storage.kv.list("snapshot-part:");
+      expect(parts.length).toBeGreaterThan(4);
+      // A newer report replaces the parts of the one before.
+      await report(trace(true, many));
+      expect(await bb.storage.kv.list("snapshot-part:")).toHaveLength(parts.length);
+      expect(await bb.storage.kv.list("snapshot-part:")).not.toEqual(parts);
+      history.turn();
+      await emit("thread.idle");
+      await tick();
+      const steps = sent.flatMap((request) => request.spans).filter((span) => span.name === "example.step");
+      expect(steps).toHaveLength(many.length);
+      expect(new Set(steps.map((span) => attr(span, "example.n"))).size).toBe(many.length);
+    });
+
+    it("refuses a snapshot larger than 4 MB, or with a span larger than one stored value", async () => {
+      const { bb, report } = await setup();
+      const big = Array.from({ length: 1_000 }, (_, n) => span(`s${n}`, { attributes: { "example.note": "b".repeat(5_000) } }));
+      await expect(report(trace(true, big))).rejects.toMatchObject({ code: "invalid" });
+      await expect(report(trace(true, big))).rejects.toThrow(/4 MB/);
+      const wide = Object.fromEntries(Array.from({ length: 64 }, (_, n) => [`example.c${n}`, "w".repeat(8_000)]));
+      await expect(
+        report({ ...trace(true, [span("wide", { content: wide })]) }),
+      ).resolves.toMatchObject({ sending: true });
+      expect(await bb.storage.kv.list("snapshot")).not.toEqual([]);
+    });
+
+    it("refuses a span larger than one stored value with content capture on", async () => {
+      const { report } = await setup({ settings: { captureContent: true } });
+      const wide = Object.fromEntries(Array.from({ length: 64 }, (_, n) => [`example.c${n}`, "w".repeat(8_000)]));
+      await expect(report(trace(true, [span("wide", { content: wide })]))).rejects.toThrow(/span wide is larger/);
+    });
+
+    it("refuses a trace with more spans than the limit", async () => {
+      const { harness, history, emit, tick, sent, claim } = await setup();
+      await claim({ [THREAD]: context() });
+      const input = { contract: 2, trace: trace(true, Array.from({ length: 2_001 }, (_, index) => span(`s${index}`))) };
+      await expect(harness.behavior.callRpc("report_trace", input, asPlugin(P))).rejects.toMatchObject({
+        code: "invalid_input",
+      });
+      history.turn();
+      await emit("thread.idle");
+      const before = sent.length;
+      await tick();
+      expect(sent).toHaveLength(before);
+    });
   });
 
   describe("does not trust what a provider sends", () => {
-    it("ignores a provider that speaks another contract version", async () => {
-      const { history, emit, spans } = await setup({
-        providers: { [P]: { contract: 2, contexts: { [THREAD]: context() } } },
-      });
-      history.turn();
-      await emit("thread.idle");
-      expect(must(spans()[0], "first span").parentSpanId).toBeUndefined();
-      expect(attr(must(spans()[0], "first span"), "bb.trace.provider")).toBeUndefined();
-    });
-
-    it("ignores a malformed answer", async () => {
-      const { history, emit, spans } = await setup({
-        providers: { [P]: { contexts: { [THREAD]: { trace: { key: "" } } } } },
-      });
-      history.turn();
-      await emit("thread.idle");
-      expect(must(spans()[0], "first span").parentSpanId).toBeUndefined();
-    });
-
     it("drops attributes that are reserved, not scalar or badly named, and keeps its own", async () => {
-      const { history, emit, spans } = await setup({
-        providers: {
-          [P]: {
-            contexts: {
-              [THREAD]: context({
-                attributes: {
-                  "sentry.op": "evil",
-                  "gen_ai.conversation.id": "someone-else",
-                  "bb.thread.id": "thr_other",
-                  "bb.provider.id": "evil-provider",
-                  "bad key": "x",
-                  nested: { a: 1 },
-                  list: [1, 2],
-                  long: "y".repeat(5_000),
-                  ok: 7,
-                },
-              }),
-            },
+      const { history, emit, spans, claim } = await setup();
+      await claim({
+        [THREAD]: context({
+          attributes: {
+            "sentry.op": "evil",
+            "gen_ai.conversation.id": "someone-else",
+            "bb.thread.id": "thr_other",
+            "bb.provider.id": "evil-provider",
+            "bad key": "x",
+            nested: { a: 1 },
+            list: [1, 2],
+            long: "y".repeat(5_000),
+            ok: 7,
           },
-        },
+        }),
       });
       history.turn();
       await emit("thread.idle");
@@ -1364,17 +1553,12 @@ describe("trace providers", () => {
     });
 
     it("gives a trace without a root one, and keeps the first of two spans with one key", async () => {
-      const { history, emit, tick, sent } = await setup({
-        providers: {
-          [P]: {
-            contexts: { [THREAD]: context() },
-            trace: () => ({
-              key: KEY,
-              ended: true,
-              spans: [span("a", { name: "first" }), span("a", { name: "second" }), span("b", { parentKey: "a" })],
-            }),
-          },
-        },
+      const { history, emit, tick, sent, claim, report } = await setup();
+      await claim({ [THREAD]: context() });
+      await report({
+        key: KEY,
+        ended: true,
+        spans: [span("a", { name: "first" }), span("a", { name: "second" }), span("b", { parentKey: "a" })],
       });
       history.turn();
       await emit("thread.idle");
@@ -1388,233 +1572,32 @@ describe("trace providers", () => {
       expect(second.parentSpanId).toBe(root.spanId);
       expect(third.parentSpanId).toBe(second.spanId);
     });
-
-    it("refuses a trace with more spans than the limit", async () => {
-      const { history, emit, tick, sent } = await setup({
-        providers: {
-          [P]: {
-            contexts: { [THREAD]: context() },
-            trace: () => trace(true, Array.from({ length: 2_001 }, (_, index) => span(`s${index}`))),
-          },
-        },
-      });
-      history.turn();
-      await emit("thread.idle");
-      const before = sent.length;
-      await tick();
-      expect(sent).toHaveLength(before);
-    });
-  });
-
-  it("waits out a provider that stops answering instead of moving its thread out of its trace", async () => {
-    const orchestrator = { contexts: { [THREAD]: { trace: { key: KEY } } } };
-    const providers: Record<string, typeof orchestrator> = { [P]: orchestrator };
-    const { history, emit, tick, clock, spans } = await setup({ providers });
-    history.turn();
-    await emit("thread.idle");
-    const traceId = providerTraceId(P, KEY);
-    expect(new Set(spans().map((span) => span.traceId))).toEqual(new Set([traceId]));
-
-    // The provider reloads and misses one call.
-    delete providers[P];
-    history.turn();
-    await emit("thread.idle");
-    const before = spans().length;
-    providers[P] = orchestrator;
-    clock.now += 6 * 60_000;
-    await tick();
-    const later = spans().slice(before);
-    expect(later.length).toBeGreaterThan(0);
-    expect(new Set(later.map((span) => span.traceId))).toEqual(new Set([traceId]));
-    expect(later.some((span) => attr(span, "bb.turn.index") === 2)).toBe(true);
-  });
-
-  it("takes a provider that stays gone to be gone, and exports on its own", async () => {
-    const orchestrator = { contexts: { [THREAD]: { trace: { key: KEY } } } };
-    const providers: Record<string, typeof orchestrator> = { [P]: orchestrator };
-    const { history, emit, tick, clock, spans } = await setup({ providers });
-    history.turn();
-    await emit("thread.idle");
-    delete providers[P];
-    history.turn();
-    await emit("thread.idle");
-    const before = spans().length;
-    for (let step = 0; step < 8; step++) {
-      clock.now += 6 * 60_000;
-      await tick();
-    }
-    const later = spans().slice(before);
-    expect(later.length).toBeGreaterThan(0);
-    expect(later.some((span) => span.traceId === providerTraceId(P, KEY))).toBe(false);
-  });
-
-  it("keeps a new thread's first turn when its export waits on a provider", async () => {
-    const orchestrator = { contexts: { [THREAD]: { trace: { key: KEY } } } };
-    const providers: Record<string, typeof orchestrator> = { [P]: orchestrator };
-    const { histories, history, emit, tick, clock, spans } = await setup({ providers });
-    history.turn();
-    await emit("thread.idle");
-    const before = spans().length;
-
-    // A thread this plugin has stored nothing for, while the provider reloads.
-    const other = (histories['thr_two'] = new History());
-    delete providers[P];
-    other.turn();
-    await emit("thread.idle", "thr_two");
-    other.turn();
-    await emit("thread.idle", "thr_two");
-    expect(spans()).toHaveLength(before);
-
-    providers[P] = orchestrator;
-    clock.now += 6 * 60_000;
-    await tick();
-    const sent = spans().slice(before).filter((span) => span.name.startsWith("invoke_agent"));
-    expect(sent.map((span) => attr(span, "bb.turn.index"))).toEqual([1, 2]);
-  });
-
-  it("exports at once when a provider answers with something it cannot read", async () => {
-    const orchestrator: { contexts: Record<string, unknown>; contract?: number } = {
-      contexts: { [THREAD]: { trace: { key: KEY } } },
-    };
-    const { history, emit, spans } = await setup({ providers: { [P]: orchestrator } });
-    history.turn();
-    await emit("thread.idle");
-    const before = spans().length;
-    orchestrator.contract = 2;
-    history.turn();
-    await emit("thread.idle");
-    const later = spans().slice(before);
-    expect(later.length).toBeGreaterThan(0);
-    expect(later.some((span) => span.traceId === providerTraceId(P, KEY))).toBe(false);
-  });
-
-  it("keeps placing a provider's threads after one of its answers cannot be read", async () => {
-    const { history, emit, tick, spans } = await setup({
-      providers: {
-        [P]: {
-          contexts: { [THREAD]: { trace: { key: KEY } } },
-          // Not a list of spans: an answer this plugin cannot read.
-          trace: () => ({ key: KEY, ended: true, spans: "too many" }),
-        },
-      },
-    });
-    history.turn();
-    await emit("thread.idle");
-    await tick();
-    const before = spans().length;
-    history.turn();
-    await emit("thread.idle");
-    const later = spans().slice(before);
-    expect(later.length).toBeGreaterThan(0);
-    expect(later.every(inTrace)).toBe(true);
-  });
-
-  it("does not wait for a provider that never gave a readable answer", async () => {
-    const orchestrator = { contract: 2, contexts: { [THREAD]: { trace: { key: KEY } } } };
-    const providers: Record<string, typeof orchestrator> = { [P]: orchestrator };
-    const { history, emit, clock, spans } = await setup({ providers });
-    history.turn();
-    await emit("thread.idle");
-    expect(spans().some(inTrace)).toBe(false);
-    const before = spans().length;
-
-    delete providers[P];
-    clock.now += 6 * 60_000;
-    history.turn();
-    await emit("thread.idle");
-    expect(spans().length).toBeGreaterThan(before);
-  });
-
-  it("backs off for five minutes from when a slow call failed, not from when it began", async () => {
-    const { history, emit, clock, rpc } = await setup({ settings: { providers: P } });
-    rpc.mockImplementationOnce(async () => {
-      clock.now += 60_000;
-      throw new Error("timed out");
-    });
-    history.turn();
-    await emit("thread.idle");
-    expect(rpc).toHaveBeenCalledTimes(1);
-    // Five and a half minutes after the call began, four and a half after it failed.
-    clock.now += 4.5 * 60_000;
-    history.turn();
-    await emit("thread.idle");
-    expect(rpc).toHaveBeenCalledTimes(1);
-  });
-
-  it("asks a provider on another contract once, not once for every thread", async () => {
-    const { histories, emit, rpc, spans } = await setup({
-      providers: { [P]: { contract: 2, contexts: { [THREAD]: { trace: { key: KEY } } } } },
-    });
-    for (const id of [THREAD, "thr_two", "thr_three"]) {
-      histories[id] ??= new History();
-      must(histories[id], id).turn();
-      await emit("thread.idle", id);
-    }
-    expect(rpc).toHaveBeenCalledTimes(1);
-    expect(turnIndexes(spans())).toEqual([1, 1, 1]);
-  });
-
-  it("keeps placing a provider's threads after an answer of its with no contract at all", async () => {
-    const { history, emit, tick, rpc, spans } = await setup({
-      providers: { [P]: { contexts: { [THREAD]: { trace: { key: KEY } } } } },
-    });
-    history.turn();
-    await emit("thread.idle");
-    // The trace's own spans are asked for at the tick: a broken answer to that one question.
-    rpc.mockImplementationOnce(async () => null as never);
-    await tick();
-    const before = spans().length;
-    history.turn();
-    await emit("thread.idle");
-    const later = spans().slice(before);
-    expect(later.length).toBeGreaterThan(0);
-    expect(later.every(inTrace)).toBe(true);
-  });
-
-  it("asks a provider again right after its back-off, however long its call took to fail", async () => {
-    const { bb, history, emit, tick, clock, rpc, spans } = await setup({
-      providers: { [P]: { contexts: { [THREAD]: { trace: { key: KEY } } } } },
-    });
-    history.turn();
-    await emit("thread.idle");
-    const before = spans().length;
-    rpc.mockImplementationOnce(async () => {
-      clock.now += 60_000;
-      throw new Error("timed out");
-    });
-    history.turn();
-    await emit("thread.idle");
-    expect(spans()).toHaveLength(before);
-    const retry = (await bb.storage.kv.get(`retry:${THREAD}`)) as { nextAt: number };
-    expect(retry.nextAt).toBeGreaterThan(clock.now + 5 * 60_000);
-    clock.now = retry.nextAt;
-    await tick();
-    const later = spans().slice(before);
-    expect(later.length).toBeGreaterThan(0);
-    expect(later.every(inTrace)).toBe(true);
   });
 });
 
-describe("the Orchestrator's real answers", () => {
-  // Captured from the Orchestrator plugin's own test world, unedited: an open
-  // task-loop run with a Jev decision, one dispatched attempt, two model picks
-  // and a verify.
-  const real = JSON.parse(
-    readFileSync(new URL("./fixtures/orchestrator-telemetry.json", import.meta.url), "utf8"),
-  ) as {
+describe("a provider's recorded reports", () => {
+  // What a provider reported for an open task-loop run with a model decision,
+  // one dispatched attempt, two model picks and a verify, its names made neutral.
+  const real = JSON.parse(readFileSync(new URL("./fixtures/provider-reports.json", import.meta.url), "utf8")) as {
     coordinatorThreadId: string;
     workerThreadId: string;
     scriptName: string;
-    contexts: { contexts: Record<string, { trace: { key: string } } | null> };
-    trace: { trace: { key: string; spans: Array<{ key: string; name: string; op: string; final?: boolean }> } };
+    report_threads: { contract: number; threads: Array<{ threadId: string; context: unknown }> };
+    report_trace: {
+      contract: number;
+      trace: { key: string; spans: Array<{ key: string; name: string; op: string; final?: boolean }> };
+    };
   };
-  const KEY = real.trace.trace.key;
+  const KEY = real.report_trace.trace.key;
+  const send = async (harness: Awaited<ReturnType<typeof setup>>["harness"], trace = real.report_trace) => {
+    await harness.behavior.callRpc("report_threads", real.report_threads, asPlugin(P));
+    await harness.behavior.callRpc("report_trace", trace, asPlugin(P));
+  };
 
-  it("send the run's Jev decision, picks and verify while the run is still open", async () => {
+  it("send the run's decision, picks and verify while the run is still open", async () => {
     const coordinator = real.coordinatorThreadId;
-    const { histories, emit, tick, sent } = await setup({
-      providers: { [P]: { contexts: real.contexts.contexts, trace: () => real.trace.trace } },
-    });
+    const { harness, histories, emit, tick, sent } = await setup();
+    await send(harness);
     histories[coordinator] = new History();
     must(histories[coordinator], coordinator).turn();
     await emit("thread.idle", coordinator);
@@ -1623,24 +1606,24 @@ describe("the Orchestrator's real answers", () => {
     expect(sent).toHaveLength(before + 1);
     const early = must(sent.at(-1), "early request").spans;
     expect(early.map((span) => attr(span, "sentry.op")).sort((a, b) => String(a).localeCompare(String(b)))).toEqual([
+      "example.pick",
+      "example.pick",
+      "example.verify",
       "gen_ai.decide",
-      "orchestrator.pick",
-      "orchestrator.pick",
-      "orchestrator.verify",
     ]);
     const decide = must(
       early.find((span) => attr(span, "sentry.op") === "gen_ai.decide"),
       "decide span",
     );
     expect(decide.kind).toBe(3);
-    expect(attr(decide, "gen_ai.request.model")).toBe("jev-test");
+    expect(attr(decide, "gen_ai.request.model")).toBe("decider-test");
     expect(attr(decide, "gen_ai.usage.input_tokens")).toBe(120);
   });
 
   it("are accepted as they are, and place a run's threads and workflow", async () => {
     const coordinator = real.coordinatorThreadId;
     const worker = real.workerThreadId;
-    const { histories, emit, tick, spans, sent, clock } = await setup({
+    const { harness, histories, emit, tick, spans, sent, clock } = await setup({
       threads: { [worker]: { originPluginId: "workflows", lifecycleOwnerThreadId: coordinator } },
       workflows: {
         metadata: { [worker]: { workflowWorker: 1, runId: "wf_real", callId: "call_0", originThreadId: coordinator } },
@@ -1670,14 +1653,9 @@ describe("the Orchestrator's real answers", () => {
           finishedAt: 1_800_000_030_000,
         }),
       },
-      providers: {
-        [P]: {
-          contexts: real.contexts.contexts,
-          // The captured run was still open; say it ended so its spans are sent.
-          trace: () => ({ ...real.trace.trace, ended: true }),
-        },
-      },
     });
+    // The recorded run was still open; say it ended so its spans are sent.
+    await send(harness, { ...real.report_trace, trace: { ...real.report_trace.trace, ended: true } as never });
     for (const id of [coordinator, worker]) {
       histories[id] = new History();
       must(histories[id], id).turn();
@@ -1690,19 +1668,19 @@ describe("the Orchestrator's real answers", () => {
     expect(lead.name).toBe("invoke_agent Coordinator");
     expect(attr(lead, "bb.agent.id")).toBe("coordinator");
     expect(lead.parentSpanId).toBe(providerSpanId(P, KEY, "root"));
-    expect(attr(lead, "orchestrator.role")).toBe("coordinator");
-    // The Orchestrator has no answer for the worker; it joins through the coordinator.
+    expect(attr(lead, "example.role")).toBe("coordinator");
+    // The provider did not claim the worker; it joins through the coordinator.
     expect(developer.traceId).toBe(providerTraceId(P, KEY));
     expect(developer.parentSpanId).toBe(workflowCallSpanId("wf_real", "call_0"));
-    expect(attr(developer, "orchestrator.run_id")).toBe(KEY);
+    expect(attr(developer, "example.run_id")).toBe(KEY);
     expect(attr(developer, "gen_ai.pipeline.name")).toBe("task-loop");
 
     clock.now = 1_800_000_030_000 + 1_000;
     await tick();
     const sentNames = sent.flatMap((request) => names(request.spans));
-    for (const span of real.trace.trace.spans) expect(sentNames).toContain(span.name);
+    for (const span of real.report_trace.trace.spans) expect(sentNames).toContain(span.name);
     // The workflow run hangs under the step whose compiled script it ran.
-    const step = real.trace.trace.spans.find((span) => span.name.startsWith("orchestrator.step"))!;
+    const step = real.report_trace.trace.spans.find((span) => span.name.startsWith("example.step"))!;
     const workflow = sent.flatMap((request) => request.spans).find((span) => span.name.startsWith("invoke_workflow"))!;
     expect(workflow.parentSpanId).toBe(providerSpanId(P, KEY, step.key));
   });
@@ -1970,12 +1948,10 @@ describe("workflow runs", () => {
   });
 
   describe("inside a provider's trace", () => {
-    const P = "orchestrator";
-    const KEY = "run_42";
     const origin = (extra: Record<string, unknown> = {}) => ({
-      trace: { key: KEY, pipeline: "feature", attributes: { "orchestrator.run_id": KEY } },
+      trace: { key: KEY, pipeline: "feature", attributes: { "example.run_id": KEY } },
       agent: { id: "coordinator", name: "Lead" },
-      attributes: { "orchestrator.role": "coordinator" },
+      attributes: { "example.role": "coordinator" },
       ...extra,
     });
     const span = (key: string, extra: Record<string, unknown> = {}) => ({
@@ -1989,13 +1965,13 @@ describe("workflow runs", () => {
     const trace = (spans: unknown[]) => ({ key: KEY, ended: false, spans: [span("root"), ...spans] });
 
     it("joins the trace through the thread that started the workflow", async () => {
-      let spans_: unknown[] = [span("step-1")];
-      const { histories, emit, tick, spans, sent, clock, rpc } = await setup({
+      const { histories, emit, tick, spans, sent, clock, claim, report } = await setup({
         threads,
         workflows: { metadata, view: () => view("succeeded") },
-        // The provider knows the thread that started the workflow, not its workers.
-        providers: { [P]: { contexts: { [THREAD]: origin() }, trace: () => trace(spans_) } },
       });
+      // The provider claims the thread that started the workflow, not its workers.
+      await claim({ [THREAD]: origin() });
+      await report(trace([span("step-1")]));
       histories['thr_w1'] = new History();
       must(histories['thr_w1'], "thr_w1").turn();
       await emit("thread.idle", "thr_w1");
@@ -2004,66 +1980,39 @@ describe("workflow runs", () => {
       expect(agent.traceId).toBe(providerTraceId(P, KEY));
       // The worker's place is its workflow call.
       expect(agent.parentSpanId).toBe(workflowCallSpanId(WF, "call_0"));
-      expect(attr(agent, "orchestrator.run_id")).toBe(KEY);
+      expect(attr(agent, "example.run_id")).toBe(KEY);
       // It takes the trace from the origin thread, not that thread's agent or attributes.
       expect(agent.name).toBe("invoke_agent claude-code");
       expect(attr(agent, "bb.agent.id")).toBeUndefined();
-      expect(attr(agent, "orchestrator.role")).toBeUndefined();
+      expect(attr(agent, "example.role")).toBeUndefined();
       // Inside a trace that names a pipeline, that is the pipeline.
       expect(attr(agent, "gen_ai.pipeline.name")).toBe("feature");
       expect(attr(agent, "bb.workflow.name")).toBe("review-changes");
-
-      // The provider is told what Workflows knows about the worker, and asked about the origin too.
-      const asked = rpc.mock.calls.find(([call]) => call.method === "telemetry_thread_context")!;
-      expect((asked[0] as { input: unknown }).input).toEqual({
-        contract: 1,
-        threads: [
-          {
-            threadId: "thr_w1",
-            workflow: {
-              runId: WF,
-              name: "review-changes",
-              callId: "call_0",
-              callIndex: 0,
-              originThreadId: THREAD,
-              phase: SECRETS.phaseTitle,
-              provider: "claude-code",
-              model: "claude-sonnet-5-5",
-              reasoningLevel: "medium",
-            },
-          },
-          { threadId: THREAD },
-        ],
-      });
 
       // The workflow just finished and no span of the trace names it yet: wait for that link.
       clock.now = 1_800_000_030_000 + 60_000;
       const before = sent.length;
       await tick();
       expect(sent).toHaveLength(before);
-      spans_ = [span("step-1", { workflowRunId: WF })];
+      await report(trace([span("step-1", { workflowRunId: WF })]));
       await tick();
       expect(sent).toHaveLength(before + 1);
       const root = must(sent.at(-1)?.spans[0], "root span");
       expect(root.name).toBe("invoke_workflow review-changes");
       expect(root.traceId).toBe(providerTraceId(P, KEY));
       expect(root.parentSpanId).toBe(providerSpanId(P, KEY, "step-1"));
-      expect(attr(root, "orchestrator.run_id")).toBe(KEY);
+      expect(attr(root, "example.run_id")).toBe(KEY);
       expect(attr(root, "gen_ai.pipeline.name")).toBe("feature");
     });
 
     it("hangs the workflow under a span that names its script, without waiting", async () => {
-      const { histories, emit, tick, sent, clock } = await setup({
+      const { histories, emit, tick, sent, clock, claim, report } = await setup({
         threads,
         workflows: { metadata, view: () => view("succeeded") },
-        providers: {
-          [P]: {
-            contexts: { [THREAD]: origin() },
-            // A provider that compiles the script knows its name before the run has an id.
-            trace: () => trace([span("step-1", { workflowName: "review-changes" })]),
-          },
-        },
       });
+      await claim({ [THREAD]: origin() });
+      // A provider that writes the script knows its name before the run has an id.
+      await report(trace([span("step-1", { workflowName: "review-changes" })]));
       histories['thr_w1'] = new History();
       must(histories['thr_w1'], "thr_w1").turn();
       await emit("thread.idle", "thr_w1");
@@ -2074,16 +2023,12 @@ describe("workflow runs", () => {
     });
 
     it("hangs the workflow where its origin thread hangs when no span ever names it", async () => {
-      const { histories, emit, tick, sent, clock } = await setup({
+      const { histories, emit, tick, sent, clock, claim, report } = await setup({
         threads,
         workflows: { metadata, view: () => view("succeeded") },
-        providers: {
-          [P]: {
-            contexts: { [THREAD]: origin({ parent: "subtask-ENG-8" }) },
-            trace: () => trace([span("subtask-ENG-8")]),
-          },
-        },
       });
+      await claim({ [THREAD]: origin({ parent: "subtask-ENG-8" }) });
+      await report(trace([span("subtask-ENG-8")]));
       histories['thr_w1'] = new History();
       must(histories['thr_w1'], "thr_w1").turn();
       await emit("thread.idle", "thr_w1");
@@ -2093,55 +2038,36 @@ describe("workflow runs", () => {
       expect(root.parentSpanId).toBe(providerSpanId(P, KEY, "subtask-ENG-8"));
     });
 
-    it("waits for a provider that did not answer rather than placing the workflow for good", async () => {
-      let down = false;
-      const { histories, emit, tick, sent, clock } = await setup({
+    it("waits for the trace's first snapshot rather than placing the workflow for good", async () => {
+      const { histories, emit, tick, sent, clock, claim, report } = await setup({
         threads,
         workflows: { metadata, view: () => view("succeeded") },
-        providers: {
-          [P]: {
-            contexts: { [THREAD]: origin({ parent: "subtask-ENG-8" }) },
-            trace: () => {
-              if (down) throw new Error("busy");
-              return trace([span("step-1", { workflowRunId: WF })]);
-            },
-          },
-        },
       });
+      await claim({ [THREAD]: origin({ parent: "subtask-ENG-8" }) });
       histories['thr_w1'] = new History();
       must(histories['thr_w1'], "thr_w1").turn();
       await emit("thread.idle", "thr_w1");
-      const before = sent.length;
-      down = true;
+      const workflowRoots = () =>
+        sent.flatMap((request) => request.spans).filter((span) => span.name.startsWith("invoke_workflow"));
+      clock.now = 1_800_000_030_000 + 60_000;
       await tick();
-      expect(sent.slice(before).flatMap((request) => request.spans).map((span) => span.name)).not.toContainEqual(
-        expect.stringMatching(/^invoke_workflow/),
-      );
-      down = false;
-      clock.now += 6 * 60_000;
+      expect(workflowRoots()).toEqual([]);
+      await report(trace([span("step-1", { workflowRunId: WF })]));
       await tick();
-      const root = sent.flatMap((request) => request.spans).find((span) => span.name.startsWith("invoke_workflow"))!;
-      expect(root.parentSpanId).toBe(providerSpanId(P, KEY, "step-1"));
+      expect(must(workflowRoots()[0], "workflow root").parentSpanId).toBe(providerSpanId(P, KEY, "step-1"));
     });
 
-    it("names a worker after the agent its provider gives it", async () => {
-      const { histories, emit, tick, spans, sent, clock } = await setup({
+    it("names a worker after the agent its provider claims it as", async () => {
+      const { histories, emit, tick, spans, sent, clock, claim, report } = await setup({
         threads,
         workflows: { metadata, view: () => view("succeeded") },
-        providers: {
-          [P]: {
-            contexts: {
-              [THREAD]: origin(),
-              // The provider can name the worker itself, from what it was told about its call.
-              thr_w1: {
-                trace: { key: KEY, pipeline: "feature" },
-                agent: { id: "developer", name: "Senior Dev" },
-              },
-            },
-            trace: () => trace([span("step-1", { workflowRunId: WF })]),
-          },
-        },
       });
+      await claim({
+        [THREAD]: origin(),
+        // The provider can claim the worker itself, to name its agent.
+        thr_w1: { trace: { key: KEY, pipeline: "feature" }, agent: { id: "developer", name: "Senior Dev" } },
+      });
+      await report(trace([span("step-1", { workflowRunId: WF })]));
       histories['thr_w1'] = new History();
       must(histories['thr_w1'], "thr_w1").turn();
       await emit("thread.idle", "thr_w1");
@@ -2159,6 +2085,49 @@ describe("workflow runs", () => {
       const calls = sent.at(-1)!.spans.filter((span) => span.name.startsWith("workflow.call"));
       expect(calls.map((span) => attr(span, "bb.agent.id"))).toEqual(["developer", undefined, undefined]);
       expect(attr(must(calls[0], "first call span"), "bb.agent.name")).toBe("Senior Dev");
+    });
+  });
+
+  describe("with Workflows disabled or removed", () => {
+    const quietly = async (options: Setup) => {
+      const ctx = await setup(options);
+      await ctx.claim({ [THREAD]: { trace: { key: KEY } } });
+      for (const id of WORKERS) ctx.histories[id] = new History();
+      for (let round = 0; round < 3; round++) {
+        for (const id of WORKERS) {
+          must(ctx.histories[id], id).turn();
+          await ctx.emit("thread.idle", id);
+        }
+        ctx.clock.now += 6 * 60_000;
+        await ctx.tick();
+      }
+      return ctx;
+    };
+    const expectOwnTraces = async (ctx: Awaited<ReturnType<typeof quietly>>) => {
+      const agents = ctx.spans().filter((span) => span.name.startsWith("invoke_agent"));
+      // Every turn went out when its thread went idle, each as its own trace.
+      expect(agents).toHaveLength(6);
+      expect(new Set(agents.map((span) => span.traceId)).size).toBe(6);
+      for (const span of ctx.spans()) {
+        expect(span.traceId).not.toBe(workflowTraceId(WF));
+        expect(span.traceId).not.toBe(providerTraceId(P, KEY));
+        expect(attr(span, "bb.workflow.run_id")).toBeUndefined();
+      }
+      expect(await ctx.bb.storage.kv.list("workflow:")).toEqual([]);
+      expect(await ctx.bb.storage.kv.list("retry:")).toEqual([]);
+      const logs = ctx.harness.inspection.logEntries;
+      expect(logs.filter((entry) => entry.level === "warn" || entry.level === "error")).toEqual([]);
+      // Said once, not once for every worker or every tick.
+      expect(logs.filter((entry) => entry.message.includes("Workflows")).length).toBeLessThanOrEqual(1);
+    };
+
+    it("exports workers as their own threads when Workflows does not answer", async () => {
+      // The metadata is still in bb's thread record; the plugin that answers for it is gone.
+      await expectOwnTraces(await quietly({ threads, workflows: { metadata, view: () => { throw new Error("no such plugin"); } } }));
+    });
+
+    it("exports workers as their own threads when their Workflows metadata cannot be read", async () => {
+      await expectOwnTraces(await quietly({ threads, metadataFails: true }));
     });
   });
 });
@@ -2267,22 +2236,43 @@ describe("bb sentry-traces", () => {
     expect(unknown.stderr).toContain("No thread with id thr_missing");
   });
 
-  it("export says when a provider did not answer, rather than showing a placement as final", async () => {
-    const orchestrator = { contexts: { [THREAD]: { trace: { key: KEY } } } };
-    const providers: Record<string, typeof orchestrator> = { [P]: orchestrator };
-    const { harness, history, emit } = await setup({ providers });
+  it("export shows the provider trace a claim puts the thread in", async () => {
+    const { harness, history, claim } = await setup();
+    await claim({ [THREAD]: { trace: { key: KEY } } });
+    history.turn();
+    const summary = await harness.behavior.runCli(["export", THREAD, "--summary"]);
+    expect(summary.stdout).toContain(`${P} trace ${KEY}`);
+    expect(summary.stderr).toBe("");
+  });
+
+  it("status lists the providers that reported lately, with their threads and open traces", async () => {
+    const { harness, clock, claim, report } = await setup();
+    const none = await harness.behavior.runCli(["status"]);
+    expect(none.stdout).toContain("Trace providers: none reported in the last 30 days");
+    await claim({ thr_a: { trace: { key: KEY } }, thr_b: { trace: { key: KEY } } });
+    await report({ key: KEY, ended: false, spans: [] });
+    await claim({ thr_c: { trace: { key: "other" } } }, "other-provider");
+    clock.now += 2 * 60 * 60_000;
+    const text = await harness.behavior.runCli(["status"]);
+    expect(text.stdout).toContain(`Trace provider ${P}: 2 threads claimed, 1 traces open, last report 2h ago`);
+    expect(text.stdout).toContain("Trace provider other-provider: 1 threads claimed, 0 traces open");
+    const json = JSON.parse((await harness.behavior.runCli(["status", "--json"])).stdout) as { providers: unknown };
+    expect(json.providers).toEqual([
+      { provider: P, claimedThreads: 2, openTraces: 1, lastReportAt: clock.now - 2 * 60 * 60_000 },
+      { provider: "other-provider", claimedThreads: 1, openTraces: 0, lastReportAt: clock.now - 2 * 60 * 60_000 },
+    ]);
+    // A provider not heard from in 30 days is not listed.
+    clock.now += 31 * 24 * 60 * 60_000;
+    expect((await harness.behavior.runCli(["status"])).stdout).toContain("Trace providers: none reported");
+  });
+
+  it("loads and exports with a providers setting left from an older version", async () => {
+    const { harness, history, emit, spans, rpc } = await setup({ settings: { providers: "example-provider" } });
     history.turn();
     await emit("thread.idle");
-    delete providers[P];
-    const failed = await harness.behavior.runCli(["export", THREAD, "--summary"]);
-    // The first call fails; the next asks within the outage.
-    const summary = await harness.behavior.runCli(["export", THREAD, "--summary"]);
-    expect(failed.stdout + summary.stdout).toContain("A trace provider did not answer");
-    const json = await harness.behavior.runCli(["export", THREAD]);
-    expect(json.stderr).toContain("A trace provider did not answer");
-    expect(() => {
-      JSON.parse(json.stdout);
-    }).not.toThrow();
+    expect(spans().length).toBeGreaterThan(0);
+    expect(rpc).not.toHaveBeenCalled();
+    expect((await harness.behavior.runCli(["status"])).exitCode).toBe(0);
   });
 });
 

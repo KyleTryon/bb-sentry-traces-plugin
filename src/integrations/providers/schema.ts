@@ -1,18 +1,24 @@
 /**
- * The wire format of the trace provider contract: what a provider may send
- * back, and how its attributes and content are checked and capped before they
- * become span attributes. Anything that does not fit is dropped, not repaired.
+ * The wire format of the trace provider contract: what a provider may report,
+ * and how its attributes and content are checked and capped before they are
+ * stored or become span attributes. Anything that does not fit is dropped, not
+ * repaired.
  */
 import { z } from "zod";
+import { scrub } from "../../core/scrub/cut.js";
 import { scrubText } from "../../core/scrub/value.js";
 import { MAX_TIME_MS, type AttributeValue } from "../../core/otlp.js";
 import { head } from "../../core/text.js";
-import { CONTRACT_VERSION } from "./types.js";
+import { ROOT_KEY, type TraceContext } from "./types.js";
 
-const MAX_SPANS = 2_000;
+export const MAX_SPANS = 2_000;
+/** Threads one `report_threads` call may report. */
+export const MAX_THREADS_PER_CALL = 200;
 const MAX_ATTRIBUTES = 64;
 const MAX_ATTRIBUTE_CHARS = 2_000;
 const MAX_CONTENT_CHARS = 8_000;
+/** Error text is sent cut to 300 characters; this much is kept until then. */
+const MAX_ERROR_CHARS = 2_000;
 const MAX_KEY_CHARS = 200;
 
 const key = z.string().min(1).max(MAX_KEY_CHARS);
@@ -24,7 +30,7 @@ const attributeMap = z.record(z.string(), z.unknown()).nullish();
  */
 const time = z.number().min(0).max(MAX_TIME_MS);
 
-const contextSchema = z
+export const contextSchema = z
   .object({
     trace: z
       .object({
@@ -38,13 +44,6 @@ const contextSchema = z
     agent: z.object({ id: optionalText, name: optionalText }).loose().nullish(),
     model: optionalText,
     attributes: attributeMap,
-  })
-  .loose();
-
-export const contextResultSchema = z
-  .object({
-    contract: z.literal(CONTRACT_VERSION),
-    contexts: z.record(z.string(), contextSchema.nullable()),
   })
   .loose();
 
@@ -68,23 +67,43 @@ const spanSchema = z
   })
   .loose();
 
-export const traceResultSchema = z
+export const traceSchema = z
   .object({
-    contract: z.literal(CONTRACT_VERSION),
-    trace: z
-      .object({
-        key,
-        ended: z.boolean(),
-        pipeline: optionalText,
-        attributes: attributeMap,
-        spans: z.array(spanSchema).max(MAX_SPANS),
-      })
-      .loose()
-      .nullable(),
+    key,
+    ended: z.boolean(),
+    pipeline: optionalText,
+    attributes: attributeMap,
+    spans: z.array(spanSchema).max(MAX_SPANS),
   })
   .loose();
 
-export type ProviderTrace = NonNullable<z.infer<typeof traceResultSchema>["trace"]>;
+/**
+ * `contract` is any number here, so a call with another version reaches the
+ * handler and gets an answer that names the version this plugin speaks.
+ */
+export const reportThreadsInput = z.object({
+  contract: z.number(),
+  threads: z
+    .array(z.object({ threadId: key, context: contextSchema.nullable() }))
+    .max(MAX_THREADS_PER_CALL),
+});
+
+export const reportThreadsOutput = z.object({
+  contract: z.number(),
+  sending: z.boolean(),
+  results: z.record(z.string(), z.enum(["ok", "conflict", "invalid"])),
+});
+
+export const reportTraceInput = z.object({
+  contract: z.number(),
+  trace: traceSchema.optional(),
+  deleted: z.object({ key }).optional(),
+});
+
+export const reportTraceOutput = z.object({ contract: z.number(), sending: z.boolean() });
+
+export type ThreadContextInput = z.infer<typeof contextSchema>;
+export type ProviderTrace = z.infer<typeof traceSchema>;
 export type ProviderSpan = z.infer<typeof spanSchema>;
 
 /**
@@ -162,3 +181,50 @@ export function sanitizeContent(values: Record<string, unknown> | null | undefin
   return kept;
 }
 
+
+/**
+ * A reported trace as it is stored until sent: attributes checked, and its
+ * text kept only while content capture is on, already scrubbed. So what sits
+ * in storage is no more than what may be sent.
+ */
+export function storedTrace(trace: ProviderTrace, captureContent: boolean): ProviderTrace {
+  return {
+    key: trace.key,
+    ended: trace.ended,
+    pipeline: trace.pipeline ?? null,
+    attributes: sanitizeSharedAttributes(trace.attributes),
+    spans: trace.spans.map((span) => ({
+      key: span.key,
+      parentKey: span.parentKey ?? null,
+      name: span.name,
+      op: span.op ?? null,
+      start: span.start,
+      end: span.end,
+      status: span.status ?? null,
+      errorType: span.errorType ?? null,
+      errorMessage: captureContent && span.errorMessage ? scrub(span.errorMessage, MAX_ERROR_CHARS) : null,
+      kind: span.kind ?? null,
+      attributes: sanitizeAttributes(span.attributes),
+      content: captureContent ? sanitizeContent(span.content) : null,
+      workflowRunId: span.workflowRunId ?? null,
+      workflowName: span.workflowName ?? null,
+      final: span.final ?? null,
+    })),
+  };
+}
+
+/** A provider's claim of a thread, as the export reads it. */
+export function claimContext(provider: string, context: ThreadContextInput): TraceContext {
+  return {
+    provider,
+    traceKey: context.trace.key,
+    endedAt: context.trace.endedAt ?? null,
+    parentKey: context.parent || ROOT_KEY,
+    agentId: context.agent?.id || null,
+    agentName: context.agent?.name || null,
+    model: context.model || null,
+    pipeline: context.trace.pipeline || null,
+    traceAttributes: sanitizeAttributes(context.trace.attributes),
+    attributes: sanitizeAttributes(context.attributes),
+  };
+}

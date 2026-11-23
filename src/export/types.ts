@@ -7,7 +7,7 @@ import { type AttributeValue } from "../core/otlp.js";
 import { TraceBuilder } from "../core/trace/builder.js";
 import { type Turn } from "../core/trace/types.js";
 import { type RawUsage } from "../core/usage.js";
-import { TraceProviders } from "../integrations/providers/client.js";
+import { type ProviderStore } from "../integrations/providers/store.js";
 import { WorkflowsClient } from "../integrations/workflows/client.js";
 import { type Fetch } from "../sentry.js";
 
@@ -16,8 +16,6 @@ export interface ExportSettings {
   enabled: boolean;
   captureContent: boolean;
   environment: string;
-  /** Plugin ids to ask which trace a thread belongs to. */
-  providers: string[];
 }
 
 /** What is remembered about a thread between exports. */
@@ -78,6 +76,11 @@ export interface TraceEntry extends TraceRef {
   sentAt: number | null;
   /** The keys of the spans already sent before the trace ended, because its provider said they were final. */
   sentKeys?: string[] | null;
+  /**
+   * The snapshot version last looked at. Nothing about the trace changes
+   * until its provider reports again, so the same version is not read twice.
+   */
+  seenVersion?: string | null;
 }
 
 /** A workflow run whose own spans still have to be sent when it ends. */
@@ -111,13 +114,14 @@ export interface Folded {
   truncated: boolean;
 }
 
-/** What the export functions share: bb, the trace providers, and the clock. */
+/** What the export functions share: bb, what trace providers reported, and the clock. */
 export interface ExportContext {
   bb: ExporterDeps["bb"];
   settings: () => Promise<ExportSettings>;
   fetch: Fetch | undefined;
   now: () => number;
-  providers: TraceProviders;
+  /** What trace providers reported: thread claims and trace snapshots. */
+  providers: ProviderStore;
   workflows: WorkflowsClient;
   /** Read-modify-write of a shared storage key, one at a time. */
   locks: Map<string, Promise<unknown>>;

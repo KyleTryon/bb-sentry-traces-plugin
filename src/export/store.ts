@@ -3,6 +3,7 @@
  * runs and stats. Shared records are changed one at a time under a lock, and
  * every other entry is stored under a key of its own.
  */
+import { queue } from "../core/queue.js";
 import { LEGACY_KEYS, SENDING_SINCE_KEY, STATS_KEY } from "./constants.js";
 import { type ExportContext, type Stats, type ThreadState } from "./types.js";
 
@@ -42,17 +43,24 @@ export async function entries<T>(ctx: ExportContext, prefix: string): Promise<Re
   return found;
 }
 
-/** Keeps at most `max` entries under `prefix`, dropping those that sort first by `dropFirst`. */
+/**
+ * Keeps at most `max` entries under `prefix`, dropping those that sort first
+ * by `dropFirst`. `dropped` is told of each, to drop what goes with it.
+ */
 export async function trim<T>(
   ctx: ExportContext,
   prefix: string,
   max: number,
   dropFirst: (a: T, b: T) => number,
+  dropped: (entry: T) => Promise<void> = async () => undefined,
 ): Promise<void> {
   const keys = await kv(ctx).list(prefix);
   if (keys.length <= max) return;
   const all = Object.entries(await entries<T>(ctx, prefix)).sort(([, a], [, b]) => dropFirst(a, b));
-  for (const [id] of all.slice(0, Math.max(0, all.length - max))) await kv(ctx).delete(prefix + id);
+  for (const [id, entry] of all.slice(0, Math.max(0, all.length - max))) {
+    await kv(ctx).delete(prefix + id);
+    await dropped(entry);
+  }
 }
 
 /** Moves 0.1.0's one-map-per-kind records to one key per entry. */
@@ -101,17 +109,4 @@ export async function recordFailure(ctx: ExportContext, message: string): Promis
     stats.lastFailureAt = ctx.now();
     stats.lastError = message.slice(0, 300);
   });
-}
-
-/** Runs `work` after everything already queued under `key`, whether that failed or not. */
-export function queue<T>(chains: Map<string, Promise<unknown>>, key: string, work: () => Promise<T>): Promise<T> {
-const next = (chains.get(key) ?? Promise.resolve()).then(work, work);
-chains.set(key, next);
-void next.then(
-  () => undefined,
-  () => undefined,
-).finally(() => {
-  if (chains.get(key) === next) chains.delete(key);
-});
-return next;
 }

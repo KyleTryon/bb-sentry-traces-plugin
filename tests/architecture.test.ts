@@ -6,7 +6,7 @@ import { describe, expect, it } from "vitest";
 /**
  * The layering the source is organized by. `core/` is pure event-to-trace
  * logic: it does not know about bb, Sentry, providers or the export loop.
- * `integrations/` reads what other plugins answer; `export/` decides what to
+ * `integrations/` reads what other plugins answer or report; `export/` decides what to
  * send and when. Nothing below `export/` depends on `export/`.
  */
 const ROOT = fileURLToPath(new URL("../src", import.meta.url));
@@ -88,7 +88,7 @@ describe("architecture", () => {
       "cli.ts",
       "export/read.ts",
       "export/types.ts",
-      "integrations/providers/client.ts",
+      "integrations/providers/rpc.ts",
       "integrations/workflows/client.ts",
     ]);
     for (const [file, node] of graph) {

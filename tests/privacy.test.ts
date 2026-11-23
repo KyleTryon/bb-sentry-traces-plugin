@@ -12,7 +12,7 @@ import { oneLine } from "../src/core/text.js";
 import { TraceBuilder } from "../src/core/trace/builder.js";
 import type { Turn } from "../src/core/trace/types.js";
 import { turnSpans } from "../src/export/spans.js";
-import { sanitizeAttributes, sanitizeContent, traceResultSchema } from "../src/integrations/providers/schema.js";
+import { sanitizeAttributes, sanitizeContent, traceSchema } from "../src/integrations/providers/schema.js";
 import { providerSpans } from "../src/integrations/providers/spans.js";
 import type { TraceContext } from "../src/integrations/providers/types.js";
 import { parseDsn, sendSpans } from "../src/sentry.js";
@@ -38,7 +38,7 @@ const THREAD: ThreadInfo = {
 
 function context(overrides: Partial<TraceContext> = {}): TraceContext {
   return {
-    provider: "orchestrator",
+    provider: "example-provider",
     traceKey: "run_42",
     endedAt: null,
     parentKey: "root",
@@ -84,7 +84,7 @@ describe("provider attributes", () => {
     "gen_ai.operation.name": "chat",
     "gen_ai.request.model": "fake-model",
     "gen_ai.response.model": "fake-model",
-    "orchestrator.role": "coordinator",
+    "example.role": "coordinator",
   };
 
   it("keeps content, usage and plugin-owned keys out of thread and trace attributes", () => {
@@ -102,7 +102,7 @@ describe("provider attributes", () => {
     expect(sent).not.toContain("fake-model");
     for (const span of spans) expect(attr(span, "gen_ai.usage.input_tokens")).toBeUndefined();
     for (const span of spans) {
-      expect(attr(span, "orchestrator.role")).toBe("coordinator");
+      expect(attr(span, "example.role")).toBe("coordinator");
       expect(attr(span, "gen_ai.cost.total")).toBeUndefined();
     }
   });
@@ -138,7 +138,7 @@ describe("provider attributes", () => {
         },
       ],
     };
-    const spans = providerSpans(context(), traceResultSchema.parse({ contract: 1, trace }).trace!, false);
+    const spans = providerSpans(context(), traceSchema.parse(trace), false);
     const decide = spans.find((span) => span.name === "decide")!;
     const root = spans.find((span) => span.name === "run")!;
     expect(attr(decide, "gen_ai.usage.input_tokens")).toBe(400);
@@ -170,7 +170,7 @@ describe("provider attributes", () => {
         { key: "b", name: "b", start: 1, end: 2, status: "error", errorType: "verify_failed" },
       ],
     };
-    const spans = providerSpans(context(), traceResultSchema.parse({ contract: 1, trace }).trace!, false);
+    const spans = providerSpans(context(), traceSchema.parse(trace), false);
     expect(wire(spans)).not.toContain("secret");
     const b = spans.find((span) => span.name === "b")!;
     expect(b.status).toEqual({ code: 2, message: "verify_failed" });
@@ -410,10 +410,7 @@ describe("scrubber speed", () => {
 describe("provider times", () => {
   it("refuses times far outside milliseconds since the epoch", () => {
     const parse = (start: number) =>
-      traceResultSchema.safeParse({
-        contract: 1,
-        trace: { key: "k", ended: true, spans: [{ key: "a", name: "x", start, end: start }] },
-      }).success;
+      traceSchema.safeParse({ key: "k", ended: true, spans: [{ key: "a", name: "x", start, end: start }] }).success;
     expect(parse(1_800_000_000_000)).toBe(true);
     expect(parse(1_800_000_000_000.5)).toBe(true);
     expect(parse(1e300)).toBe(false);

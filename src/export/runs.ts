@@ -1,6 +1,7 @@
 /**
  * Provider traces and workflow runs that outlive one export: remembered when a
- * turn is sent into them, then sent once they have ended.
+ * turn is sent into them, then sent once they have ended. A provider trace is
+ * sent from the snapshot its provider last reported.
  */
 import { errorMessage } from "../core/text.js";
 import {
@@ -105,7 +106,15 @@ export async function noteTrace(ctx: ExportContext, trace: TraceContext): Promis
   const key = `${TRACE_PREFIX}${trace.provider}/${trace.traceKey}`;
   if ((await kv(ctx).get(key)) !== undefined) return;
   await kv(ctx).set(key, { ...traceRef(trace), firstSeenAt: ctx.now(), sentAt: null } satisfies TraceEntry);
-  await trim<TraceEntry>(ctx, TRACE_PREFIX, MAX_RUN_ENTRIES, dropFirst);
+  await trim<TraceEntry>(ctx, TRACE_PREFIX, MAX_RUN_ENTRIES, dropFirst, (entry) =>
+    ctx.providers.deleteSnapshot(entry.provider, entry.traceKey),
+  );
+}
+
+/** Drops a provider trace's entry, and the snapshot it was sent from: neither is needed again. */
+async function dropTrace(ctx: ExportContext, key: string, entry: TraceEntry): Promise<void> {
+  await kv(ctx).delete(key);
+  await ctx.providers.deleteSnapshot(entry.provider, entry.traceKey);
 }
 
 /**
@@ -146,22 +155,29 @@ async function sweepTrace(
   const key = TRACE_PREFIX + id;
   const now = ctx.now();
   if (entry.sentAt !== null) {
-    if (now - entry.sentAt > SENT_RUN_KEEP_MS) await kv(ctx).delete(key);
+    if (now - entry.sentAt > SENT_RUN_KEEP_MS) await dropTrace(ctx, key, entry);
     return "next";
   }
   const expired = now - entry.firstSeenAt > OPEN_RUN_KEEP_MS;
-  const trace = await ctx.providers.trace(entry.provider, entry.traceKey, settings.captureContent);
+  const head = await ctx.providers.head(entry.provider, entry.traceKey);
+  // Nothing new was reported since the last look: what was due then went out.
+  if (head && head.version === entry.seenVersion && !expired) return "next";
+  const trace = head ? await ctx.providers.snapshot(entry.provider, entry.traceKey, head) : undefined;
   if (trace === undefined) {
-    // No answer: ask again later, unless it has been open too long to wait for.
-    if (expired) await kv(ctx).delete(key);
+    // Nothing reported yet: wait, unless it has been open too long to wait for.
+    if (expired) await dropTrace(ctx, key, entry);
     return "next";
   }
   const sent = new Set(entry.sentKeys ?? []);
   const ended = trace === null || trace.ended || expired;
   const due = trace === null ? new Set<string>() : keysToSend(trace, sent, ended);
   const keys = ended ? due : fitting(sent, due);
-  // Nothing new is final yet: the rest waits for the end.
-  if (!ended && keys.size === 0) return "next";
+  const seenVersion = head?.version ?? null;
+  // Nothing new is final yet: the rest waits for the end, or a newer report.
+  if (!ended && keys.size === 0) {
+    await kv(ctx).set(key, { ...entry, seenVersion } satisfies TraceEntry);
+    return "next";
+  }
   const spans =
     trace === null
       ? deletedTraceSpans(entry, { from: entry.firstSeenAt, to: now })
@@ -170,8 +186,8 @@ async function sweepTrace(
           rootAttributes: trace.ended ? {} : { "bb.trace.state": "open" },
         });
   const done: TraceEntry = ended
-    ? { ...entry, sentAt: now, sentKeys: null }
-    : { ...entry, sentKeys: [...sent, ...keys] };
+    ? { ...entry, sentAt: now, sentKeys: null, seenVersion }
+    : { ...entry, sentKeys: [...sent, ...keys], seenVersion };
   const result = await sendSpans(target, spans, resourceOf(settings), ctx.fetch);
   if (!result.ok) return failedRun(ctx, `trace ${id}`, key, result, done);
   await settle(ctx, key, done);

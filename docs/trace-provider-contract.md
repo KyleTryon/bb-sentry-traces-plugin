@@ -1,99 +1,114 @@
 # Trace provider contract
 
-Version 1.
+Version 2.
 
 The Sentry Traces plugin exports each bb thread on its own: one trace per
 turn. A **trace provider** is any other bb plugin that knows some threads
-belong together, such as an orchestrator that runs a coordinator and several
-workers for one task. A provider tells the plugin two things:
+belong together, such as an orchestration plugin that runs a coordinator and
+several workers for one task. A provider tells the plugin two things:
 
 - which trace a thread belongs to, where the thread's turns hang in it, and
   which agent the thread runs as;
 - the trace's own structure, as a list of spans.
 
-The plugin knows nothing about what a provider's trace means. It does not read
-a provider's database or thread metadata. It calls two RPC methods on the
-plugins named in its `providers` setting, through `bb.sdk.plugins.callRpc`.
+The provider pushes both by calling two RPC methods of this plugin through
+`bb.sdk.plugins.callRpc`. The plugin calls no provider and knows none by
+name. It does not read a provider's database or thread metadata, and it knows
+nothing about what a provider's trace means.
 
-A provider needs no Sentry code and no dependency on this plugin. The spans it
-returns are plain data that follow OpenTelemetry's naming.
+A provider needs no Sentry code and no dependency on this plugin. What it
+sends is plain data that follows OpenTelemetry's naming. When Sentry Traces is
+not installed or is disabled, the call fails; catch that and carry on.
+
+Version 1, in which this plugin asked providers listed in a `providers`
+setting, is no longer supported.
 
 ## Rules for every call
 
-- Every request carries `"contract": 1`, and every answer must carry it back.
-  An answer with another version is ignored.
+- Every call carries `"contract": 2`, and every answer carries it back. A call
+  with another version is refused with an `invalid` error that names the
+  version this plugin speaks.
+- Only another bb plugin may call. Calls from the app, the `bb` CLI or an
+  agent are refused with `forbidden`. bb tells this plugin which plugin
+  called, and that plugin id is your provider id: it is sent as
+  `bb.trace.provider` and goes into every trace and span id.
+- A call that does not match this page is refused with `invalid_input`, and
+  nothing of it is kept. The plugin ignores fields it does not know.
 - Times are milliseconds since the epoch.
-- An answer with another version means "this provider has nothing to say":
-  the thread exports on its own, and the plugin does not call the provider
-  again for five minutes.
-- An answer with the right version that does not match this page means the
-  same for that one request: the same request is not made again for five
-  minutes, and other requests are still made.
-- A failed call means the provider could not be reached, and the plugin does
-  not call it again for five minutes. From a provider that has never given a
-  readable answer since the plugin loaded, that is final: the thread exports
-  on its own. A provider that answered before and then fails, as during a
-  reload, may still claim the thread, so the export waits and asks again, for
-  up to 30 minutes of failures before it takes the provider to be gone.
-- The plugin reads the fields below and ignores any others.
-- Providers are asked in the order of the `providers` setting. The first one
-  with an answer for a thread wins.
+- Every answer says whether export is on (`sending`). You may skip building
+  snapshots while it is `false`, but keep claiming threads: a claim made
+  while export is off is used once it is on.
 
-## `telemetry_thread_context`
+## Example
 
-Says where threads belong.
+```ts
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
+import { z } from "zod";
 
-Input:
+const SENTRY_TRACES = "sentry-traces";
+const answer = z.object({ contract: z.number(), sending: z.boolean() }).loose();
 
-```json
-{
-  "contract": 1,
-  "threads": [
-    {
-      "threadId": "thr_worker",
-      "workflow": {
-        "runId": "wf_7",
-        "name": "orch-run-42-develop-1",
-        "callId": "call_0",
-        "callIndex": 0,
-        "originThreadId": "thr_coordinator",
-        "phase": "Implement",
-        "provider": "claude-code",
-        "model": "claude-sonnet-4-5",
-        "reasoningLevel": "medium"
-      }
-    },
-    { "threadId": "thr_coordinator" }
-  ]
+async function reportToSentryTraces(bb: BbPluginApi, method: string, input: object) {
+  try {
+    return await bb.sdk.plugins.callRpc({
+      pluginId: SENTRY_TRACES,
+      method,
+      input: { contract: 2, ...input },
+      outputSchema: answer,
+    });
+  } catch {
+    return null; // Not installed, disabled, or an older version: nothing to do.
+  }
 }
+
+// When a run starts a thread, before the thread's first turn ends:
+await reportToSentryTraces(bb, "report_threads", {
+  threads: [
+    {
+      threadId: coordinatorThreadId,
+      context: {
+        trace: { key: run.id, pipeline: "feature-dev" },
+        agent: { id: "coordinator", name: "Lead" },
+      },
+    },
+  ],
+});
+
+// Whenever the run changes, and once after it ends:
+await reportToSentryTraces(bb, "report_trace", { trace: snapshotOf(run) });
 ```
 
-`workflow` is present when the thread is a worker of a bb Workflows run. It is
-what Workflows says about the worker: its run and the name its script
-declares, its call, the thread that started the run, and the phase and model
-the call ran with. Use it to place or
-name a worker you did not spawn yourself.
+## `report_threads`
 
-Output: one entry per requested thread, `null` for a thread that is not in a
-trace of yours.
+Claims threads for a trace of yours, or lets them go.
+
+Claim a thread before its first turn ends. The plugin places a turn when it
+exports it, as the thread goes idle, and a turn sent on its own stays there.
+Report again whenever a thread's context changes, such as when its trace
+ends.
+
+Input: at most 200 threads per call.
 
 ```json
 {
-  "contract": 1,
-  "contexts": {
-    "thr_coordinator": {
-      "trace": {
-        "key": "run_42",
-        "endedAt": null,
-        "pipeline": "feature-dev",
-        "attributes": { "orchestrator.run_id": "run_42" }
-      },
-      "parent": null,
-      "agent": { "id": "coordinator", "name": "Lead" },
-      "attributes": { "orchestrator.role": "coordinator" }
+  "contract": 2,
+  "threads": [
+    {
+      "threadId": "thr_coordinator",
+      "context": {
+        "trace": {
+          "key": "run_42",
+          "endedAt": null,
+          "pipeline": "feature-dev",
+          "attributes": { "example.run_id": "run_42" }
+        },
+        "parent": null,
+        "agent": { "id": "coordinator", "name": "Lead" },
+        "attributes": { "example.role": "coordinator" }
+      }
     },
-    "thr_worker": null
-  }
+    { "threadId": "thr_done", "context": null }
+  ]
 }
 ```
 
@@ -108,72 +123,87 @@ trace of yours.
 | `model` | optional | The model to report when bb recorded none for a turn. |
 | `attributes` | optional | Attributes for this thread's spans only. |
 
+A `null` context clears your claim of the thread.
+
+Output: one result per thread.
+
+```json
+{ "contract": 2, "sending": true, "results": { "thr_coordinator": "ok", "thr_done": "ok" } }
+```
+
+| Result | Meaning |
+| --- | --- |
+| `ok` | Stored, or cleared. |
+| `conflict` | Another provider claimed the thread first. It stays theirs until they clear it; you cannot clear it either. |
+| `invalid` | The claim is larger than 64 KB once checked. Send fewer or shorter attributes. |
+
+A thread no provider claimed exports on its own. A claim is dropped when its
+thread is deleted, and after 90 days in which neither the claim nor the
+thread's export changed.
+
 ### Workflow workers
 
-You do not have to answer for a worker. When a provider returns `null` for a
-worker, the plugin looks at the thread that started the worker's workflow,
-which it asked about in the same call. If that thread is in a trace of yours,
-the worker joins the same trace. Its turns hang under its workflow call, and
-the workflow run hangs under a span of yours (see
-[Workflow runs](#workflow-runs)). A worker placed this way gets the trace's
-attributes but no agent.
+You do not have to claim a bb Workflows worker. A worker no provider claimed
+joins the trace of the thread that started its workflow, when that thread is
+claimed. Its turns hang under its workflow call, and the workflow run hangs
+under a span of yours (see [Workflow runs](#workflow-runs)). A worker placed
+this way gets the trace's attributes but no agent.
 
-Answer for a worker when you can name its agent. Its place in the trace still
+Claim a worker when you can name its agent. Its place in the trace still
 comes from its workflow call.
 
 ### After a trace ends
 
-Keep answering for a thread after its trace has ended. A thread's last turn
-often finishes after the trace does, and the plugin exports a turn only when
-its thread goes idle.
+Keep your claim after the trace has ended. A thread's last turn often
+finishes after the trace does, and the plugin exports a turn only when its
+thread goes idle.
 
-Set `trace.endedAt` once the trace has ended. A turn that starts after that
-time gets a trace of its own, outside yours. Without `endedAt`, every later
-turn in the thread joins the finished trace.
+Set `trace.endedAt` once the trace has ended, by claiming the thread again. A
+turn that starts after that time gets a trace of its own, outside yours.
+Without `endedAt`, every later turn in the thread joins the finished trace.
 
-## `telemetry_trace`
+## `report_trace`
 
-Returns a trace's own structure.
+Reports a trace's own structure.
+
+Each call is a whole snapshot of the trace, and replaces the one before. Report
+whenever the trace changes, and once more after it ends. The plugin sends
+nothing while it handles the call: what a snapshot makes due goes out at the
+plugin's next pass, within a minute or so.
 
 Input:
 
 ```json
-{ "contract": 1, "traceKey": "run_42", "includeContent": false }
-```
-
-Output: the trace, or `"trace": null` when you have no such trace.
-
-```json
 {
-  "contract": 1,
+  "contract": 2,
   "trace": {
     "key": "run_42",
     "ended": true,
     "pipeline": "feature-dev",
-    "attributes": { "orchestrator.run_id": "run_42" },
+    "attributes": { "example.run_id": "run_42" },
     "spans": [
       {
         "key": "root",
         "parentKey": null,
-        "name": "orchestrator.run feature-dev",
-        "op": "orchestrator.run",
+        "name": "example.run feature-dev",
+        "op": "example.run",
         "start": 1800000000000,
         "end": 1800000400000,
-        "attributes": { "orchestrator.state": "completed" }
+        "attributes": { "example.state": "completed" }
       },
       {
         "key": "step-develop-1",
         "parentKey": "root",
-        "name": "orchestrator.step develop#1",
-        "op": "orchestrator.step",
+        "name": "example.step develop#1",
+        "op": "example.step",
         "start": 1800000100000,
         "end": 1800000300000,
-        "workflowName": "orch-run-42-develop-1"
+        "workflowName": "example-run-42-develop-1"
       },
       {
         "key": "decision-1",
         "parentKey": "root",
-        "name": "decide typesafe/jev-1.13",
+        "name": "decide example/decider-1",
         "op": "gen_ai.decide",
         "kind": "client",
         "final": true,
@@ -181,7 +211,7 @@ Output: the trace, or `"trace": null` when you have no such trace.
         "end": 1800000050420,
         "attributes": {
           "gen_ai.operation.name": "decide",
-          "gen_ai.request.model": "typesafe/jev-1.13",
+          "gen_ai.request.model": "example/decider-1",
           "gen_ai.usage.input_tokens": 400,
           "gen_ai.usage.output_tokens": 20
         }
@@ -189,8 +219,8 @@ Output: the trace, or `"trace": null` when you have no such trace.
       {
         "key": "verify-1",
         "parentKey": "step-develop-1",
-        "name": "orchestrator.verify",
-        "op": "orchestrator.verify",
+        "name": "example.verify",
+        "op": "example.verify",
         "start": 1800000310000,
         "end": 1800000310000,
         "status": "error",
@@ -201,25 +231,44 @@ Output: the trace, or `"trace": null` when you have no such trace.
 }
 ```
 
+Or, for a trace that no longer exists:
+
+```json
+{ "contract": 2, "deleted": { "key": "run_42" } }
+```
+
+Output:
+
+```json
+{ "contract": 2, "sending": true }
+```
+
 | Field | Required | Meaning |
 | --- | --- | --- |
-| `ended` | yes | Whether the trace has ended. The plugin sends the spans not sent yet, and the root, once, when this is `true`. |
+| `ended` | yes | Whether the trace has ended. The plugin sends the spans not sent yet, and the root, once, after a snapshot says `true`. |
 | `pipeline`, `attributes` | optional | As in the thread context; they apply to every span. |
 | `spans[].key` | yes | Your id for the span, unique in the trace. Thread contexts and other spans refer to it. |
 | `spans[].parentKey` | optional | The parent span's key. Missing or unknown means the root. |
 | `spans[].name` | yes | The span's name. Keep it to a small set of values; put ids in attributes. |
-| `spans[].op` | optional | The span's operation, such as `orchestrator.step` or `gen_ai.decide`. |
+| `spans[].op` | optional | The span's operation, such as `example.step` or `gen_ai.decide`. |
 | `spans[].start`, `.end` | yes | The span's times. |
 | `spans[].status` | optional | `ok` or `error`. |
 | `spans[].errorType` | optional | A short, fixed reason for an error, such as `verify_failed`. |
-| `spans[].errorMessage` | optional | Free text about the error. Sent only as [content](#content). |
+| `spans[].errorMessage` | optional | Free text about the error. Kept and sent only as [content](#content). |
 | `spans[].kind` | optional | `client` for a call to a model, else `internal`. |
 | `spans[].attributes` | optional | The span's attributes. |
 | `spans[].content` | optional | Attributes that hold user or model text. See [Content](#content). |
 | `spans[].workflowName`, `.workflowRunId` | optional | The bb Workflows run this span started, by the name its script declares or by its run id. See [Workflow runs](#workflow-runs). |
 | `spans[].final` | optional | `true` when the span will not change again, so it can be sent before the trace ends. See [When the trace is sent](#when-the-trace-is-sent). |
 
-At most 2,000 spans.
+### Limits
+
+- At most 2,000 spans, refused with `invalid_input` past that.
+- At most 4 MB for the whole trace as sent, and 192 KB for one span once
+  checked; past either, the call is refused with `invalid`.
+- While export is off (`sending: false`), the plugin keeps no snapshot. Report
+  again after it is turned on; a provider that reports on every change does.
+  A `deleted` report is always kept.
 
 ### The root
 
@@ -229,17 +278,22 @@ makes one that covers the other spans.
 
 ### When the trace is sent
 
-The plugin asks for a trace about once a minute after it first exports a
-thread that belongs to it.
+The plugin looks at a trace once it has exported a turn of a thread in it,
+then at each of its passes, about once a minute, and only when a newer
+snapshot came in.
 
+- Until the first snapshot comes, the trace's own spans wait.
 - While the trace is open, it sends each span marked `"final": true` that it
   has not sent yet, once. Mark a span final only when nothing about it will
   change: Sentry keeps the first copy it gets. The root is never sent early,
   even when marked final, since it covers the whole trace.
-- Once `ended` is `true`, it sends every span not sent yet, and the root, and
-  stops asking.
-- A trace still open 30 days after it was first seen is sent as it stands,
-  with its root marked `bb.trace.state: "open"`, and is not asked about again.
+- Once a snapshot says `ended`, it sends every span not sent yet, and the
+  root, and is done with the trace. Later snapshots of it are ignored.
+- A trace still open 30 days after it was first seen is sent as its last
+  snapshot stands, with its root marked `bb.trace.state: "open"`. With no
+  snapshot by then, its own spans are never sent.
+- After a `deleted` report, it sends a root marked `bb.trace.state:
+  "deleted"` for the turns it already sent into that trace.
 
 A span sent early keeps its parent, even when the parent is sent later.
 
@@ -250,9 +304,8 @@ step in progress, should wait for the end.
 Thread turns are sent as they finish, before the trace's own spans. Until the
 trace ends, it has no root in Sentry.
 
-Return `"trace": null` only when the trace does not exist. The plugin then
-sends a root marked `bb.trace.state: "deleted"` for the turns it already sent
-into that trace, and stops asking.
+A snapshot is dropped a day after its trace was sent, or after 30 days when
+no turn was ever sent into its trace.
 
 ### Workflow runs
 
@@ -266,9 +319,12 @@ run hangs, by naming the workflow on the span that started it:
 - `workflowRunId`, the run's id, when you know it.
 
 You may learn which workflow a span started only after the workflow has run.
-The plugin waits up to ten minutes after a workflow ends for a span to name
-it. After that it hangs the workflow run where the thread that started it
-hangs.
+The plugin waits up to ten minutes after a workflow ends for a snapshot that
+names it. After that it hangs the workflow run where the thread that started
+it hangs.
+
+When Workflows is disabled or removed, workers export as threads of their
+own, and nothing waits for it.
 
 ### Model calls
 
@@ -292,21 +348,29 @@ anything else, and:
 - drops a key that is not a plain name (letters, digits, `.`, `_`, `-`);
 - drops keys starting with `sentry.`, `bb.thread.`, `bb.turn.` or `bb.trace.`,
   and `gen_ai.conversation.id`;
+- drops keys for user or model text, such as `gen_ai.input.messages`, outside
+  `content`;
+- drops keys for one model call's usage and cost from trace and thread
+  attributes, which land on every span;
 - lets its own attributes win over a provider's with the same key.
 
-Prefix your attributes with your plugin's name, such as `orchestrator.run_id`.
+Prefix your attributes with your plugin's name, such as `example.run_id`.
 
 ## Content
 
 The plugin has a `captureContent` setting, off by default. It decides whether
-prompts, replies, tool arguments and outputs leave the machine.
+prompts, replies, tool arguments and outputs leave the machine. You are not
+told its value; send content anyway, and the plugin decides.
 
-- `includeContent` in a request tells you whether content is wanted. When it
-  is `false`, return no user or model text.
 - Put text in `spans[].content` and `spans[].errorMessage`, never in `name`
-  or `attributes`. The plugin sends those two fields only when `captureContent`
-  is on, after scrubbing them for secrets and capping each at 8,000 characters.
-- Scrub the text yourself first if you have a scrubber.
+  or `attributes`.
+- While `captureContent` is off, those two fields are dropped as the snapshot
+  comes in, and are never stored or sent.
+- While it is on, they are scrubbed for secrets and capped (8,000 characters
+  per content value) as they come in, and stored that way until sent. If
+  `captureContent` is turned off before then, they are dropped when sending.
+- Send only content you are comfortable having stored on this machine until
+  it is sent. Scrub the text yourself first if you have a scrubber.
 
 ## Ids
 
