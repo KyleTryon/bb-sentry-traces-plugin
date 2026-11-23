@@ -80,7 +80,8 @@ export function createPlugin(options: PluginOptions = {}) {
       providers: {
         type: "string",
         label: "Trace providers: plugin ids that group threads into traces, separated by commas",
-        default: "orchestrator",
+        // None by default: a provider adds spans to your Sentry project, so it is named on purpose.
+        default: "",
         experimental_schema: maxLength(200, "Use at most 200 characters"),
       },
     });

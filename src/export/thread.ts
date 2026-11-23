@@ -83,7 +83,7 @@ export async function previewThread(
     const total = await readUsage(ctx, thread.id);
     if (total && !isEmptyUsage(total)) {
       usage.set(newest.id, {
-        usage: toSentryUsage(total),
+        usage: toSentryUsage(total, thread.providerId),
         turns: picked.length,
       });
     }
@@ -405,7 +405,7 @@ export async function exportThread(ctx: ExportContext, thread: ThreadInfo): Prom
     if (delta && !isEmptyUsage(delta)) {
       // One span of one turn carries it, so cost is never counted twice.
       usage.set(newestPending.id, {
-        usage: toSentryUsage(delta),
+        usage: toSentryUsage(delta, thread.providerId),
         turns: pending.length + usageTurns,
       });
     }

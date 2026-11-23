@@ -13,6 +13,9 @@ export const TRACE_EVENT_TYPES = [
   "item/completed",
   "item/backgroundTask/progress",
   "item/backgroundTask/completed",
+  // A delegation row's call returning, or its agent ending, arrives here, not as `item/completed`.
+  "item/delegation/progress",
+  "item/delegation/completed",
   "system/interaction/lifecycle",
   "provider/error",
   "system/error",

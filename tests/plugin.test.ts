@@ -84,7 +84,8 @@ async function setup(options: Setup = {}) {
     });
   const { bb, harness } = createFakePluginHost({
     pluginId: "sentry-traces",
-    settings: { dsn: DSN, enabled: true, ...options.settings },
+    // No provider is asked by default; a test's providers are, unless its settings say otherwise.
+    settings: { dsn: DSN, enabled: true, providers: Object.keys(options.providers ?? {}).join(","), ...options.settings },
     sdk: {
       threads: {
         events: { list: eventsList(histories) },
@@ -253,8 +254,8 @@ describe("exporting a thread", () => {
     const chat = rest.find((span) => span.name.startsWith("chat"))!;
     expect(attr(chat, "gen_ai.operation.name")).toBe("chat");
     expect(attr(chat, "bb.inferred")).toBe(true);
-    // bb cannot see which model answered, so no response model is claimed.
-    expect(attr(chat, "gen_ai.response.model")).toBeUndefined();
+    // bb records no other answering model, so the requested one answered.
+    expect(attr(chat, "gen_ai.response.model")).toBe("claude-fable-5-2");
     // OpenTelemetry's kinds: a model request is a client span, the rest internal.
     expect([agent.kind, chat.kind, tool.kind]).toEqual([1, 3, 1]);
   });
@@ -999,7 +1000,7 @@ describe("trace providers", () => {
   });
 
   it("exports a thread on its own when no provider answers, and stops asking", async () => {
-    const { history, emit, spans, rpc } = await setup();
+    const { history, emit, spans, rpc } = await setup({ settings: { providers: P } });
     history.turn();
     await emit("thread.idle");
     expect(rpc).toHaveBeenCalledTimes(1);
@@ -1525,7 +1526,7 @@ describe("trace providers", () => {
   });
 
   it("backs off for five minutes from when a slow call failed, not from when it began", async () => {
-    const { history, emit, clock, rpc } = await setup();
+    const { history, emit, clock, rpc } = await setup({ settings: { providers: P } });
     rpc.mockImplementationOnce(async () => {
       clock.now += 60_000;
       throw new Error("timed out");
@@ -1767,7 +1768,7 @@ describe("bb details", () => {
     expect(attr(agent, "gen_ai.response.model")).toBe("claude-opus-5-5");
     expect(attr(agent, "bb.model_fallback.reason")).toBe("provider");
     expect(chats.map((span) => attr(span, "gen_ai.response.model"))).toEqual([
-      undefined,
+      "claude-fable-5-2",
       "claude-opus-5-5",
     ]);
   });

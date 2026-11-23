@@ -22,7 +22,7 @@ import { type TraceContext } from "../integrations/providers/types.js";
 import { recap, rescrub, scrub } from "../core/scrub/cut.js";
 import { SUBAGENT } from "../core/trace/builder.js";
 import { MAX_ARGS, MAX_INPUT, MAX_REPLY, MAX_RESULT, type Span, type Turn } from "../core/trace/types.js";
-import { usageAttributes, type SentryUsage } from "../core/usage.js";
+import { costAttributes, usageAttributes, type SentryUsage } from "../core/usage.js";
 import {
   workflowAttributes,
   workflowCallSpanId,
@@ -32,9 +32,15 @@ import {
 import type { ThreadInfo } from "../thread.js";
 
 export interface TurnUsage {
-  usage: SentryUsage;
+  /** Token usage; null when the provider reports a cost but no tokens. */
+  usage: SentryUsage | null;
   /** How many turns the usage covers: more than one when earlier turns were never exported. */
   turns: number;
+  /**
+   * The provider's own cost in USD for the same stretch, when it reports one.
+   * Sent only when there are no tokens, which Sentry would price itself.
+   */
+  costUsd?: number | null;
 }
 
 export interface TurnSpanOptions {
@@ -69,9 +75,35 @@ const PROVIDER_NAMES: Record<string, string> = {
   codex: "openai",
 };
 
+/** Vendor prefixes of `vendor/model` ids whose OpenTelemetry name differs. */
+const VENDOR_NAMES: Record<string, string> = {
+  google: "gcp.gemini",
+  "google-vertex": "gcp.vertex_ai",
+  vertex: "gcp.vertex_ai",
+  xai: "x_ai",
+  "x-ai": "x_ai",
+  mistral: "mistral_ai",
+  bedrock: "aws.bedrock",
+  "amazon-bedrock": "aws.bedrock",
+  azure: "azure.ai.openai",
+  "azure-openai": "azure.ai.openai",
+};
+
+/**
+ * A model id as pricing tables know it. Claude Code marks a long context
+ * window with a suffix such as `[1m]`, which no model name has.
+ */
+export function modelName(model: string | null | undefined): string | null {
+  const name = (model ?? "").replace(/\[[^\]]*\]\s*$/, "").trim();
+  return name || null;
+}
+
 /**
  * The model vendor in OpenTelemetry's names. bb's provider id names the agent
- * CLI, which is not always the vendor, so the model string decides when it can.
+ * CLI, which is not always the vendor, so the model string decides when it
+ * can: first by the model family, then by the vendor in a `vendor/model` id
+ * (`zai-coding-plan/glm-5` is `zai-coding-plan`), and only then by the bb
+ * provider, where its vendor is known.
  */
 export function genAiProvider(providerId: string | null, model: string | null): string | null {
   const name = (model ?? "").toLowerCase();
@@ -81,6 +113,8 @@ export function genAiProvider(providerId: string | null, model: string | null): 
   if (/(^|[/:])grok/.test(name)) return "x_ai";
   if (/(^|[/:])(mistral|codestral)/.test(name)) return "mistral_ai";
   if (/(^|[/:])deepseek/.test(name)) return "deepseek";
+  const vendor = /^([a-z0-9][a-z0-9._-]{0,63})\/./.exec(name)?.[1];
+  if (vendor) return VENDOR_NAMES[vendor] ?? vendor;
   if (!providerId) return null;
   return PROVIDER_NAMES[providerId] ?? providerId;
 }
@@ -172,7 +206,7 @@ export function turnSpans(turn: Turn, options: TurnSpanOptions): OtlpSpan[] {
   const rootId = id("turn");
   const turnEnd = turn.end ?? Math.max(now, turn.start);
   const agentName = agentNameFor(thread, trace);
-  const model = turn.model ?? trace?.model ?? null;
+  const model = modelName(turn.model ?? trace?.model);
   const provider = genAiProvider(thread.providerId, model);
 
   const shared: Record<string, AttributeValue> = {
@@ -187,9 +221,11 @@ export function turnSpans(turn: Turn, options: TurnSpanOptions): OtlpSpan[] {
     "bb.turn.index": turn.index,
     "bb.thread.title": captureContent && thread.title ? scrub(thread.title, 200) : undefined,
   };
-  // The model the provider switched to mid-turn is the one that answered from then on.
+  // The model the provider switched to mid-turn is the one that answered from
+  // then on. bb records no other answering model, so until then it is the one
+  // requested: Sentry lists the response model on chat spans.
   const answeredBy = (end: number) =>
-    turn.fallback && end >= turn.fallback.at ? turn.fallback.model : undefined;
+    (turn.fallback && end >= turn.fallback.at ? modelName(turn.fallback.model) : null) ?? model;
   const input = captureContent && turn.input ? rescrub(turn.input, MAX_INPUT) : null;
   const inputMessages = input ? messages("user", [input]) : undefined;
   const outputMessages = captureContent ? messages("assistant", fitReplies(turn.replies)) : undefined;
@@ -277,7 +313,11 @@ export function turnSpans(turn: Turn, options: TurnSpanOptions): OtlpSpan[] {
         "gen_ai.provider.name": provider,
         "bb.inferred": true,
         "bb.phases": stretch.phases.join(","),
-        ...(usage ? usageAttributes(usage.usage) : {}),
+        ...(usage?.usage
+          ? usageAttributes(usage.usage)
+          : typeof usage?.costUsd === "number"
+            ? costAttributes(usage.costUsd)
+            : {}),
         "bb.usage.turns": usage && usage.turns > 1 ? usage.turns : undefined,
         "gen_ai.input.messages": last ? inputMessages : undefined,
         "gen_ai.output.messages": last ? outputMessages : undefined,

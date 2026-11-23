@@ -5,10 +5,15 @@
  * Sentry wants `input_tokens` to include cached tokens and `output_tokens` to
  * include reasoning tokens. Providers disagree on both (Claude Code reports
  * input without its cache reads and writes; Codex includes them), so the
- * convention is read off the numbers themselves: `totalTokens` says which
- * parts were already counted.
+ * convention comes from what cannot be otherwise (a cache larger than the
+ * input), then from the bb provider where its convention is known, then from
+ * the numbers themselves: `totalTokens` says which parts were already counted.
+ *
+ * ACP agents report no tokens at all, but some (OpenCode) report a running
+ * cost in USD with their context window usage; Sentry takes that as
+ * `gen_ai.cost.total_tokens`.
  */
-import { record, type Json } from "./text.js";
+import { record, text, type Json } from "./text.js";
 
 /** bb's `tokenUsage.total` (or `.last`), as stored. */
 export interface RawUsage {
@@ -84,29 +89,66 @@ export function isEmptyUsage(usage: RawUsage): boolean {
   return usage.inputTokens + usage.cachedInputTokens + usage.outputTokens === 0;
 }
 
-/** Converts bb's counts to Sentry's convention. */
-export function toSentryUsage(raw: RawUsage): SentryUsage {
-  const { inputTokens: input, cachedInputTokens: cached, outputTokens: output } = raw;
+/**
+ * How bb's providers count input, where it is known: Claude Code reports its
+ * input without cache reads and writes, Codex with them.
+ */
+const INPUT_EXCLUDES_CACHE: Readonly<Record<string, boolean>> = {
+  "claude-code": true,
+  codex: false,
+};
+
+/**
+ * Whether the input leaves its cached tokens out, when that is settled
+ * before looking at `totalTokens`: a cache larger than the input cannot be
+ * part of it, whatever else the numbers say; else the bb provider decides
+ * when its convention is known. Null when neither says.
+ */
+function settledInputConvention(raw: RawUsage, providerId: string | null | undefined): boolean | null {
+  if (cacheOf(raw) > raw.inputTokens) return true;
+  return (providerId ? INPUT_EXCLUDES_CACHE[providerId] : undefined) ?? null;
+}
+
+/**
+ * All cached input: bb's cached count, or its reads and writes together when
+ * they add up to more (a provider that fills in only the split).
+ */
+function cacheOf(raw: RawUsage): number {
+  const split = (raw.cacheReadInputTokens ?? 0) + (raw.cacheWriteInputTokens ?? 0);
+  return Math.max(raw.cachedInputTokens, split);
+}
+
+/** Each way of counting: [input leaves out its cache, output leaves out its reasoning]. */
+const CONVENTIONS: readonly (readonly [boolean, boolean])[] = [
+  [true, false],
+  [false, false],
+  [true, true],
+  [false, true],
+];
+
+/**
+ * Converts bb's counts to Sentry's convention. `providerId` is the thread's
+ * bb provider, when known; it settles how the input was counted.
+ */
+export function toSentryUsage(raw: RawUsage, providerId?: string | null): SentryUsage {
+  const { inputTokens: input, outputTokens: output } = raw;
+  const cached = cacheOf(raw);
   const reasoning = raw.reasoningOutputTokens;
   const total = raw.totalTokens;
 
-  // Which parts does `total` already count? Try each convention against it.
-  let inputExcludesCached: boolean;
-  let outputExcludesReasoning = false;
-  if (cached > 0 && total === input + cached + output) {
-    inputExcludesCached = true;
-  } else if (total === input + output) {
-    inputExcludesCached = false;
-  } else if (cached > 0 && reasoning > 0 && total === input + cached + output + reasoning) {
-    inputExcludesCached = true;
-    outputExcludesReasoning = true;
-  } else if (reasoning > 0 && total === input + output + reasoning) {
-    inputExcludesCached = false;
-    outputExcludesReasoning = true;
-  } else {
-    // No total to go by: cached tokens cannot exceed an input that includes them.
-    inputExcludesCached = cached > input;
-  }
+  // Which parts does `total` already count? Try each convention against it,
+  // keeping to the input convention when that is already settled. With
+  // nothing to go by, the input includes its cache, as Sentry's does.
+  const settled = settledInputConvention(raw, providerId);
+  const match = CONVENTIONS.find(
+    ([excludesCached, excludesReasoning]) =>
+      (settled === null || settled === excludesCached) &&
+      (!excludesCached || cached > 0) &&
+      (!excludesReasoning || reasoning > 0) &&
+      total === input + (excludesCached ? cached : 0) + output + (excludesReasoning ? reasoning : 0),
+  );
+  const inputExcludesCached = settled ?? match?.[0] ?? false;
+  const outputExcludesReasoning = match?.[1] ?? false;
 
   const inputTokens = input + (inputExcludesCached ? cached : 0);
   const outputTokens = output + (outputExcludesReasoning ? reasoning : 0);
@@ -133,4 +175,34 @@ export function usageAttributes(usage: SentryUsage): Record<string, number | und
     "gen_ai.usage.cache_creation.input_tokens": usage.cacheWriteTokens || undefined,
     "gen_ai.usage.reasoning.output_tokens": usage.reasoningTokens || undefined,
   };
+}
+
+/**
+ * The running cost in USD that a `thread/contextWindowUsage/updated` event's
+ * data reports, as ACP agents such as OpenCode do. Null when there is none,
+ * or when it is in another currency: Sentry takes costs in USD only.
+ */
+export function readCost(data: unknown): number | null {
+  const cost = record(record(record(data)['contextWindowUsage'])['cost']);
+  if (text(cost['currency']).toUpperCase() !== "USD") return null;
+  return count(cost['amount']);
+}
+
+/**
+ * The cost between two running costs. Null when it went backwards (the agent
+ * started a new session), since then the difference means nothing.
+ */
+export function costDelta(current: number, previous: number | null): number | null {
+  if (previous === null) return current;
+  return current >= previous ? current - previous : null;
+}
+
+/**
+ * A provider's own cost, in Sentry's name. Sentry keeps a numeric
+ * `gen_ai.cost.total_tokens` instead of estimating one from tokens
+ * (https://docs.sentry.io/product/agents/costs/#send-custom-costs), so it is
+ * only sent where there are no tokens to estimate from.
+ */
+export function costAttributes(costUsd: number): Record<string, number> {
+  return { "gen_ai.cost.total_tokens": costUsd };
 }
