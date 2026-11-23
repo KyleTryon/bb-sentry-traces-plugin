@@ -83,6 +83,7 @@ export function registerCli(bb: Pick<BbPluginApi, "cli">, deps: CliDeps): void {
               dsn.ok
                 ? `  DSN: set (${dsn.target.host}, project ${dsn.target.projectId})`
                 : `  DSN: ${dsn.reason}`,
+              ...(dsn.ok && dsn.warning ? [`  warning: ${dsn.warning}`] : []),
               `  content capture: ${settings.captureContent ? "on (prompts, replies, tool arguments and outputs are sent)" : "off (names, timing, status and token counts only)"}`,
               `  environment: ${settings.environment || "(none)"}`,
               `Sent: ${stats.turnsSent} turns, ${stats.spansSent} spans, ${stats.workflowsSent} workflow runs, ${stats.tracesSent} provider traces`,

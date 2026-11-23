@@ -18,8 +18,10 @@ import {
   providerTraceId,
   traceAttributes,
 } from "../integrations/providers/spans.js";
+import { sanitizeSharedAttributes } from "../integrations/providers/schema.js";
 import { type TraceContext } from "../integrations/providers/types.js";
-import { recap, rescrub, scrub } from "../core/scrub/cut.js";
+import { recap, rescrub, scrub, scrubLine } from "../core/scrub/cut.js";
+import { errorCode, oneLine } from "../core/text.js";
 import { SUBAGENT } from "../core/trace/builder.js";
 import { MAX_ARGS, MAX_INPUT, MAX_REPLY, MAX_RESULT, type Span, type Turn } from "../core/trace/types.js";
 import { usageAttributes, type SentryUsage } from "../core/usage.js";
@@ -85,9 +87,27 @@ export function genAiProvider(providerId: string | null, model: string | null): 
   return PROVIDER_NAMES[providerId] ?? providerId;
 }
 
-/** The agent's name in Sentry: the one a trace provider gave, else bb's provider. */
+/** Agent names are what Sentry groups agents by; a long one is free text, not a name. */
+const MAX_AGENT_NAME = 80;
+
+/**
+ * The agent's name in Sentry: the one a trace provider gave, else bb's
+ * provider. A provider's name may have spaces ("Senior Dev"), so it is only
+ * kept to one short line.
+ */
 export function agentNameFor(thread: ThreadInfo, trace: TraceContext | null): string {
-  return trace?.agentName || trace?.agentId || thread.providerId || "bb-agent";
+  const given = oneLine(trace?.agentName || trace?.agentId || "", MAX_AGENT_NAME);
+  return given || thread.providerId || "bb-agent";
+}
+
+/**
+ * Error text as sent. With content capture it is scrubbed and capped; without
+ * it, only a message that reads as a code (`overloaded_error`) is sent, since
+ * any other may hold a path, a command line or a credential.
+ */
+function errorText(message: string | null, captureContent: boolean): string | null {
+  if (!message) return null;
+  return captureContent ? scrub(message, 300) : errorCode(message);
 }
 
 function messages(role: "user" | "assistant", texts: readonly string[]): string | undefined {
@@ -177,7 +197,10 @@ export function turnSpans(turn: Turn, options: TurnSpanOptions): OtlpSpan[] {
 
   const shared: Record<string, AttributeValue> = {
     // A provider's own attributes first, so they cannot replace this plugin's.
-    ...(trace ? { ...trace.attributes, ...traceAttributes(trace), "bb.agent.id": trace.agentId } : {}),
+    // Checked again for a context kept from before the check: they land on every span here.
+    ...(trace
+      ? { ...sanitizeSharedAttributes(trace.attributes), ...traceAttributes(trace), "bb.agent.id": trace.agentId }
+      : {}),
     ...(workflow ? workflowAttributes(workflow, !trace?.pipeline) : {}),
     "gen_ai.conversation.id": thread.id,
     "bb.thread.id": thread.id,
@@ -214,7 +237,11 @@ export function turnSpans(turn: Turn, options: TurnSpanOptions): OtlpSpan[] {
         "gen_ai.request.reasoning.level": turn.reasoningLevel,
         "bb.service_tier": turn.serviceTier,
         "bb.permission_mode": turn.permissionMode,
-        "bb.model_fallback.reason": turn.fallback?.reason,
+        "bb.model_fallback.reason": turn.fallback?.reason
+          ? captureContent
+            ? scrubLine(turn.fallback.reason, 200)
+            : errorCode(turn.fallback.reason)
+          : undefined,
         "bb.rate_limit.status": turn.rateLimitStatus,
         "bb.context.used_tokens": turn.context?.usedTokens,
         "bb.context.window_tokens": turn.context?.windowTokens,
@@ -240,7 +267,7 @@ export function turnSpans(turn: Turn, options: TurnSpanOptions): OtlpSpan[] {
       },
       error:
         turn.status === "failed"
-          ? { message: turn.error ? scrub(turn.error, 300) : "turn failed" }
+          ? { message: errorText(turn.error, captureContent) ?? "turn failed" }
           : null,
     }),
   );
@@ -296,7 +323,7 @@ export function turnSpans(turn: Turn, options: TurnSpanOptions): OtlpSpan[] {
     const caller = lane?.agent ?? agentName;
     const failed = span.status === "failed";
     const end = span.end ?? Math.max(turnEnd, span.start);
-    const error = failed ? { message: span.error ? scrub(span.error, 300) : span.errorType } : null;
+    const error = failed ? { message: errorText(span.error, captureContent) ?? span.errorType } : null;
     const state: Record<string, AttributeValue> = {
       "error.type": span.errorType,
       "bb.span.kind": span.kind,

@@ -3,7 +3,7 @@
  * functions scrub a text first (see `secrets.ts`), so a cut cannot hide a
  * secret's shape.
  */
-import { oneLine } from "../text.js";
+import { head, oneLine, tail } from "../text.js";
 import { scrubSecrets } from "./secrets.js";
 
 /** Room for the marker a cut adds, so text already cut to a cap is not cut again. */
@@ -28,26 +28,26 @@ export function startMarker(cut: number): string {
 /** Scrubs, then keeps the first `max` characters, with a visible marker when cut. */
 export function scrub(value: string, max: number): string {
   // Only the part that can be kept, plus a margin, is worth scrubbing.
-  const head = value.slice(0, max + SCRUB_MARGIN);
-  const clean = scrubSecrets(head, { end: head !== value });
-  if (head === value && clean.length <= max) return clean;
+  const kept = head(value, max + SCRUB_MARGIN);
+  const clean = scrubSecrets(kept, { end: kept !== value });
+  if (kept === value && clean.length <= max) return clean;
   const over = Math.max(value.length, clean.length) - max;
-  return `${clean.slice(0, Math.max(0, max))}${endMarker(over)}`;
+  return `${head(clean, max)}${endMarker(over)}`;
 }
 
 /** Scrubs, then keeps the last `max` characters, with a visible marker when cut. */
 export function scrubTail(value: string, max: number): string {
-  const tail = value.length > max + SCRUB_MARGIN ? value.slice(-(max + SCRUB_MARGIN)) : value;
-  const clean = scrubSecrets(tail, { start: tail !== value });
-  if (tail === value && clean.length <= max) return clean;
+  const kept = tail(value, max + SCRUB_MARGIN);
+  const clean = scrubSecrets(kept, { start: kept !== value });
+  if (kept === value && clean.length <= max) return clean;
   const over = Math.max(value.length, clean.length) - max;
-  return `${startMarker(over)}${max > 0 ? clean.slice(-max) : ""}`;
+  return `${startMarker(over)}${tail(clean, max)}`;
 }
 
 /** Scrubs, then makes one line of at most `max` characters, ending in "…" when cut. */
 export function scrubLine(value: string, max: number): string {
-  const head = value.slice(0, max + SCRUB_MARGIN);
-  return oneLine(scrubSecrets(head, { end: head !== value }), max);
+  const kept = head(value, max + SCRUB_MARGIN);
+  return oneLine(scrubSecrets(kept, { end: kept !== value }), max);
 }
 
 // Must match `endMarker` and `startMarker` below.
@@ -68,6 +68,6 @@ export function rescrub(value: string, max: number, keep: "start" | "end" = "sta
 /** Text that was scrubbed already, capped. Text `scrub` cut to `max` keeps its cut and marker. */
 export function recap(value: string, max: number): string {
   if (value.length <= max || (CUT_AT_END.test(value) && value.length <= max + MARKER_ROOM)) return value;
-  return `${value.slice(0, Math.max(0, max))}${endMarker(value.length - max)}`;
+  return `${head(value, max)}${endMarker(value.length - max)}`;
 }
 
