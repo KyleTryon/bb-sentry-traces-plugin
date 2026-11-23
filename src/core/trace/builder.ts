@@ -358,7 +358,7 @@ export class TraceBuilder {
    */
   snapshot(now?: number): Turn[] {
     const stale = now !== undefined && now - this.lastEventAt > STALE_MS;
-    return [...this.turns.values()].map(({ spanIds, activityIds, lastAt, previousEnd, ...turn }) => {
+    return [...this.turns.values()].map(({ spanIds, activityIds, lastAt, previousEnd: _previousEnd, ...turn }) => {
       const end = turn.end ?? (stale ? lastAt : null);
       const close = <T extends { start: number; end: number | null }>(
         item: T,

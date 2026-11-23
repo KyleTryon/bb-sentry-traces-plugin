@@ -201,7 +201,8 @@ and its threads export as one trace per turn.
   several turns finish before one export, the last of them carries the usage
   for all (`bb.usage.turns`). A thread first seen after it already has history
   gets no usage on its first exported turn. Providers that report no token
-  usage to bb show none.
+  usage to bb show none, and a turn that is stopped before it ends may get
+  none either: Claude Code, for one, reports usage only when a turn finishes.
 - **Only the requested model is known.** The plugin sends
   `gen_ai.request.model` and no `gen_ai.response.model`; Sentry fills the
   response model from the request and still works out cost.

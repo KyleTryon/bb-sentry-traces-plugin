@@ -33,6 +33,11 @@ describe("version", () => {
       .parse(JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")));
     expect(VERSION).toBe(manifest.version);
   });
+
+  it("has release notes in CHANGELOG.md", () => {
+    const changelog = readFileSync(new URL("../CHANGELOG.md", import.meta.url), "utf8");
+    expect(changelog.split("\n")).toContain(`## ${VERSION}`);
+  });
 });
 
 describe("parseDsn", () => {

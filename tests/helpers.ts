@@ -182,7 +182,7 @@ export function fakeFetch(respond: () => number | Error = () => 200) {
   const fetchImpl = (async (url: unknown, init?: RequestInit) => {
     const answer = respond();
     if (answer instanceof Error) throw answer;
-    const body = JSON.parse(String(init?.body)) as OtlpTraces;
+    const body = JSON.parse(init?.body as string) as OtlpTraces;
     if (answer >= 200 && answer < 300) {
       sent.push({
         url: String(url),
