@@ -9,13 +9,33 @@
  */
 export const REDACTED = "[redacted]";
 
-/** Names of credential-like variables and fields. `AUTHOR` is not one; `AUTHORIZATION` is. */
+/**
+ * Names ending in `_KEY` that are not credentials: database, cache and map
+ * keys and the like. `PRIMARY_KEY=id` is code, `STRIPE_KEY=…` is not.
+ */
+const PLAIN_KEY_NAME =
+  "(?:PRIMARY|FOREIGN|SORT|PARTITION|CACHE|IDEMPOTENCY|ROUTING|PUBLIC|PUB|HASH|RANGE|LOOKUP|GROUP|MAP|ROW|DEDUPE?|UNIQUE|OBJECT|S3|I18N|TRANSLATION|STORAGE|SHORTCUT|HOT|SEARCH|INDEX|SHARD|BUCKET|FIELD|ITEM|ENTRY|STATE|LABEL|MESSAGE|LOCALE|COLUMN|TABLE|EVENT|METRIC|TAG|QUERY|LIST|SECTION|REACT|SSH_PUBLIC)";
+
+/**
+ * Names of credential-like variables and fields. `AUTHOR` is not one;
+ * `AUTHORIZATION` is. The short words `PASS`, `PWD` and `KEY` count only as a
+ * whole part of a name (`DB_PASS`, `MYSQL_PWD`, `SIGNING_KEY`, `api-key`), so
+ * `passport`, `monkey` and a plain `key` are left alone.
+ */
 const CREDENTIAL_NAME =
-  "(?:API_?KEY|TOKEN(?!S)|SECRET|PASSWORD|PASSWD|CREDENTIAL|ACCESS_?KEY|AUTH(?!OR(?!IZ))|SESSION|COOKIE|PRIVATE_?KEY|DSN)";
+  "(?:API[_-]?KEY|TOKEN(?!S)|SECRET|PASSWORD|PASSWD|PASSPHRASE|CREDENTIAL|ACCESS[_-]?KEY|ACCOUNT[_-]?KEY" +
+  "|AUTH(?!OR(?!IZ))|SESSION|COOKIE|PRIVATE[_-]?KEY|DSN" +
+  "|(?<![A-Za-z0-9])(?:PASS|PWD)(?![A-Za-z0-9])" +
+  `|(?<=[A-Za-z0-9])(?<!${PLAIN_KEY_NAME})[_-]KEY(?![A-Za-z0-9]))`;
+/**
+ * The rest of a name around a credential word. Bounded, so a long run of
+ * name characters cannot make a match try every split of it.
+ */
+const NAME_PART = "[A-Za-z0-9_-]{0,64}";
 
 /** Lines that look like dotenv assignments of credential-like variables. */
 const ENV_LINE = new RegExp(
-  `^(\\s*(?:export\\s+)?[A-Za-z0-9_]*${CREDENTIAL_NAME}[A-Za-z0-9_]*\\s*[=:]\\s*)\\S.*$`,
+  `^(\\s*(?:export\\s+)?${NAME_PART}${CREDENTIAL_NAME}${NAME_PART}\\s*[=:]\\s*)\\S.*$`,
   "i",
 );
 
@@ -24,7 +44,7 @@ const ENV_LINE = new RegExp(
  * `cd app && API_KEY=… npm start`.
  */
 const INLINE_NAME = new RegExp(
-  String.raw`(?<![A-Za-z0-9_])(?:export\s+)?[A-Za-z0-9_]*${CREDENTIAL_NAME}[A-Za-z0-9_]*=(?!=)`,
+  String.raw`(?<![A-Za-z0-9_])(?:export\s+)?${NAME_PART}${CREDENTIAL_NAME}${NAME_PART}=(?!=)`,
   "gi",
 );
 /**
@@ -138,23 +158,27 @@ function scrubInlineAssignments(text: string): string {
 
 /** Quoted credential-like keys with quoted values, as in JSON, YAML or code: `"apiKey": "…"`. */
 const QUOTED_PAIR = new RegExp(
-  `((["'])[A-Za-z0-9_.-]*${CREDENTIAL_NAME}[A-Za-z0-9_.-]*\\2\\s*[:=]\\s*)(["'])(?:\\\\.|(?!\\3)[^\\\\\\n])+\\3`,
+  `((["'])[A-Za-z0-9_.-]{0,64}${CREDENTIAL_NAME}[A-Za-z0-9_.-]{0,64}\\2\\s*[:=]\\s*)(["'])(?:\\\\.|(?!\\3)[^\\\\\\n])+\\3`,
   "gi",
 );
 
-const PEM_BLOCK =
-  /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g;
+/**
+ * What a private key marker says after BEGIN or END: `RSA PRIVATE KEY`, or
+ * `PGP PRIVATE KEY BLOCK` for a PGP key. Its kind is bounded, so a run of
+ * spaces cannot make every match attempt walk it.
+ */
+const MARKER_NAME = "[A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----";
 /** In text cut short here: a key whose end was cut off runs to the end. */
-const PEM_UNTERMINATED = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*$/;
+const PEM_UNTERMINATED = new RegExp(`-----BEGIN ${MARKER_NAME}[\\s\\S]*$`);
 /** In text cut short here: a key whose start was cut off runs from the start. */
-const PEM_UNSTARTED = /^[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/;
+const PEM_UNSTARTED = new RegExp(`^[\\s\\S]*?-----END ${MARKER_NAME}`);
 
-/** Every key marker ends with this; text without it has no key to look for. */
-const KEY_MARKER = "PRIVATE KEY-----";
-const BEGIN_MARKER = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/g;
-const END_MARKER = /-----END [A-Z0-9 ]*PRIVATE KEY-----/g;
-/** The header lines of an encrypted key, which sit between its marker and its body. */
-const KEY_HEADER = /(?:Proc-Type|DEK-Info|Comment):[^\r\n\\]*/y;
+/** Every key marker has this; text without it has no key to look for. */
+const KEY_MARKER = "PRIVATE KEY";
+const BEGIN_MARKER = new RegExp(`-----BEGIN ${MARKER_NAME}`, "g");
+const END_MARKER = new RegExp(`-----END ${MARKER_NAME}`, "g");
+/** The header lines of an encrypted or PGP key, which sit between its marker and its body. */
+const KEY_HEADER = /(?:Proc-Type|DEK-Info|Comment|Version|Hash|Charset):[^\r\n\\]*/y;
 const KEY_CHAR = /[A-Za-z0-9+/=]/;
 /** A piece of key body this long is taken to be one whatever it looks like. */
 const LONG_KEY_PIECE = 16;
@@ -295,19 +319,120 @@ export interface Cut {
   end?: boolean;
 }
 
+/**
+ * Replaces whole keys, BEGIN marker to END marker. Done by hand, not with one
+ * lazy pattern: that would walk to the end of the text from every BEGIN that
+ * has no END after it.
+ */
+function scrubWholeKeys(text: string): string {
+  let out = "";
+  let at = 0;
+  for (;;) {
+    BEGIN_MARKER.lastIndex = at;
+    const begin = BEGIN_MARKER.exec(text);
+    if (!begin) break;
+    END_MARKER.lastIndex = begin.index + begin[0].length;
+    const end = END_MARKER.exec(text);
+    // No END after this BEGIN means none after any later BEGIN either.
+    if (!end) break;
+    out += text.slice(at, begin.index) + REDACTED;
+    at = end.index + end[0].length;
+  }
+  // `matchAll` starts where these were left.
+  BEGIN_MARKER.lastIndex = 0;
+  END_MARKER.lastIndex = 0;
+  return at === 0 ? text : out + text.slice(at);
+}
+
+/**
+ * Credentials in a URL, as in `postgres://user:pass@host`. The user may be
+ * empty (`redis://:pass@host`), and the password may hold `/` or `@`: an `@`
+ * belongs to it while another `@` follows before any `/`. A port is not a
+ * password, so `http://localhost:3000/@vite/client` is left alone, and a
+ * quote ends the URL, so it cannot run on into the next JSON field. Every part
+ * is bounded, so no input makes it slow; the scheme has no `\b` before it, so
+ * a scheme glued to the word before it is still found.
+ */
+const URL_CREDENTIALS =
+  /[a-z][a-z0-9+.-]{0,31}:\/\/[^\s/:@"'`<>]{0,256}:(?!\d{1,5}(?:[/?#]|$))(?:[^\s@"'`<>]|@(?=[^\s@/"'`<>]{0,256}@)){1,256}@/gi;
+
+/** `Basic` and what may be base64 of `user:password`, anywhere in a line. */
+const BASIC_CREDENTIALS = /\bBasic\s+([A-Za-z0-9+/]{4,4096}={0,2})(?![A-Za-z0-9+/=])/g;
+
+/**
+ * Whether text after `Basic` is HTTP basic credentials: base64 of
+ * `user:password`. Decoding it tells credentials from a word, as in
+ * `Basic information`, which no pattern could.
+ */
+function isBasicCredential(encoded: string): boolean {
+  try {
+    // Printable text with a colon in it; a word decodes to binary.
+    const decoded = atob(encoded);
+    return decoded.includes(":") && /^[\x20-\x7e\u0080-ÿ]+$/.test(decoded);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Credentials in HTTP headers anywhere in a line, as in `curl -H "…"`: the
+ * value of an `Authorization` header (its scheme stays), of a header named
+ * like a key or token, and of a cookie header.
+ */
+const AUTH_HEADER = /(\b(?:Proxy-)?Authorization\s{0,8}:\s{0,8})((?:[A-Za-z][\w-]{0,20}\s+)?)[^\s"'\\]{1,4096}/gi;
+const NAMED_KEY_HEADER =
+  /(\b(?:X-[A-Za-z0-9-]{0,32}(?:Key|Token|Secret|Auth|Signature)|Api-Key)\s{0,8}:\s{0,8})[^\s"'\\]{1,4096}/gi;
+const COOKIE_HEADER = /(\b(?:Set-)?Cookie\s{0,8}:\s{0,8})[^\s"'\\][^"'\r\n\\]{0,4095}/gi;
+
+/** Passwords given as command flags: `curl -u user:pass` and `mysql -ppass`. */
+const CURL_USER = /(\bcurl\b[^\n|;&]{0,256}?\s(?:-u|--user)(?:\s{1,8}|=)?["']?)[^\s"':]{0,256}:[^\s"']{1,4096}/g;
+const MYSQL_PASSWORD = /(\bmysql(?:dump|admin|sh|import)?\b[^\n|;&]{0,256}?\s-p)(["']?)[^\s"']{1,4096}/g;
+
+/**
+ * An AWS secret access key next to its name, as `aws configure` or a
+ * credentials file has it: 40 characters that look like nothing on their own.
+ */
+const AWS_SECRET =
+  /(\baws[A-Za-z0-9_.-]{0,32}secret[A-Za-z0-9_.-]{0,32}["']?\s{0,8}[\s=:,]\s{0,8}["']?)[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+=])/gi;
+
+/** Credentials that keep the text around them: the name, header or flag stays. */
+const LABELLED_PATTERNS: Array<[RegExp, string]> = [
+  [AUTH_HEADER, `$1$2${REDACTED}`],
+  [NAMED_KEY_HEADER, `$1${REDACTED}`],
+  [COOKIE_HEADER, `$1${REDACTED}`],
+  [CURL_USER, `$1${REDACTED}`],
+  [MYSQL_PASSWORD, `$1$2${REDACTED}`],
+  [AWS_SECRET, `$1${REDACTED}`],
+];
+
+/**
+ * A token's prefix starts it only where no letter or digit comes before, so
+ * `MY_ghp_…` is caught and `xghp_` is not; `\b` would miss the first, since
+ * `_` is a word character.
+ */
+const START = "(?<![A-Za-z0-9])";
+
 /** Known token shapes; each hit is replaced wholesale. */
 const TOKEN_PATTERNS: RegExp[] = [
-  /\bAKIA[0-9A-Z]{16}\b/g, // AWS access key id
-  /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b/g, // GitHub tokens
-  /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, // GitHub fine-grained tokens
-  /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g, // Slack tokens
-  /\bAIza[0-9A-Za-z_-]{35}\b/g, // Google API keys
-  /\bsk-(?:ant-)?[A-Za-z0-9_-]{20,}\b/g, // OpenAI and Anthropic keys
-  /\bsntry[su]_[A-Za-z0-9_=-]{20,}/g, // Sentry auth tokens
-  /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}\b/g, // JWTs
+  new RegExp(`${START}(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}(?![A-Za-z0-9])`, "g"), // AWS access key ids
+  new RegExp(`${START}gh[pousr]_[A-Za-z0-9]{20,}`, "g"), // GitHub tokens
+  new RegExp(`${START}github_pat_[A-Za-z0-9_]{20,}`, "g"), // GitHub fine-grained tokens
+  new RegExp(`${START}gl(?:pat|ptt|dt|rt|cbt|soat|ft|imt|agent)-[A-Za-z0-9_-]{20,}`, "g"), // GitLab tokens
+  new RegExp(`${START}xox[abeprs](?:\\.xox[abeprs])?-[A-Za-z0-9-]{10,}`, "g"), // Slack tokens
+  new RegExp(`${START}xapp-\\d-[A-Za-z0-9-]{10,}`, "g"), // Slack app tokens
+  /\bhttps:\/\/hooks\.slack\.com\/(?:services|workflows|triggers)\/[A-Za-z0-9_/-]{8,}/gi, // Slack webhooks
+  /\bhttps:\/\/(?:canary\.|ptb\.)?discord(?:app)?\.com\/api\/webhooks\/\d+\/[A-Za-z0-9_-]+/gi, // Discord webhooks
+  new RegExp(`${START}AIza[0-9A-Za-z_-]{35}`, "g"), // Google API keys
+  new RegExp(`${START}sk-[A-Za-z0-9_-]{20,}`, "g"), // OpenAI and Anthropic keys, sk-proj- and sk-ant- too
+  new RegExp(`${START}[sr]k_(?:live|test)_[A-Za-z0-9]{10,}`, "g"), // Stripe secret and restricted keys
+  new RegExp(`${START}whsec_[A-Za-z0-9]{20,}`, "g"), // Stripe webhook secrets
+  new RegExp(`${START}npm_[A-Za-z0-9]{30,}`, "g"), // npm tokens
+  new RegExp(`${START}hf_[A-Za-z0-9]{30,}`, "g"), // Hugging Face tokens
+  new RegExp(`${START}sntry[su]_[A-Za-z0-9_=-]{20,}`, "g"), // Sentry auth tokens
+  new RegExp(`${START}eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{5,}`, "g"), // JWTs
   /\bBearer\s+[A-Za-z0-9._~+/-]{16,}=*/gi, // bearer headers
-  /\b[a-z][a-z0-9+.-]*:\/\/[^\s/:@]+:[^\s/@]+@/gi, // credentials inside a URL
-  /\bhttps?:\/\/[0-9a-f]{32}@[^\s/]+\/\d+/gi, // Sentry DSNs
+  URL_CREDENTIALS,
+  /\bhttps?:\/\/[0-9a-f]{32}@[^\s/]{1,256}\/\d+/gi, // Sentry DSNs
 ];
 
 /**
@@ -318,7 +443,7 @@ const TOKEN_PATTERNS: RegExp[] = [
 export function scrubSecrets(value: string, cut: Cut = {}): string {
   let out = value;
   if (out.includes(KEY_MARKER)) {
-    out = out.replace(PEM_BLOCK, REDACTED);
+    out = scrubWholeKeys(out);
     if (cut.end) out = out.replace(PEM_UNTERMINATED, REDACTED);
     if (cut.start) out = out.replace(PEM_UNSTARTED, REDACTED);
     out = scrubCutOffKeys(out);
@@ -331,10 +456,17 @@ export function scrubSecrets(value: string, cut: Cut = {}): string {
     .map((line) => line.replace(ENV_LINE, `$1${REDACTED}`))
     .join("\n");
   out = out.replace(QUOTED_PAIR, `$1$3${REDACTED}$3`);
+  for (const [pattern, replacement] of LABELLED_PATTERNS) out = out.replace(pattern, replacement);
+  out = out.replace(BASIC_CREDENTIALS, (match, encoded: string) =>
+    isBasicCredential(encoded) ? `Basic ${REDACTED}` : match,
+  );
   for (const pattern of TOKEN_PATTERNS) out = out.replace(pattern, REDACTED);
   return out;
 }
 
 /** A field named like a credential, as in `{"apiKey": "…"}`. */
-export const CREDENTIAL_KEY = new RegExp(`^[A-Za-z0-9_.-]*${CREDENTIAL_NAME}[A-Za-z0-9_.-]*$`, "i");
+export const CREDENTIAL_KEY = new RegExp(
+  `^[A-Za-z0-9_.-]{0,64}${CREDENTIAL_NAME}[A-Za-z0-9_.-]{0,64}$`,
+  "i",
+);
 

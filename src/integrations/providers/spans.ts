@@ -4,7 +4,14 @@
  */
 import { span as otlpSpan, spanIdFor, traceIdFor, type AttributeValue, type OtlpSpan } from "../../core/otlp.js";
 import { scrub } from "../../core/scrub/cut.js";
-import { sanitizeAttributes, sanitizeContent, type ProviderSpan, type ProviderTrace } from "./schema.js";
+import { errorCode } from "../../core/text.js";
+import {
+  sanitizeAttributes,
+  sanitizeContent,
+  sanitizeSharedAttributes,
+  type ProviderSpan,
+  type ProviderTrace,
+} from "./schema.js";
 import { ROOT_KEY, type TraceContext } from "./types.js";
 
 export function providerTraceId(provider: string, traceKey: string): string {
@@ -14,7 +21,11 @@ export function providerSpanId(provider: string, traceKey: string, spanKey: stri
   return spanIdFor(`provider/${provider}/${traceKey}/${spanKey}`);
 }
 
-/** The attributes every span of a provider's trace carries. */
+/**
+ * The attributes every span of a provider's trace carries. The provider's own
+ * are checked again here, so a context kept from before a check was added
+ * cannot put text or token counts on every span.
+ */
 export function traceAttributes(context: {
   provider: string;
   traceKey: string;
@@ -22,7 +33,7 @@ export function traceAttributes(context: {
   traceAttributes: Record<string, AttributeValue>;
 }): Record<string, AttributeValue> {
   return {
-    ...context.traceAttributes,
+    ...sanitizeSharedAttributes(context.traceAttributes),
     "bb.trace.provider": context.provider,
     "bb.trace.key": context.traceKey,
     // Left out entirely when unknown, so it cannot blank another source's value.
@@ -97,7 +108,7 @@ export function providerSpans(
   const shared = traceAttributes({
     ...ref,
     pipeline: trace.pipeline || ref.pipeline,
-    traceAttributes: { ...ref.traceAttributes, ...sanitizeAttributes(trace.attributes) },
+    traceAttributes: { ...ref.traceAttributes, ...sanitizeSharedAttributes(trace.attributes) },
   });
   const keys = new Set(trace.spans.map((span) => span.key));
   const spans: OtlpSpan[] = [];
@@ -119,6 +130,8 @@ export function providerSpans(
     const isRoot = span.key === ROOT_KEY;
     const parentKey = span.parentKey && keys.has(span.parentKey) ? span.parentKey : ROOT_KEY;
     const failed = span.status === "error";
+    // The contract asks for a short, fixed reason; anything else reads as free text.
+    const errorType = errorCode(span.errorType) ?? "error";
     spans.push(
       otlpSpan({
         traceId,
@@ -135,7 +148,7 @@ export function providerSpans(
           ...(isRoot ? rootAttributes : {}),
           "sentry.op": span.op || `${ref.provider}.span`,
           "bb.workflow.run_id": span.workflowRunId || undefined,
-          "error.type": failed ? span.errorType || "error" : undefined,
+          "error.type": failed ? errorType : undefined,
         },
         error: failed
           ? {
@@ -143,7 +156,7 @@ export function providerSpans(
               message:
                 captureContent && span.errorMessage
                   ? scrub(span.errorMessage, 300)
-                  : span.errorType || "error",
+                  : errorType,
             }
           : null,
       }),

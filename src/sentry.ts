@@ -14,7 +14,17 @@ export interface SentryTarget {
   projectId: string;
 }
 
-export type DsnResult = { ok: true; target: SentryTarget } | { ok: false; reason: string };
+export type DsnResult =
+  | {
+      ok: true;
+      target: SentryTarget;
+      /** Set when the DSN sends traces in the clear to another machine. */
+      warning?: string;
+    }
+  | { ok: false; reason: string };
+
+/** Hosts a plain http:// DSN may point at without a warning: this machine. */
+const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
 /** Reads a DSN such as `https://<publicKey>@o1.ingest.us.sentry.io/42`. */
 export function parseDsn(raw: string | undefined | null): DsnResult {
@@ -43,6 +53,9 @@ export function parseDsn(raw: string | undefined | null): DsnResult {
   }
   // A self-hosted Sentry can live under a path prefix, which stays in front of /api.
   const prefix = segments.length > 0 ? `/${segments.join("/")}` : "";
+  // http:// stays allowed for a self-hosted Sentry in development, but past
+  // this machine anyone on the way can read the traces and the key.
+  const plaintext = url.protocol === "http:" && !LOCAL_HOSTS.has(url.hostname);
   return {
     ok: true,
     target: {
@@ -51,6 +64,9 @@ export function parseDsn(raw: string | undefined | null): DsnResult {
       host: url.host,
       projectId,
     },
+    ...(plaintext
+      ? { warning: "The DSN uses plain http://: traces and the DSN key are sent unencrypted. Use https://." }
+      : {}),
   };
 }
 
@@ -87,7 +103,20 @@ async function post(target: SentryTarget, payload: OtlpTraces, fetchImpl: Fetch)
       headers: { "content-type": "application/json", "x-sentry-auth": target.authHeader },
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
+      // A redirect is not followed: it could carry the auth header and the
+      // traces to another host. Sentry's ingest endpoint does not redirect.
+      redirect: "manual",
     });
+    if (response.type === "opaqueredirect" || (response.status >= 300 && response.status < 400)) {
+      return {
+        ok: false,
+        status: response.status || null,
+        message: "Sentry answered with a redirect, which is not followed. Check the DSN's host.",
+        // The same DSN gets the same redirect.
+        retryable: false,
+        payloadRejected: false,
+      };
+    }
     if (response.ok) {
       return { ok: true, status: response.status, message: "", retryable: false, payloadRejected: false };
     }

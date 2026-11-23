@@ -18,7 +18,10 @@
  *   command line, tool argument, tool output, file name or model-written
  *   label: only tool names, timing, status and exit codes. When it is on it
  *   keeps the prompt, the replies, and each call's arguments and result.
- * - Every span has a `toolName` that is safe to send either way.
+ * - Every span has a `toolName` that is safe to send without content: a tool
+ *   or agent name that is not a plain identifier becomes `tool` or
+ *   `subagent` then. Provider and bb error text is kept without content only
+ *   when it reads as a code, such as `overloaded_error`.
  * - A subagent keeps the tool that started it, the kind of agent it is, and
  *   when that tool call returned, so it can be reported as a tool call that
  *   hands work to another agent.
@@ -48,7 +51,7 @@ import {
 } from "./types.js";
 import { scrub, scrubLine, scrubTail } from "../scrub/cut.js";
 import { scrubValue } from "../scrub/value.js";
-import { record, text, type Json } from "../text.js";
+import { errorCode, record, text, toolName, type Json } from "../text.js";
 
 const MAX_TEXT = 160;
 const MAX_ERROR = 300;
@@ -137,9 +140,21 @@ export const SUBAGENT = "subagent";
  * A subagent's kind, when it is a plain identifier. It becomes an agent name
  * in Sentry, which has to be one of a small set, so free text is refused.
  */
-function agentKind(value: unknown): string {
+function agentKind(value: unknown, content: boolean): string {
   const kind = text(value).trim();
-  return /^[\w.:@/-]{1,64}$/.test(kind) ? kind : SUBAGENT;
+  if (/^[\w.:@-]{1,64}$/.test(kind)) return kind;
+  return content && kind ? clip(kind, 64) : SUBAGENT;
+}
+
+/**
+ * A tool's name as kept. A plain identifier stays as it is; anything else,
+ * such as a name with a path or spaces in it, is kept only with content, and
+ * is `fallback` without.
+ */
+function nameOfTool(value: string, content: boolean, fallback: string): string {
+  const name = toolName(value);
+  if (name) return name;
+  return content && value.trim() ? clip(value) : fallback;
 }
 
 /**
@@ -217,11 +232,11 @@ function describe(item: Json, content: boolean): Description {
       return { ...base, detail: clip(text(item['description']) || title) };
     }
     case "toolCall": {
-      const tool = text(item['tool']) || "tool";
+      const tool = nameOfTool(text(item['tool']), content, "tool");
       const args = record(item['arguments']);
       if (SUBAGENT_TOOLS.has(tool)) {
         const background = args['run_in_background'] === true;
-        const agent = agentKind(args['subagent_type']);
+        const agent = agentKind(args['subagent_type'], content);
         const base = { ...plain("subagent", tool), name: agent, agent, background };
         if (!content) return base;
         return {
@@ -241,7 +256,8 @@ function describe(item: Json, content: boolean): Description {
     default: {
       // The static label a plugin or provider registered for this kind of row.
       const label = record(record(item['presentation'])['label']);
-      const base = plain("tool", text(item['type']) || text(label['completed']) || "tool");
+      const kind = text(item['type']) || text(label['completed']);
+      const base = plain("tool", nameOfTool(kind, content, "tool"));
       return content ? { ...base, detail: clip(title) } : base;
     }
   }
@@ -270,10 +286,29 @@ function describeInteraction(
   };
 }
 
-function errorOf(item: Json): string | null {
+function errorMessageOf(item: Json): string {
   const error = item['error'];
-  const message = typeof error === "string" ? error : text(record(error)['message']);
+  return typeof error === "string" ? error : text(record(error)['message']);
+}
+
+function errorOf(item: Json): string | null {
+  const message = errorMessageOf(item);
   return message ? clip(message, MAX_ERROR) : null;
+}
+
+/**
+ * Error text from a provider or from bb, as kept. With content, `full`,
+ * scrubbed and cut. Without, the first of `parts` that reads as a code, such
+ * as `overloaded_error` or `ENOENT`: any other may hold a path, a command line
+ * or a credential.
+ */
+function errorText(full: string, parts: readonly string[], content: boolean): string | null {
+  if (content) return clip(full, MAX_ERROR) || null;
+  for (const part of parts) {
+    const code = errorCode(part);
+    if (code) return code;
+  }
+  return null;
 }
 
 /**
@@ -453,7 +488,8 @@ export class TraceBuilder {
         this.touch(turn, event.seq, event.createdAt);
         turn.end = event.createdAt;
         turn.status = itemStatus(data['status']);
-        turn.error = errorOf(data);
+        const message = errorMessageOf(data);
+        turn.error = errorText(message, [message], this.content);
         if (this.activeTurn === turn.id) this.activeTurn = null;
         return;
       }
@@ -466,35 +502,43 @@ export class TraceBuilder {
       case "system/interaction/lifecycle":
         this.foldInteraction(turnId, record(data['interaction']), event);
         return;
-      case "provider/error":
+      case "provider/error": {
+        const parts = [text(data['message']), text(data['detail'])];
         this.addMarker(turnId, event, {
           toolName: "Provider error",
           errorType: "provider_error",
-          error: [text(data['message']), text(data['detail'])].filter(Boolean).join(": "),
+          error: errorText(parts.filter(Boolean).join(": "), parts, this.content),
           status: "failed",
         });
         return;
-      case "system/error":
+      }
+      case "system/error": {
+        const parts = [text(data['message']), text(data['code'])];
         this.addMarker(turnId, event, {
           toolName: "bb error",
           errorType: "bb_error",
-          error: text(data['message']) || text(data['code']),
+          error: errorText(parts[0] || parts[1] || "", parts, this.content),
           status: "failed",
         });
         return;
-      case "system/thread/interrupted":
+      }
+      case "system/thread/interrupted": {
+        const reason = text(data['reason']);
         this.addMarker(turnId, event, {
           toolName: "Stopped",
           errorType: "interrupted",
-          error: text(data['reason']),
+          error: errorText(reason, [reason], this.content),
           status: "interrupted",
         });
         return;
+      }
       case "provider/modelFallback": {
         const turn = this.turnFor(turnId);
         const model = text(data['fallbackModel']);
         if (turn && model) {
-          turn.fallback = { model, reason: text(data['reason']) || null, at: event.createdAt };
+          // Without content, only a reason that reads as a code: free text may quote the prompt.
+          const reason = text(data['reason']);
+          turn.fallback = { model, reason: errorText(reason, [reason], this.content), at: event.createdAt };
         }
         return;
       }
@@ -669,7 +713,7 @@ export class TraceBuilder {
       kind: "error",
       ...marker,
       name: marker.toolName,
-      error: clip(marker.error ?? "", MAX_ERROR) || null,
+      error: marker.error,
       start: event.createdAt,
       end: event.createdAt,
       endSeq: event.seq,

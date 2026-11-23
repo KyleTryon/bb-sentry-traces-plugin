@@ -3,6 +3,7 @@
  * turn always produces the same trace and span ids, across restarts too.
  */
 import { createHash } from "node:crypto";
+import { head, wellFormed } from "./text.js";
 
 export type AnyValue =
   | { stringValue: string }
@@ -62,9 +63,17 @@ export function spanIdFor(key: string): string {
   return hexId(`span:${key}`, 8);
 }
 
-/** Milliseconds since the epoch as OTLP's nanosecond string. */
+/**
+ * The latest time written, in milliseconds: the year 2286. Past it a number
+ * prints in exponent form (`1e+300`), which is not a nanosecond string and
+ * makes Sentry refuse the whole request.
+ */
+export const MAX_TIME_MS = 1e13;
+
+/** Milliseconds since the epoch as OTLP's nanosecond string, kept to digits whatever comes in. */
 export function nanos(ms: number): string {
-  return `${Math.max(0, Math.round(ms))}000000`;
+  const clamped = Number.isFinite(ms) ? Math.min(MAX_TIME_MS, Math.max(0, Math.round(ms))) : 0;
+  return `${clamped}000000`;
 }
 
 /** Drops empty values; whole numbers become ints, the rest doubles. */
@@ -78,7 +87,8 @@ export function attributes(values: Record<string, AttributeValue>): Attribute[] 
         ? [{ key, value: { intValue: String(value) } }]
         : [{ key, value: { doubleValue: value } }];
     }
-    return [{ key, value: { stringValue: value.slice(0, MAX_ATTRIBUTE_CHARS) } }];
+    // Every string sent goes through here; half of a split character would not be valid JSON for Sentry.
+    return [{ key, value: { stringValue: wellFormed(head(value, MAX_ATTRIBUTE_CHARS)) } }];
   });
 }
 
@@ -101,7 +111,7 @@ const SELF_DESCRIBED = new Set(["invoke_agent", "chat", "execute_tool"]);
 
 export function span(input: SpanInput): OtlpSpan {
   const start = Math.round(input.start);
-  const name = input.name.slice(0, 200);
+  const name = wellFormed(head(input.name, 200));
   // Sentry derives a description for agent, model and tool spans only; any
   // other span shows "(no description)" unless it is given one.
   const operation = input.attributes["gen_ai.operation.name"];
@@ -122,7 +132,7 @@ export function span(input: SpanInput): OtlpSpan {
     status: input.error
       ? {
           code: STATUS_ERROR,
-          ...(input.error.message ? { message: input.error.message.slice(0, 500) } : {}),
+          ...(input.error.message ? { message: wellFormed(head(input.error.message, 500)) } : {}),
         }
       : { code: STATUS_OK },
   };

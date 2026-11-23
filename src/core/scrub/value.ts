@@ -3,6 +3,7 @@
  * message content that may be JSON. Strings are scrubbed one by one, so a
  * credential-named field is redacted even when its value is not a known shape.
  */
+import { head } from "../text.js";
 import { endMarker, SCRUB_MARGIN, scrub } from "./cut.js";
 import { CREDENTIAL_KEY, REDACTED, scrubSecrets } from "./secrets.js";
 
@@ -16,9 +17,9 @@ const MAX_DEPTH = 64;
 function scrubStrings(value: unknown, room: { left: number }, depth = 0): unknown {
   if (typeof value === "string") {
     if (room.left <= 0) return "";
-    const head = value.slice(0, room.left);
-    room.left -= head.length;
-    return scrubSecrets(head, { end: head !== value });
+    const kept = head(value, room.left);
+    room.left -= kept.length;
+    return scrubSecrets(kept, { end: kept !== value });
   }
   if (value === null || typeof value !== "object") return value;
   // Too deep to walk: scrubbed as the text it would become.
@@ -27,7 +28,8 @@ function scrubStrings(value: unknown, room: { left: number }, depth = 0): unknow
   const copy: Record<string, unknown> = {};
   for (const [key, item] of Object.entries(value)) {
     copy[key] =
-      typeof item === "string" && item && CREDENTIAL_KEY.test(key)
+      // A number can be a credential too: a PIN, a numeric key.
+      ((typeof item === "string" && item) || typeof item === "number") && CREDENTIAL_KEY.test(key)
         ? REDACTED
         : scrubStrings(item, room, depth + 1);
   }
@@ -54,7 +56,7 @@ export function scrubValue(value: unknown, max: number): string {
   if (full === undefined || clean === undefined) return "";
   if (full.length <= max && clean.length <= max) return clean;
   const over = Math.max(full.length, clean.length) - max;
-  return `${clean.slice(0, Math.max(0, max))}${endMarker(over)}`;
+  return `${head(clean, max)}${endMarker(over)}`;
 }
 
 /** Scrubs text that may itself be JSON, as a provider's message content is: then as `scrubValue` does. */

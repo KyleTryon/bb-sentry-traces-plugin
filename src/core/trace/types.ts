@@ -59,6 +59,8 @@ export interface Span {
   /**
    * A name with no user or model content in it: the tool's own name
    * (`shell`, `Read`, `mcp__docs__search`), `subagent`, `Question`, and so on.
+   * A tool name that is not a plain identifier is `tool` unless content
+   * capture is on, and then it is scrubbed and cut.
    */
   toolName: string;
   /** A display name. Equal to `toolName` unless content capture is on. */
@@ -85,7 +87,8 @@ export interface Span {
   errorType: ErrorType | null;
   /**
    * What went wrong. A tool's own error text is tool output, so it is kept
-   * only with content capture; provider and bb errors are always kept.
+   * only with content capture. Provider and bb errors are kept whole with
+   * content capture, and without it only when they read as a code.
    */
   error: string | null;
   /** The call's arguments as text. Null unless content capture is on. */
