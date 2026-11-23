@@ -167,7 +167,9 @@ identifier.
 This reads two things from bb's bundled Workflows plugin: each worker thread's
 Workflows metadata, and the `workflowRunView` RPC. That RPC is internal to
 Workflows and may change. If it does, or Workflows is disabled or removed,
-workers export on their own, one trace per turn, without waiting.
+workers export on their own, one trace per turn, without waiting. If
+Workflows fails for a moment, a worker's turns wait for it to answer again,
+for up to 30 minutes, and then go out on their own.
 
 ## Trace providers
 
@@ -197,7 +199,8 @@ sentry-traces status` lists the providers that reported in the last 30 days.
   in `bb.agent.id`. A thread no provider names is named by its bb provider
   (`claude-code`).
 - **A thread belongs to one provider.** The first to claim it keeps it until
-  it lets go. Each thread keeps its own conversation, and every span carries
+  it lets go, or until it has not reported for 30 days, as when it was
+  removed. Each thread keeps its own conversation, and every span carries
   `bb.trace.provider`, `bb.trace.key` and the provider's own attributes.
 - **A provider's spans are sent as they settle.** A provider reports its
   trace as a whole snapshot whenever it changes. A span it marks `final`, such

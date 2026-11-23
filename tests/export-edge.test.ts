@@ -10,6 +10,7 @@ import { scheduleCheck } from "../src/export/retries.js";
 import { noteTrace } from "../src/export/runs.js";
 import type { ExportContext, RetryEntry, TraceEntry } from "../src/export/types.js";
 import { TraceBuilder } from "../src/core/trace/builder.js";
+import { traceSchema } from "../src/integrations/providers/schema.js";
 import { ProviderStore } from "../src/integrations/providers/store.js";
 import type { TraceContext } from "../src/integrations/providers/types.js";
 import type { OtlpSpan, OtlpTraces } from "../src/core/otlp.js";
@@ -559,6 +560,58 @@ describe("pruning what providers reported", () => {
     await tick();
     expect(await bb.storage.kv.list("snapshot")).toEqual([]);
     expect(await bb.storage.kv.list("provider:")).toEqual([]);
+  });
+});
+
+describe("a snapshot replaced while it is read or pruned", () => {
+  it("keeps a snapshot reported again while it is being pruned", async () => {
+    const { bb, tick, clock, report } = await setup();
+    const orphan = (key: string) => ({ key: "orphan", ended: false, spans: [{ key, name: key, start: 1, end: 2 }] });
+    await report(orphan("a"));
+    clock.now += 31 * DAY;
+    const get = bb.storage.kv.get.bind(bb.storage.kv);
+    let raced = false;
+    vi.spyOn(bb.storage.kv, "get").mockImplementation(async (key: string) => {
+      // Pruning has read the old head, and now looks for the trace's entry.
+      if (key === `trace:${P}/orphan` && !raced) {
+        raced = true;
+        await report(orphan("b"));
+      }
+      return get(key);
+    });
+    await tick();
+    expect(raced).toBe(true);
+    expect(await bb.storage.kv.list("snapshot:")).toHaveLength(1);
+    expect(await bb.storage.kv.list("snapshot-part:")).toHaveLength(1);
+  });
+
+  it("reads the newer report, not none, when the one it was reading is replaced", async () => {
+    let now = 1_000_000;
+    const data = new Map<string, unknown>();
+    let beforeGet: ((key: string) => Promise<void>) | null = null;
+    const kv = {
+      get: async <T>(key: string) => {
+        await beforeGet?.(key);
+        return structuredClone(data.get(key)) as T | undefined;
+      },
+      set: async (key: string, value: unknown) => {
+        data.set(key, structuredClone(value));
+      },
+      delete: async (key: string) => {
+        data.delete(key);
+      },
+      list: async (prefix = "") => [...data.keys()].filter((key) => key.startsWith(prefix)),
+    };
+    const store = new ProviderStore(kv, () => now);
+    const trace = (key: string) => traceSchema.parse({ key: "k", ended: false, spans: [{ key, name: key, start: 1, end: 2 }] });
+    await store.saveSnapshot(P, trace("a"));
+    beforeGet = async (key) => {
+      if (!key.startsWith("snapshot-part:")) return;
+      beforeGet = null;
+      now += 1_000;
+      await store.saveSnapshot(P, trace("b"));
+    };
+    expect(await store.snapshot(P, "k")).toMatchObject({ spans: [{ key: "b" }] });
   });
 });
 

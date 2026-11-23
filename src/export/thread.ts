@@ -16,7 +16,7 @@ import {
   WAIT_CHECK_MAX_MS,
   WAIT_CHECK_MIN_MS,
 } from "./constants.js";
-import { placeThread } from "./location.js";
+import { placeNow, placeThread } from "./location.js";
 import { fold, readCostTotal, readUsage, readsOn, resumePoint } from "./read.js";
 import { clearRetry, scheduleCheck, scheduleRetry } from "./retries.js";
 import { noteTrace, noteWorkflow } from "./runs.js";
@@ -26,6 +26,7 @@ import { fromBeforeGap, kv, recordFailure, recordSuccess, sendingSince } from ".
 import type { ExportContext, ExportOutcome, Folded, ThreadState } from "./types.js";
 import { contextForTurn } from "../integrations/providers/placement.js";
 import type { TraceContext } from "../integrations/providers/types.js";
+import { NOT_NOW } from "../integrations/workflows/client.js";
 import type { WorkflowContext } from "../integrations/workflows/ids.js";
 import { type SendResult, type SentryTarget, sendSpans } from "../sentry.js";
 import type { ThreadInfo } from "../thread.js";
@@ -75,7 +76,7 @@ export async function previewThread(
       if (cost) usage.set(newest.id, { usage: null, turns: picked.length, costUsd: cost });
     }
   }
-  const { workflow, trace } = await placeThread(ctx, thread);
+  const { workflow, trace } = await placeNow(ctx, thread);
   const now = ctx.now();
   const spans = picked.flatMap((turn) =>
     turnSpans(turn, {
@@ -381,7 +382,15 @@ export async function exportThread(ctx: ExportContext, thread: ThreadInfo): Prom
   const pending = due.filter((turn) => !waits(turn));
   let workflow: WorkflowContext | null = null;
   let trace: TraceContext | null = null;
-  if (pending.length > 0) ({ workflow, trace } = await placeThread(ctx, thread));
+  if (pending.length > 0) {
+    const placed = await placeThread(ctx, thread);
+    // Workflows failed for a moment: sent now, the worker's turns would be outside its run for good.
+    if (placed === NOT_NOW) {
+      await scheduleCheck(ctx, thread.id, now + WAIT_CHECK_MIN_MS);
+      return { kind: "nothing" };
+    }
+    ({ workflow, trace } = placed);
+  }
 
   // While a turn waits, its tokens so far are in the thread's total too, and
   // the total cannot be split by turn: the usage waits with it.

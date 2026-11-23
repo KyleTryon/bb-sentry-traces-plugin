@@ -27,17 +27,34 @@ setting, is no longer supported.
 
 - Every call carries `"contract": 2`, and every answer carries it back. A call
   with another version is refused with an `invalid` error that names the
-  version this plugin speaks.
+  version this plugin speaks, whatever else the call holds, so a call written
+  for another version gets that answer rather than a list of fields.
 - Only another bb plugin may call. Calls from the app, the `bb` CLI or an
   agent are refused with `forbidden`. bb tells this plugin which plugin
   called, and that plugin id is your provider id: it is sent as
   `bb.trace.provider` and goes into every trace and span id.
-- A call that does not match this page is refused with `invalid_input`, and
-  nothing of it is kept. The plugin ignores fields it does not know.
+- A call on version 2 that does not match this page is refused with
+  `invalid_input`, and nothing of it is kept. The plugin ignores fields it
+  does not know.
 - Times are milliseconds since the epoch.
 - Every answer says whether export is on (`sending`). You may skip building
   snapshots while it is `false`, but keep claiming threads: a claim made
   while export is off is used once it is on.
+
+### Errors
+
+A refused call fails with one of these codes, in the order they are checked,
+and nothing of it is kept:
+
+| Code | When |
+| --- | --- |
+| `invalid_input` | A call that names version 2, or no version, and does not match this page: a missing or mistyped field, more than 200 threads or 2,000 spans, a key over 200 characters, a name, op, pipeline, model or other short text over 1,000 characters, a time out of range, or a `report_trace` call with both or neither of `trace` and `deleted`. The error lists the fields. |
+| `forbidden` | The caller is not another bb plugin: the app, the `bb` CLI, an agent, or this plugin itself. |
+| `invalid` | The call names a contract version other than 2, whatever else it holds. The message names version 2. |
+| `invalid` | A `report_trace` snapshot too large to keep: over 4 MB as sent, a span over 128 KB once checked (not counting its content and error message), or a trace whose pipeline and attributes take over 192 KB once checked. The message says which. |
+
+Any other code, such as `handler_error`, means the plugin could not store the
+report. Try again later.
 
 ## Example
 
@@ -136,10 +153,13 @@ Output: one result per thread.
 | `ok` | Stored, or cleared. |
 | `conflict` | Another provider claimed the thread first. It stays theirs until they clear it; you cannot clear it either. |
 | `invalid` | The claim is larger than 64 KB once checked. Send fewer or shorter attributes. |
+| `limit` | You already claim 5,000 threads. Clear the claims of threads you are done with. Claiming a thread you already claim again is always taken. |
 
 A thread no provider claimed exports on its own. A claim is dropped when its
 thread is deleted, and after 90 days in which neither the claim nor the
-thread's export changed.
+thread's export changed. All of a provider's claims are dropped once it has
+not called either method for 30 days, so a provider that was removed does
+not hold threads from the others for good.
 
 ### Workflow workers
 
@@ -266,8 +286,15 @@ Output:
 - At most 2,000 spans, refused with `invalid_input` past that.
 - Times are milliseconds since the epoch, from 0 to 10,000,000,000,000; a
   time outside that range is refused with `invalid_input`.
-- At most 4 MB for the whole trace as sent, and 192 KB for one span once
-  checked; past either, the call is refused with `invalid`.
+- Keys are at most 200 characters; names, ops, the pipeline, `errorType`,
+  `workflowName` and `workflowRunId` at most 1,000. Past that, the call is
+  refused with `invalid_input`.
+- At most 4 MB for the whole trace as sent, 128 KB for one span once checked
+  (not counting its content and error message), and 192 KB for the trace's
+  pipeline and attributes once checked; past any of them, the call is refused
+  with `invalid`. The checks are the same whether content is captured or not.
+- The plugin keeps at most 200 of your snapshots that no exported turn is in
+  yet, and drops the oldest reported past that.
 - While export is off (`sending: false`), the plugin keeps no snapshot. Report
   again after it is turned on; a provider that reports on every change does.
   A `deleted` report is always kept.
@@ -326,7 +353,9 @@ names it. After that it hangs the workflow run where the thread that started
 it hangs.
 
 When Workflows is disabled or removed, workers export as threads of their
-own, and nothing waits for it.
+own, and nothing waits for it. When it fails for a moment, a worker's turns
+wait for it to answer again, for up to 30 minutes, and then go out on their
+own.
 
 ### Model calls
 
@@ -350,8 +379,13 @@ anything else, and:
 - drops a key that is not a plain name (letters, digits, `.`, `_`, `-`);
 - drops keys starting with `sentry.`, `bb.thread.`, `bb.turn.` or `bb.trace.`,
   and `gen_ai.conversation.id`, in any case (`SENTRY.op` too);
-- drops keys for user or model text, such as `gen_ai.input.messages`, outside
-  `content`;
+- drops keys for user or model text outside `content`, in any case:
+  `gen_ai.input.*`, `gen_ai.output.*`, `gen_ai.tool.call.*`, `gen_ai.prompt*`,
+  `gen_ai.completion*`, `gen_ai.system_instructions`,
+  `gen_ai.request.messages`, `gen_ai.request.available_tools`,
+  `gen_ai.response.text`, `gen_ai.response.tool_calls`, `gen_ai.tool.input`,
+  `gen_ai.tool.output`, `gen_ai.tool.description` and
+  `gen_ai.tool.definitions`;
 - drops keys for one model call's usage and cost from trace and thread
   attributes, which land on every span;
 - lets its own attributes win over a provider's with the same key.
@@ -368,9 +402,11 @@ told its value; send content anyway, and the plugin decides.
   or `attributes`.
 - While `captureContent` is off, those two fields are dropped as the snapshot
   comes in, and are never stored or sent.
-- While it is on, they are scrubbed for secrets and capped (8,000 characters
-  per content value) as they come in, and stored that way until sent. If
-  `captureContent` is turned off before then, they are dropped when sending.
+- While it is on, they are scrubbed for secrets and capped as they come in:
+  8,000 characters per content value, and 48 KB of content per span. Values
+  past the 48 KB are dropped; the span is kept. They are stored that way until
+  sent. If `captureContent` is turned off before then, they are dropped when
+  sending.
 - Send only content you are comfortable having stored on this machine until
   it is sent. Scrub the text yourself first if you have a scrubber.
 

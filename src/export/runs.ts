@@ -162,17 +162,18 @@ async function sweepTrace(
   const head = await ctx.providers.head(entry.provider, entry.traceKey);
   // Nothing new was reported since the last look: what was due then went out.
   if (head && head.version === entry.seenVersion && !expired) return "next";
-  const trace = head ? await ctx.providers.snapshot(entry.provider, entry.traceKey, head) : undefined;
-  if (trace === undefined) {
+  const read = head ? await ctx.providers.read(entry.provider, entry.traceKey, head) : undefined;
+  if (read === undefined) {
     // Nothing reported yet: wait, unless it has been open too long to wait for.
     if (expired) await dropTrace(ctx, key, entry);
     return "next";
   }
+  const { trace } = read;
   const sent = new Set(entry.sentKeys ?? []);
   const ended = trace === null || trace.ended || expired;
   const due = trace === null ? new Set<string>() : keysToSend(trace, sent, ended);
   const keys = ended ? due : fitting(sent, due);
-  const seenVersion = head?.version ?? null;
+  const seenVersion = read.head.version;
   // Nothing new is final yet: the rest waits for the end, or a newer report.
   if (!ended && keys.size === 0) {
     await kv(ctx).set(key, { ...entry, seenVersion } satisfies TraceEntry);

@@ -10,7 +10,8 @@
  *
  * Writes to one key run one at a time. A snapshot's parts are written before
  * the head that names them and dropped only after it moved on, so a reader
- * never puts together parts of two versions.
+ * never puts together parts of two versions; one that finds a part gone reads
+ * the newer version instead.
  */
 import { randomUUID } from "node:crypto";
 import { queue } from "../../core/queue.js";
@@ -33,10 +34,24 @@ const PROVIDER_PREFIX = "provider:";
 
 /** A stored value may be 256 KB; a part of a snapshot stays well under that. */
 const MAX_PART_BYTES = 192 * 1024;
+/**
+ * One span, without its content and error text, which are capped on their
+ * own: past this it is refused, the same whether content is captured or not,
+ * and with them it still fits in one part.
+ */
+const MAX_SPAN_BYTES = 128 * 1024;
+/** A snapshot's head: its pipeline and attributes, which every span carries. */
+const MAX_HEAD_BYTES = 192 * 1024;
 /** A claim lands on every span of its thread, so it is kept small. */
 const MAX_CLAIM_BYTES = 64 * 1024;
 /** A part no snapshot names, this old, is left from a write that stopped part way. */
 const STRAY_PART_MS = 60 * 60_000;
+/** How many times a read starts over when the version it was reading is replaced under it. */
+const READ_ATTEMPTS = 3;
+/** Threads one provider may claim. Past this a new claim gets `limit`. */
+const MAX_CLAIMS_PER_PROVIDER = 5_000;
+/** Snapshots a provider may have stored that no export needs; the oldest go first. */
+const MAX_UNTRACKED_SNAPSHOTS = 200;
 
 /** A stored snapshot without its spans. */
 export interface SnapshotHead {
@@ -66,8 +81,10 @@ function partsOf(spans: readonly ProviderSpan[]): ProviderSpan[][] {
   let current: ProviderSpan[] = [];
   let size = 2;
   for (const span of spans) {
+    if (bytes({ ...span, content: null, errorMessage: null }) > MAX_SPAN_BYTES) {
+      throw new SnapshotTooLarge(`span ${span.key} is larger than 128 KB without its content`);
+    }
     const one = bytes(span) + 1;
-    if (one > MAX_PART_BYTES) throw new SnapshotTooLarge(`span ${span.key} is larger than 192 KB`);
     if (size + one > MAX_PART_BYTES && current.length > 0) {
       parts.push(current);
       current = [];
@@ -85,9 +102,15 @@ function writtenAt(version: string): number {
   return parseInt(version.split("-")[0] ?? "", 36);
 }
 
+function count(counts: Map<string, number>, provider: string, by: number): void {
+  counts.set(provider, (counts.get(provider) ?? 0) + by);
+}
+
 export class ProviderStore {
   /** Writes of one key, one at a time. */
   private readonly locks = new Map<string, Promise<unknown>>();
+  /** How many threads each provider claims: counted from storage once, then kept up to date. */
+  private claimCounts: Promise<Map<string, number>> | undefined;
 
   constructor(
     private readonly kv: Kv,
@@ -103,28 +126,72 @@ export class ProviderStore {
 
   /**
    * Claims a thread for `provider`, or clears its claim with null. A thread
-   * another provider claimed stays theirs until they clear it.
+   * another provider claimed stays theirs until they clear it, and a provider
+   * past `MAX_CLAIMS_PER_PROVIDER` claims no new thread.
    */
-  setClaim(threadId: string, provider: string, context: TraceContext | null): Promise<"ok" | "conflict" | "invalid"> {
+  setClaim(
+    threadId: string,
+    provider: string,
+    context: TraceContext | null,
+  ): Promise<"ok" | "conflict" | "invalid" | "limit"> {
     const key = CLAIM_PREFIX + threadId;
     return queue(this.locks, key, async () => {
+      const counts = await this.counts();
       const held = await this.kv.get<StoredClaim>(key);
       if (held && held.context.provider !== provider) return "conflict";
       if (context === null) {
-        if (held) await this.kv.delete(key);
+        if (held) {
+          await this.kv.delete(key);
+          count(counts, provider, -1);
+        }
         return "ok";
       }
       const claim: StoredClaim = { context, reportedAt: this.now() };
       if (bytes(claim) > MAX_CLAIM_BYTES) return "invalid";
-      await this.kv.set(key, claim);
+      if (held) {
+        await this.kv.set(key, claim);
+        return "ok";
+      }
+      if ((counts.get(provider) ?? 0) >= MAX_CLAIMS_PER_PROVIDER) return "limit";
+      // Counted before the write, so claims of other threads made meanwhile cannot pass the cap together.
+      count(counts, provider, 1);
+      try {
+        await this.kv.set(key, claim);
+      } catch (cause) {
+        count(counts, provider, -1);
+        throw cause;
+      }
       return "ok";
     });
   }
 
-  /** Drops a thread's claim, whoever made it: the thread is gone. */
-  deleteClaim(threadId: string): Promise<void> {
+  /**
+   * Drops a thread's claim, whoever made it: the thread is gone. With
+   * `reportedAt`, only the claim made then, so a claim made again since stays.
+   */
+  deleteClaim(threadId: string, reportedAt?: number): Promise<void> {
     const key = CLAIM_PREFIX + threadId;
-    return queue(this.locks, key, () => this.kv.delete(key));
+    return queue(this.locks, key, async () => {
+      const counts = await this.counts();
+      const held = await this.kv.get<StoredClaim>(key);
+      if (!held || (reportedAt !== undefined && held.reportedAt !== reportedAt)) return;
+      await this.kv.delete(key);
+      count(counts, held.context.provider, -1);
+    });
+  }
+
+  private counts(): Promise<Map<string, number>> {
+    this.claimCounts ??= this.countClaims().catch((cause: unknown) => {
+      this.claimCounts = undefined;
+      throw cause;
+    });
+    return this.claimCounts;
+  }
+
+  private async countClaims(): Promise<Map<string, number>> {
+    const counts = new Map<string, number>();
+    for (const claim of (await this.claims()).values()) count(counts, claim.context.provider, 1);
+    return counts;
   }
 
   /** Every claim, by thread id. */
@@ -141,23 +208,26 @@ export class ProviderStore {
 
   /**
    * Stores a trace as reported, in place of the one before. Throws
-   * `SnapshotTooLarge` when a span does not fit in one stored value.
+   * `SnapshotTooLarge` when a span or the head does not fit in one stored
+   * value, before anything is written.
    */
-  saveSnapshot(provider: string, trace: ProviderTrace): Promise<void> {
+  async saveSnapshot(provider: string, trace: ProviderTrace): Promise<void> {
     const parts = partsOf(trace.spans);
-    return this.replace(provider, trace.key, async (version) => {
+    const fields = {
+      provider,
+      traceKey: trace.key,
+      deleted: false,
+      ended: trace.ended,
+      pipeline: trace.pipeline ?? null,
+      attributes: (trace.attributes ?? {}) as Record<string, AttributeValue>,
+    };
+    // With room for the fields added below, which are short.
+    if (bytes(fields) + 256 > MAX_HEAD_BYTES) {
+      throw new SnapshotTooLarge("the trace's pipeline and attributes are larger than 192 KB");
+    }
+    await this.replace(provider, trace.key, async (version) => {
       for (const [index, spans] of parts.entries()) await this.kv.set(partKey(version, index), spans);
-      return {
-        provider,
-        traceKey: trace.key,
-        reportedAt: this.now(),
-        version,
-        parts: parts.length,
-        deleted: false,
-        ended: trace.ended,
-        pipeline: trace.pipeline ?? null,
-        attributes: (trace.attributes ?? {}) as Record<string, AttributeValue>,
-      };
+      return { ...fields, reportedAt: this.now(), version, parts: parts.length };
     });
   }
 
@@ -192,15 +262,36 @@ export class ProviderStore {
     for (let index = 0; index < head.parts; index++) await this.kv.delete(partKey(head.version, index));
   }
 
-  /** Drops a stored snapshot and its parts. */
-  deleteSnapshot(provider: string, traceKey: string): Promise<void> {
+  /**
+   * Drops a stored snapshot and its parts. With `version`, only that version:
+   * a newer report, which came in after the caller decided, stays.
+   */
+  deleteSnapshot(provider: string, traceKey: string, version?: string): Promise<void> {
     const key = snapshotKey(provider, traceKey);
     return queue(this.locks, key, async () => {
       const head = await this.kv.get<SnapshotHead>(key);
-      if (!head) return;
+      if (!head || (version !== undefined && head.version !== version)) return;
       await this.kv.delete(key);
       await this.dropParts(head);
     });
+  }
+
+  /**
+   * Keeps at most `MAX_UNTRACKED_SNAPSHOTS` of a provider's snapshots that
+   * no export needs, as `tracked` tells, dropping the oldest reported.
+   */
+  async trimSnapshots(provider: string, tracked: (traceKey: string) => Promise<boolean>): Promise<void> {
+    const keys = await this.kv.list(`${SNAPSHOT_PREFIX}${provider}/`);
+    if (keys.length <= MAX_UNTRACKED_SNAPSHOTS) return;
+    const untracked: SnapshotHead[] = [];
+    for (const key of keys) {
+      const head = await this.kv.get<SnapshotHead>(key);
+      if (head && !(await tracked(head.traceKey))) untracked.push(head);
+    }
+    untracked.sort((a, b) => a.reportedAt - b.reportedAt);
+    for (const head of untracked.slice(0, Math.max(0, untracked.length - MAX_UNTRACKED_SNAPSHOTS))) {
+      await this.deleteSnapshot(provider, head.traceKey, head.version);
+    }
   }
 
   /** A snapshot's head, without reading its spans. */
@@ -210,24 +301,46 @@ export class ProviderStore {
 
   /**
    * The trace as last reported: `null` when its provider said it no longer
-   * exists, `undefined` when nothing was reported or a newer report is being
-   * written over it.
+   * exists, `undefined` when nothing was reported.
    */
-  async snapshot(
+  async snapshot(provider: string, traceKey: string): Promise<ProviderTrace | null | undefined> {
+    const read = await this.read(provider, traceKey);
+    return read === undefined ? undefined : read.trace;
+  }
+
+  /**
+   * The trace as last reported, from `known` when given, and the head it was
+   * read from. A version replaced while it is read has its parts dropped: the
+   * newer one is read instead, a few times at most, and only a snapshot that
+   * is gone, or keeps changing, reads as none.
+   */
+  async read(
     provider: string,
     traceKey: string,
     known?: SnapshotHead,
-  ): Promise<ProviderTrace | null | undefined> {
-    const head = known ?? (await this.head(provider, traceKey));
-    if (!head) return undefined;
-    if (head.deleted) return null;
+  ): Promise<{ head: SnapshotHead; trace: ProviderTrace | null } | undefined> {
+    let head = known ?? (await this.head(provider, traceKey));
+    for (let attempt = 1; head && attempt <= READ_ATTEMPTS; attempt++) {
+      if (head.deleted) return { head, trace: null };
+      const spans = await this.spansOf(head);
+      if (spans) {
+        const { ended, pipeline, attributes } = head;
+        return { head, trace: { key: head.traceKey, ended, pipeline, attributes, spans } };
+      }
+      head = await this.head(provider, traceKey);
+    }
+    return undefined;
+  }
+
+  /** A version's spans, or undefined when a part of it is gone. */
+  private async spansOf(head: SnapshotHead): Promise<ProviderSpan[] | undefined> {
     const spans: ProviderSpan[] = [];
     for (let index = 0; index < head.parts; index++) {
       const part = await this.kv.get<ProviderSpan[]>(partKey(head.version, index));
       if (!part) return undefined;
       spans.push(...part);
     }
-    return { key: head.traceKey, ended: head.ended, pipeline: head.pipeline, attributes: head.attributes, spans };
+    return spans;
   }
 
   /** Every stored snapshot's head. */

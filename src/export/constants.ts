@@ -48,6 +48,11 @@ export const REQUEST_WINDOW_MS = 24 * 60 * 60_000;
 export const SENT_RUN_KEEP_MS = 24 * 60 * 60_000;
 export const OPEN_RUN_KEEP_MS = 30 * 24 * 60 * 60_000;
 /**
+ * A provider that has not reported for this long is taken to be gone: its
+ * claims are let go, and `status` no longer lists it.
+ */
+export const PROVIDER_QUIET_MS = 30 * 24 * 60 * 60_000;
+/**
  * How long a finished workflow waits for a span of its provider's trace to
  * name it. A provider may only learn that when it handles the workflow's result.
  */

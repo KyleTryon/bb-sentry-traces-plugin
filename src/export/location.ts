@@ -4,6 +4,7 @@ import { type ExportContext, type WorkflowEntry } from "./types.js";
 import { workflowSpan } from "../integrations/providers/placement.js";
 import { providerSpanId, providerTraceId, traceAttributes } from "../integrations/providers/spans.js";
 import { type TraceContext } from "../integrations/providers/types.js";
+import { NOT_NOW } from "../integrations/workflows/client.js";
 import { type WorkflowContext, workflowTraceId } from "../integrations/workflows/ids.js";
 import { type WorkflowPlacement } from "../integrations/workflows/placement.js";
 import { type WorkflowRunView, allCalls } from "../integrations/workflows/schema.js";
@@ -25,10 +26,25 @@ async function claimedTrace(
   return origin ? { ...origin, agentId: null, agentName: null, model: null, attributes: {} } : null;
 }
 
-/** The workflow call and the provider trace a thread belongs to, if any. */
-export async function placeThread(ctx: ExportContext, thread: ThreadInfo) {
+interface ThreadPlacement {
+  workflow: WorkflowContext | null;
+  trace: TraceContext | null;
+}
+
+/**
+ * The workflow call and the provider trace a thread belongs to, if any, or
+ * `NOT_NOW` for a worker while Workflows fails for a moment.
+ */
+export async function placeThread(ctx: ExportContext, thread: ThreadInfo): Promise<ThreadPlacement | typeof NOT_NOW> {
   const workflow = await ctx.workflows.workerContext(thread);
+  if (workflow === NOT_NOW) return NOT_NOW;
   return { workflow, trace: await claimedTrace(ctx, thread.id, workflow) };
+}
+
+/** Where a thread is placed as things stand, for a preview: a worker Workflows cannot place now shows on its own. */
+export async function placeNow(ctx: ExportContext, thread: ThreadInfo): Promise<ThreadPlacement> {
+  const placed = await placeThread(ctx, thread);
+  return placed === NOT_NOW ? { workflow: null, trace: await claimedTrace(ctx, thread.id, null) } : placed;
 }
 
 /** The agent each worker of a run runs as, where the same provider claimed the worker. */

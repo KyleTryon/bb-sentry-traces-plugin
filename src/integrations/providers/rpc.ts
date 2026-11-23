@@ -32,12 +32,21 @@ const MAX_SNAPSHOT_BYTES = 4 * 1024 * 1024;
 
 const DOCS = "See docs/trace-provider-contract.md in the Sentry Traces plugin.";
 
+/** A call that names a contract version other than this plugin's, whatever else it holds. */
+function otherContract(value: unknown): boolean {
+  return typeof value === "object" && value !== null && "contract" in value && value.contract !== CONTRACT_VERSION;
+}
+
 /**
  * A zod schema as the SDK's Standard Schema, with the JSON Schema export
  * discovery needs. Written out rather than passed as is: zod's failure type
  * does not fit the SDK's under exactOptionalPropertyTypes.
+ *
+ * With `anyContract`, a call on another version passes whatever its shape,
+ * so the handler refuses it naming the version this plugin speaks, rather
+ * than as malformed. The handler checks the version before it reads the rest.
  */
-function standard<T>(schema: z.ZodType<T>): StandardSchemaV1<T, T> {
+function standard<T>(schema: z.ZodType<T>, options: { anyContract?: boolean } = {}): StandardSchemaV1<T, T> {
   const json = (io: "input" | "output") => () =>
     z.toJSONSchema(schema, { io, target: "draft-2020-12", unrepresentable: "any" }) as Record<string, unknown>;
   return {
@@ -45,6 +54,7 @@ function standard<T>(schema: z.ZodType<T>): StandardSchemaV1<T, T> {
       version: 1,
       vendor: "zod",
       validate: (value) => {
+        if (options.anyContract && otherContract(value)) return { value: value as T };
         const result = schema.safeParse(value);
         if (result.success) return { value: result.data };
         return { issues: result.error.issues.map((issue) => ({ message: issue.message, path: issue.path })) };
@@ -59,20 +69,22 @@ const traceProviderContract = defineRpcContract({
     experimental_description:
       "Claim threads for a trace of yours, or clear your claim with a null context. " +
       "Claim a thread before its first turn ends: a turn is placed when it is exported.",
-    input: standard(reportThreadsInput),
+    input: standard(reportThreadsInput, { anyContract: true }),
     output: standard(reportThreadsOutput),
   },
   report_trace: {
     experimental_description:
       "Report a trace's own spans as a whole snapshot, replacing the last one, or say it was deleted. " +
       "Report whenever it changes, and once after it ends.",
-    input: standard(reportTraceInput),
+    input: standard(reportTraceInput, { anyContract: true }),
     output: standard(reportTraceOutput),
   },
 });
 
 export interface ProviderRpcDeps {
   store: ProviderStore;
+  /** Whether the export still needs a trace's snapshot, so it is not trimmed. */
+  tracked: (provider: string, traceKey: string) => Promise<boolean>;
   /** Whether export is on with a usable DSN, and whether content is captured. */
   sending: () => Promise<{ sending: boolean; captureContent: boolean }>;
 }
@@ -83,21 +95,22 @@ function refuse(code: "forbidden" | "invalid", message: string): never {
 
 /**
  * The provider a call comes from: the plugin that made it. The app, the CLI
- * and agents are not providers, and this plugin cannot report to itself.
+ * and agents are not providers, and this plugin cannot report to itself. A
+ * call on another version is refused here, before anything else of it is read.
  */
-function providerOf(caller: ExperimentalPluginRpcCaller, self: string, contract: number): string {
+function providerOf(caller: ExperimentalPluginRpcCaller, self: string, contract: unknown): string {
   if (caller.kind !== "plugin") refuse("forbidden", `Only another bb plugin can report traces. ${DOCS}`);
   if (caller.pluginId === self) refuse("forbidden", "This plugin does not report to itself.");
   if (contract !== CONTRACT_VERSION) {
     refuse(
       "invalid",
-      `This plugin speaks trace provider contract ${CONTRACT_VERSION}, not ${contract}. ${DOCS}`,
+      `This plugin speaks trace provider contract ${CONTRACT_VERSION}, not ${JSON.stringify(contract)}. ${DOCS}`,
     );
   }
   return caller.pluginId;
 }
 
-/** Stores a snapshot, refusing one with a span too large to store. */
+/** Stores a snapshot, refusing one too large to store. */
 async function saveTrace(store: ProviderStore, provider: string, trace: ProviderTrace): Promise<void> {
   try {
     await store.saveSnapshot(provider, trace);
@@ -113,7 +126,7 @@ export function registerProviderRpc(bb: Pick<BbPluginApi, "rpc" | "pluginId">, d
     {
       async report_threads(input, { experimental_caller }) {
         const provider = providerOf(experimental_caller, bb.pluginId, input.contract);
-        const results: Record<string, "ok" | "conflict" | "invalid"> = {};
+        const results: Record<string, "ok" | "conflict" | "invalid" | "limit"> = {};
         for (const { threadId, context } of input.threads) {
           results[threadId] = await deps.store.setClaim(
             threadId,
@@ -129,9 +142,6 @@ export function registerProviderRpc(bb: Pick<BbPluginApi, "rpc" | "pluginId">, d
       async report_trace(input, { experimental_caller }) {
         const provider = providerOf(experimental_caller, bb.pluginId, input.contract);
         const { trace, deleted } = input;
-        if ((trace === undefined) === (deleted === undefined)) {
-          refuse("invalid", "Send either `trace` or `deleted`, not both or neither.");
-        }
         // Checked whether or not export is on, so a provider learns of it the same way.
         if (trace && Buffer.byteLength(JSON.stringify(trace), "utf8") > MAX_SNAPSHOT_BYTES) {
           refuse("invalid", `The trace is larger than ${MAX_SNAPSHOT_BYTES / 1024 / 1024} MB. ${DOCS}`);
@@ -141,6 +151,7 @@ export function registerProviderRpc(bb: Pick<BbPluginApi, "rpc" | "pluginId">, d
         // Nothing is sent from a trace while export is off, so nothing of it is kept.
         else if (trace && !sending) await deps.store.deleteSnapshot(provider, trace.key);
         else if (trace) await saveTrace(deps.store, provider, storedTrace(trace, captureContent));
+        await deps.store.trimSnapshots(provider, (traceKey) => deps.tracked(provider, traceKey));
         await deps.store.noteReport(provider);
         return { contract: CONTRACT_VERSION, sending };
       },

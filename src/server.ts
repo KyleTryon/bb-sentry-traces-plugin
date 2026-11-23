@@ -116,6 +116,7 @@ export function createPlugin(options: PluginOptions = {}) {
     // hold; the export reads what they stored.
     registerProviderRpc(bb, {
       store: exporter.providers,
+      tracked: (provider, traceKey) => exporter.tracksTrace(provider, traceKey),
       sending: async () => {
         const values = await readSettings();
         return { sending: sends(values), captureContent: values.captureContent };

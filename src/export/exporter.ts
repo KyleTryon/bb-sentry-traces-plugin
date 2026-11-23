@@ -18,6 +18,7 @@ import { WorkflowsClient } from "../integrations/workflows/client.js";
 import {
   DISPOSE_WAIT_MS,
   OPEN_RUN_KEEP_MS,
+  PROVIDER_QUIET_MS,
   PRUNE_EVERY_MS,
   PRUNED_AT_KEY,
   RETRY_PREFIX,
@@ -254,31 +255,47 @@ export class Exporter {
     }
   }
 
-  /** A claim made months ago, of a thread not exported since, is dropped with the thread's state. */
+  /**
+   * Drops the claims of a provider that has not reported for 30 days, such
+   * as one that was removed: they would hold its threads from every other
+   * provider for good. A claim made months ago, of a thread not exported
+   * since, is dropped with the thread's state.
+   */
   private async pruneClaims(now: number): Promise<void> {
+    const reporters = await this.providers.reporters();
     for (const [threadId, claim] of await this.providers.claims()) {
       if (this.ctx.disposed) return;
-      if (now - claim.reportedAt <= THREAD_KEEP_MS) continue;
-      const state = await kv(this.ctx).get<ThreadState>(THREAD_KEY + threadId);
-      if (state && now - state.updatedAt <= THREAD_KEEP_MS) continue;
-      await this.serialize(threadId, () => this.providers.deleteClaim(threadId));
+      const heardAt = reporters.get(claim.context.provider)?.lastReportAt ?? claim.reportedAt;
+      if (now - heardAt <= PROVIDER_QUIET_MS) {
+        if (now - claim.reportedAt <= THREAD_KEEP_MS) continue;
+        const state = await kv(this.ctx).get<ThreadState>(THREAD_KEY + threadId);
+        if (state && now - state.updatedAt <= THREAD_KEEP_MS) continue;
+      }
+      await this.serialize(threadId, () => this.providers.deleteClaim(threadId, claim.reportedAt));
     }
+  }
+
+  /** Whether the export still needs a provider trace's snapshot: a turn was sent into the trace. */
+  async tracksTrace(provider: string, traceKey: string): Promise<boolean> {
+    return (await kv(this.ctx).get(`${TRACE_PREFIX}${provider}/${traceKey}`)) !== undefined;
   }
 
   /**
    * A snapshot of a trace no turn was ever sent into is dropped after the
-   * time an open trace is kept; so is a provider not heard from in that time.
+   * time an open trace is kept, unless it was reported again meanwhile; so is
+   * a provider not heard from in that time.
    */
   private async pruneSnapshots(now: number): Promise<void> {
     for (const head of await this.providers.heads()) {
       if (this.ctx.disposed) return;
       if (now - head.reportedAt <= OPEN_RUN_KEEP_MS) continue;
-      const entry = await kv(this.ctx).get(`${TRACE_PREFIX}${head.provider}/${head.traceKey}`);
-      if (entry === undefined) await this.providers.deleteSnapshot(head.provider, head.traceKey);
+      if (!(await this.tracksTrace(head.provider, head.traceKey))) {
+        await this.providers.deleteSnapshot(head.provider, head.traceKey, head.version);
+      }
     }
     await this.providers.dropStrayParts();
     for (const [provider, record] of await this.providers.reporters()) {
-      if (now - record.lastReportAt > OPEN_RUN_KEEP_MS) await this.providers.forgetReporter(provider);
+      if (now - record.lastReportAt > PROVIDER_QUIET_MS) await this.providers.forgetReporter(provider);
     }
   }
 
@@ -317,7 +334,7 @@ export class Exporter {
     const claims = [...(await this.providers.claims()).values()];
     const heads = await this.providers.heads();
     return [...(await this.providers.reporters())]
-      .filter(([, record]) => now - record.lastReportAt <= OPEN_RUN_KEEP_MS)
+      .filter(([, record]) => now - record.lastReportAt <= PROVIDER_QUIET_MS)
       .map(([provider, record]) => ({
         provider,
         claimedThreads: claims.filter((claim) => claim.context.provider === provider).length,

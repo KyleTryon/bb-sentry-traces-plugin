@@ -74,9 +74,10 @@ Change settings with `bb plugin config sentry-traces set <key> <value>`.
    short code such as `overloaded_error`; other error text needs
    `captureContent`.
 8. A workflow run's workers share one trace, read from the Workflows plugin's
-   thread metadata and its `workflowRunView` RPC. If either is unreadable, each
-   worker exports on its own, including while Workflows is disabled. The
-   run's own spans are sent when the run ends.
+   thread metadata and its `workflowRunView` RPC. If Workflows is disabled or
+   removed, or its metadata is unreadable, each worker exports on its own at
+   once. If Workflows fails for a moment, a worker's turns wait for it, for up
+   to 30 minutes. The run's own spans are sent when the run ends.
 9. Threads join another plugin's trace only when that plugin claims them by
    calling this plugin's `report_threads` RPC, before the thread's turn ends.
    `status` lists each provider that reported in the last 30 days, with the

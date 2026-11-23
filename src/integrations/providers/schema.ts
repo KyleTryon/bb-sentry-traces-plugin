@@ -17,12 +17,23 @@ const MAX_THREADS_PER_CALL = 200;
 const MAX_ATTRIBUTES = 64;
 const MAX_ATTRIBUTE_CHARS = 2_000;
 const MAX_CONTENT_CHARS = 8_000;
+/**
+ * Bytes of content one span may carry, as stored; the values past it are
+ * dropped. With it, a span with content fits in one stored value whenever the
+ * same span without content does, so content capture never decides whether a
+ * report is refused.
+ */
+const MAX_SPAN_CONTENT_BYTES = 48 * 1024;
+/** A name, op, pipeline or other short text a provider may send. */
+const MAX_TEXT_CHARS = 1_000;
 /** Error text is sent cut to 300 characters; this much is kept until then. */
 const MAX_ERROR_CHARS = 2_000;
 const MAX_KEY_CHARS = 200;
 
 const key = z.string().min(1).max(MAX_KEY_CHARS);
-const optionalText = z.string().nullish();
+const optionalText = z.string().max(MAX_TEXT_CHARS).nullish();
+/** Free text about an error: cut to `MAX_ERROR_CHARS` as it is stored, so any length is taken. */
+const errorText = z.string().nullish();
 const attributeMap = z.record(z.string(), z.unknown()).nullish();
 /**
  * Milliseconds since the epoch. Anything past the year 2286 is not one, and
@@ -51,13 +62,13 @@ const spanSchema = z
   .object({
     key,
     parentKey: key.nullish(),
-    name: z.string().min(1),
+    name: z.string().min(1).max(MAX_TEXT_CHARS),
     op: optionalText,
     start: time,
     end: time,
     status: z.enum(["ok", "error"]).nullish(),
     errorType: optionalText,
-    errorMessage: optionalText,
+    errorMessage: errorText,
     kind: z.enum(["internal", "client"]).nullish(),
     attributes: attributeMap,
     content: attributeMap,
@@ -91,14 +102,18 @@ export const reportThreadsInput = z.object({
 export const reportThreadsOutput = z.object({
   contract: z.number(),
   sending: z.boolean(),
-  results: z.record(z.string(), z.enum(["ok", "conflict", "invalid"])),
+  results: z.record(z.string(), z.enum(["ok", "conflict", "invalid", "limit"])),
 });
 
-export const reportTraceInput = z.object({
-  contract: z.number(),
-  trace: traceSchema.optional(),
-  deleted: z.object({ key }).optional(),
-});
+export const reportTraceInput = z
+  .object({
+    contract: z.number(),
+    trace: traceSchema.optional(),
+    deleted: z.object({ key }).optional(),
+  })
+  .refine((input) => (input.trace === undefined) !== (input.deleted === undefined), {
+    message: "Send either `trace` or `deleted`, not both or neither.",
+  });
 
 export const reportTraceOutput = z.object({ contract: z.number(), sending: z.boolean() });
 
@@ -116,7 +131,7 @@ const RESERVED_KEY = /^(?:sentry\.|bb\.thread\.|bb\.turn\.|bb\.trace\.)|^gen_ai\
  * is sent only with content capture; in `attributes` they would go out always.
  */
 const CONTENT_KEY =
-  /^(?:gen_ai\.(?:input\.|output\.|tool\.call\.|prompt|completion|system_instructions$|request\.messages$)|bb\.environment\.branch$|bb\.span\.detail$)/i;
+  /^(?:gen_ai\.(?:input\.|output\.|tool\.call\.|prompt|completion|system_instructions$|request\.messages$|request\.available_tools$|response\.text$|response\.tool_calls$|tool\.(?:input|output|description|definitions)$)|bb\.environment\.branch$|bb\.span\.detail$)/i;
 /**
  * Keys that describe one model call: what it was, which model, what it used
  * and what it cost. A provider may set them on its own span for that call. On
@@ -168,19 +183,26 @@ export function sanitizeSharedAttributes(
   return keep(values, (name) => CONTENT_KEY.test(name) || CALL_KEY.test(name), MAX_ATTRIBUTE_CHARS);
 }
 
+const bytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value), "utf8");
+
 /**
  * A provider's content attributes: text only, scrubbed whole and only then
  * capped, so a cut cannot leave the head of a secret that no longer looks
- * like one.
+ * like one. Once the span carries `MAX_SPAN_CONTENT_BYTES`, the values after
+ * are dropped; the span itself is kept.
  */
 export function sanitizeContent(values: Record<string, unknown> | null | undefined) {
   const kept: Record<string, AttributeValue> = {};
+  let size = 2;
   for (const [name, value] of Object.entries(keep(values, () => false, Number.POSITIVE_INFINITY))) {
-    if (typeof value === "string") kept[name] = scrubText(value, MAX_CONTENT_CHARS);
+    if (typeof value !== "string") continue;
+    const text = scrubText(value, MAX_CONTENT_CHARS);
+    size += bytes(name) + bytes(text) + 2;
+    if (size > MAX_SPAN_CONTENT_BYTES) break;
+    kept[name] = text;
   }
   return kept;
 }
-
 
 /**
  * A reported trace as it is stored until sent: attributes checked, and its

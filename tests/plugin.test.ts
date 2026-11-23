@@ -1400,6 +1400,17 @@ describe("trace providers", () => {
       expect(await bb.storage.kv.list("claim:")).toEqual([]);
     });
 
+    it("refuses a call shaped for another version as that version, not as malformed", async () => {
+      const { bb, harness } = await setup();
+      const threads = harness.behavior.callRpc("report_threads", { contract: 1, threadIds: [THREAD] }, asPlugin(P));
+      await expect(threads).rejects.toMatchObject({ code: "invalid" });
+      await expect(threads).rejects.toThrow(/contract 2, not 1/);
+      const traces = harness.behavior.callRpc("report_trace", { contract: 1, runId: KEY }, asPlugin(P));
+      await expect(traces).rejects.toMatchObject({ code: "invalid" });
+      await expect(traces).rejects.toThrow(/contract 2, not 1/);
+      expect(await bb.storage.kv.list()).toEqual([]);
+    });
+
     it("refuses a malformed report", async () => {
       const { harness, history, emit, spans } = await setup();
       const bad = { contract: 2, threads: [{ threadId: THREAD, context: { trace: { key: "" } } }] };
@@ -1408,7 +1419,10 @@ describe("trace providers", () => {
       });
       await expect(
         harness.behavior.callRpc("report_trace", { contract: 2 }, asPlugin(P)),
-      ).rejects.toMatchObject({ code: "invalid" });
+      ).rejects.toMatchObject({ code: "invalid_input" });
+      await expect(
+        harness.behavior.callRpc("report_trace", { contract: 2, trace: trace(true), deleted: { key: KEY } }, asPlugin(P)),
+      ).rejects.toMatchObject({ code: "invalid_input" });
       history.turn();
       await emit("thread.idle");
       expect(must(spans()[0], "first span").parentSpanId).toBeUndefined();
@@ -1462,6 +1476,32 @@ describe("trace providers", () => {
         [THREAD]: context(),
       });
       expect(answer.results).toEqual({ thr_big: "invalid", [THREAD]: "ok" });
+    });
+
+    it("takes at most 5,000 claims from one provider", async () => {
+      const { bb, claim } = await setup();
+      for (let n = 0; n < 5_000; n++) {
+        await bb.storage.kv.set(`claim:thr_${n}`, { context: { provider: P, traceKey: KEY }, reportedAt: 1 });
+      }
+      expect((await claim({ thr_new: context(), thr_1: context() })).results).toEqual({ thr_new: "limit", thr_1: "ok" });
+      expect((await claim({ thr_new: { trace: { key: "theirs" } } }, "other-provider")).results).toEqual({ thr_new: "ok" });
+      expect((await claim({ thr_2: null })).results).toEqual({ thr_2: "ok" });
+      expect((await claim({ thr_other: context() })).results).toEqual({ thr_other: "ok" });
+      expect((await claim({ thr_more: context() })).results).toEqual({ thr_more: "limit" });
+    }, 30_000);
+
+    it("lets go of the claims of a provider that has not reported for 30 days", async () => {
+      const { bb, clock, tick, claim, report } = await setup();
+      await claim({ thr_quiet: context() });
+      await claim({ thr_busy: { trace: { key: "theirs" } } }, "other-provider");
+      clock.now += 20 * 24 * 60 * 60_000;
+      await report({ key: "theirs", ended: false, spans: [] }, "other-provider");
+      clock.now += 11 * 24 * 60 * 60_000;
+      await tick();
+      expect(await bb.storage.kv.list("claim:")).toEqual(["claim:thr_busy"]);
+      expect((await claim({ thr_quiet: { trace: { key: "theirs" } } }, "other-provider")).results).toEqual({
+        thr_quiet: "ok",
+      });
     });
 
     it("drops a deleted thread's claim", async () => {
@@ -1531,11 +1571,68 @@ describe("trace providers", () => {
       expect(await bb.storage.kv.list("snapshot")).not.toEqual([]);
     });
 
-    it("refuses a span larger than one stored value with content capture on", async () => {
-      const { report } = await setup({ settings: { captureContent: true } });
-      const wide = Object.fromEntries(Array.from({ length: 64 }, (_, n) => [`example.c${n}`, "w".repeat(8_000)]));
-      await expect(report(trace(true, [span("wide", { content: wide })]))).rejects.toThrow(/span wide is larger/);
+    it("refuses or takes a span the same way whether content capture is on or off", async () => {
+      const content = Object.fromEntries(Array.from({ length: 40 }, (_, n) => [`gen_ai.input.messages${n}`, "y".repeat(8_000)]));
+      // Escaped in storage, each of these takes six bytes.
+      const attributes = Object.fromEntries(Array.from({ length: 64 }, (_, n) => [`example.a${n}`, "\u0001".repeat(2_000)]));
+      for (const captureContent of [false, true]) {
+        const { report } = await setup({ settings: { captureContent } });
+        await expect(report(trace(true, [span("wide", { content })]))).resolves.toMatchObject({ sending: true });
+        await expect(report(trace(true, [span("heavy", { attributes })]))).rejects.toMatchObject({ code: "invalid" });
+      }
     });
+
+    it("keeps a span with more content than it may carry, without the content past the cap", async () => {
+      const { history, emit, tick, sent, claim, report } = await setup({ settings: { captureContent: true } });
+      await claim({ [THREAD]: context() });
+      const content = Object.fromEntries(Array.from({ length: 40 }, (_, n) => [`gen_ai.input.messages${n}`, "y".repeat(8_000)]));
+      await report(trace(true, [span("wide", { content })]));
+      history.turn();
+      await emit("thread.idle");
+      await tick();
+      const wide = must(sent.flatMap((request) => request.spans).find((one) => one.name === "wide"), "the wide span");
+      const kept = wide.attributes.filter((one) => one.key.startsWith("gen_ai.input.messages"));
+      expect(kept.length).toBeGreaterThan(0);
+      expect(kept.length).toBeLessThan(40);
+      expect(JSON.stringify(kept).length).toBeLessThanOrEqual(48 * 1024 + 1024);
+    });
+
+    it("refuses a trace whose text or shared attributes are too large to store, and keeps nothing of it", async () => {
+      const { bb, report } = await setup();
+      await expect(report({ ...trace(true), pipeline: "x".repeat(300 * 1024) })).rejects.toMatchObject({
+        code: "invalid_input",
+      });
+      for (const field of ["name", "op", "errorType", "workflowName", "workflowRunId"]) {
+        await expect(report(trace(true, [span("s", { [field]: "n".repeat(5_000) })]))).rejects.toMatchObject({
+          code: "invalid_input",
+        });
+      }
+      const attributes = Object.fromEntries(Array.from({ length: 64 }, (_, n) => [`example.a${n}`, "\u0001".repeat(2_000)]));
+      const refused = report({ ...trace(true), attributes });
+      await expect(refused).rejects.toMatchObject({ code: "invalid" });
+      await expect(refused).rejects.toThrow(/attributes/);
+      expect(await bb.storage.kv.list("snapshot")).toEqual([]);
+    });
+
+    it("keeps at most 200 snapshots of a provider that no exported turn is in, dropping the oldest", async () => {
+      const { bb, history, emit, clock, claim, report } = await setup();
+      await claim({ [THREAD]: context() });
+      await report(trace(false));
+      history.turn();
+      await emit("thread.idle");
+      for (let n = 0; n < 205; n++) {
+        clock.now += 1_000;
+        await report({ key: `other-${n}`, ended: false, spans: [] });
+      }
+      await report({ key: "elsewhere", ended: false, spans: [] }, "other-provider");
+      const keys = await bb.storage.kv.list("snapshot:");
+      expect(keys.filter((key) => key.startsWith(`snapshot:${P}/other-`))).toHaveLength(200);
+      expect(keys).not.toContain(`snapshot:${P}/other-4`);
+      expect(keys).toContain(`snapshot:${P}/other-5`);
+      // The trace a turn was sent into is kept, and so is another provider's.
+      expect(keys).toContain(`snapshot:${P}/${KEY}`);
+      expect(keys).toContain("snapshot:other-provider/elsewhere");
+    }, 30_000);
 
     it("refuses a trace with more spans than the limit", async () => {
       const { harness, history, emit, tick, sent, claim } = await setup();
@@ -2121,6 +2218,53 @@ describe("workflow runs", () => {
     });
   });
 
+  describe("when Workflows fails for a moment", () => {
+    const failure = Object.assign(new Error("HTTP 500: database is locked"), { status: 500, code: "handler_error" });
+
+    it("waits for Workflows to answer again, then places the worker in its run", async () => {
+      let failing = true;
+      const { bb, histories, emit, tick, spans, clock } = await setup({
+        threads,
+        workflows: {
+          metadata,
+          view: () => {
+            if (failing) throw failure;
+            return view("running");
+          },
+        },
+      });
+      histories['thr_w1'] = new History();
+      must(histories['thr_w1'], "thr_w1").turn();
+      await emit("thread.idle", "thr_w1");
+      expect(spans()).toEqual([]);
+      expect(await bb.storage.kv.list("retry:")).toEqual(["retry:thr_w1"]);
+      failing = false;
+      clock.now += 2 * 60_000;
+      await tick();
+      const agent = must(spans().find((span) => span.name.startsWith("invoke_agent")), "agent span");
+      expect(agent.traceId).toBe(workflowTraceId(WF));
+      expect(agent.parentSpanId).toBe(workflowCallSpanId(WF, "call_0"));
+    });
+
+    it("exports the worker on its own once Workflows has failed for 30 minutes", async () => {
+      const { histories, emit, tick, spans, clock } = await setup({
+        threads,
+        workflows: { metadata, view: () => { throw failure; } },
+      });
+      histories['thr_w1'] = new History();
+      must(histories['thr_w1'], "thr_w1").turn();
+      await emit("thread.idle", "thr_w1");
+      clock.now += 10 * 60_000;
+      await tick();
+      expect(spans()).toEqual([]);
+      clock.now += 21 * 60_000;
+      await tick();
+      const agent = must(spans().find((span) => span.name.startsWith("invoke_agent")), "agent span");
+      expect(agent.parentSpanId).toBeUndefined();
+      expect(attr(agent, "bb.workflow.run_id")).toBeUndefined();
+    });
+  });
+
   describe("with Workflows disabled or removed", () => {
     const quietly = async (options: Setup) => {
       const ctx = await setup(options);
@@ -2154,10 +2298,24 @@ describe("workflow runs", () => {
       expect(logs.filter((entry) => entry.message.includes("Workflows")).length).toBeLessThanOrEqual(1);
     };
 
-    it("exports workers as their own threads when Workflows does not answer", async () => {
-      // The metadata is still in bb's thread record; the plugin that answers for it is gone.
-      await expectOwnTraces(await quietly({ threads, workflows: { metadata, view: () => { throw new Error("no such plugin"); } } }));
-    });
+    // What bb's `callRpc` throws when the plugin is gone, disabled or lacks the method.
+    const absent = {
+      removed: Object.assign(new Error('HTTP 404: unknown plugin "workflows"'), { status: 404, code: null }),
+      disabled: Object.assign(new Error('HTTP 503: plugin "workflows" is not running (status: disabled)'), {
+        status: 503,
+        code: null,
+      }),
+      "without the method": Object.assign(new Error('HTTP 404: plugin "workflows" has no rpc method "workflowRunView"'), {
+        status: 404,
+        code: "unknown_method",
+      }),
+    };
+    for (const [why, error] of Object.entries(absent)) {
+      it(`exports workers as their own threads, at once, when Workflows is ${why}`, async () => {
+        // The metadata is still in bb's thread record; the plugin that answers for it is not.
+        await expectOwnTraces(await quietly({ threads, workflows: { metadata, view: () => { throw error; } } }));
+      });
+    }
 
     it("exports workers as their own threads when their Workflows metadata cannot be read", async () => {
       await expectOwnTraces(await quietly({ threads, metadataFails: true }));

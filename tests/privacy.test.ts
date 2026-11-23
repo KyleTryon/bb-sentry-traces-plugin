@@ -107,6 +107,25 @@ describe("provider attributes", () => {
     }
   });
 
+  it("keeps every Sentry key for user or model text out of attributes, in any case", () => {
+    const keys = [
+      "gen_ai.response.text",
+      "gen_ai.response.tool_calls",
+      "gen_ai.tool.input",
+      "gen_ai.tool.output",
+      "gen_ai.request.available_tools",
+      "gen_ai.tool.description",
+      "gen_ai.tool.definitions",
+      "gen_ai.system_instructions",
+      "GEN_AI.Response.Text",
+      "Gen_AI.Tool.Output",
+    ];
+    const values: Record<string, unknown> = { "gen_ai.tool.name": "Read" };
+    for (const key of keys) values[key] = "secret";
+    const kept = sanitizeAttributes(values);
+    expect(kept).toEqual({ "gen_ai.tool.name": "Read" });
+  });
+
   it("filters attributes that reached a context before this check", () => {
     // A context stored by an older version, or built some other way.
     const history = new History();
