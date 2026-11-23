@@ -5,6 +5,7 @@
 import { span as otlpSpan, spanIdFor, traceIdFor, type AttributeValue, type OtlpSpan } from "../../core/otlp.js";
 import { scrub } from "../../core/scrub/cut.js";
 import { errorCode } from "../../core/text.js";
+import { MAX_ERROR } from "../../core/trace/types.js";
 import {
   sanitizeAttributes,
   sanitizeContent,
@@ -155,7 +156,7 @@ export function providerSpans(
               // Free text from the provider is content.
               message:
                 captureContent && span.errorMessage
-                  ? scrub(span.errorMessage, 300)
+                  ? scrub(span.errorMessage, MAX_ERROR)
                   : errorType,
             }
           : null,

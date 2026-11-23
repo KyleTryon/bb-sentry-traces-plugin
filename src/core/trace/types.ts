@@ -175,3 +175,5 @@ export const MAX_INPUT = 16_000;
 export const MAX_REPLY = 16_000;
 export const MAX_ARGS = 4_000;
 export const MAX_RESULT = 4_000;
+/** Error text kept or sent with content capture: a provider's, bb's, a tool's or a workflow's. */
+export const MAX_ERROR = 300;

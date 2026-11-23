@@ -37,7 +37,8 @@ contract other plugins use to report traces to it.
 | `src/integrations/` | What other plugins report: trace providers (`providers/`, the RPC methods this plugin serves) and bb Workflows (`workflows/`). Never imports `export/`. |
 | `src/export/` | The export loop: what to send and when, storage, retries, sweeps. |
 | `src/server.ts`, `src/cli.ts` | Settings, event wiring, background service, the `bb sentry-traces` CLI. |
-| `tests/` | `plugin.test.ts` drives the whole plugin through a fake bb host; the other files cover one subject each. |
+| `src/core/trace/` | `builder.ts` folds events into turns; `describe.ts` decides what each row keeps, with and without content; `shell.ts` reads command lines. |
+| `tests/` | `plugin.test.ts`, `providers.test.ts` and `workflows.test.ts` drive the whole plugin through the fake bb host in `host.ts`; the other files cover one subject each. |
 
 ## Commands
 

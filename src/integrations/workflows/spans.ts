@@ -5,6 +5,7 @@
 import { span as otlpSpan, type AttributeValue, type OtlpSpan } from "../../core/otlp.js";
 import { scrub } from "../../core/scrub/cut.js";
 import { identifier } from "../../core/text.js";
+import { MAX_ERROR } from "../../core/trace/types.js";
 import {
   workflowAttributes,
   workflowCallSpanId,
@@ -90,7 +91,7 @@ export function workflowSpans(
         "error.type": failed ? "workflow_failed" : undefined,
       },
       error: failed
-        ? { message: captureContent && run.error ? scrub(run.error, 300) : "workflow failed" }
+        ? { message: captureContent && run.error ? scrub(run.error, MAX_ERROR) : "workflow failed" }
         : null,
     }),
   );
@@ -127,7 +128,7 @@ export function workflowSpans(
         "error.type": callFailed ? "workflow_call_failed" : undefined,
       },
       error: callFailed
-        ? { message: captureContent && call.error ? scrub(call.error, 300) : "workflow call failed" }
+        ? { message: captureContent && call.error ? scrub(call.error, MAX_ERROR) : "workflow call failed" }
         : null,
     });
   };

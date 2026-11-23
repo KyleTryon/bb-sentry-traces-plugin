@@ -22,8 +22,16 @@ import { sanitizeSharedAttributes } from "../integrations/providers/schema.js";
 import { type TraceContext } from "../integrations/providers/types.js";
 import { recap, rescrub, scrub, scrubLine } from "../core/scrub/cut.js";
 import { errorCode, oneLine } from "../core/text.js";
-import { SUBAGENT } from "../core/trace/builder.js";
-import { MAX_ARGS, MAX_INPUT, MAX_REPLY, MAX_RESULT, type Span, type Turn } from "../core/trace/types.js";
+import { SUBAGENT } from "../core/trace/describe.js";
+import {
+  MAX_ARGS,
+  MAX_ERROR,
+  MAX_INPUT,
+  MAX_REPLY,
+  MAX_RESULT,
+  type Span,
+  type Turn,
+} from "../core/trace/types.js";
 import { costAttributes, usageAttributes, type SentryUsage } from "../core/usage.js";
 import {
   workflowAttributes,
@@ -141,7 +149,7 @@ function agentNameFor(thread: ThreadInfo, trace: TraceContext | null): string {
  */
 function errorText(message: string | null, captureContent: boolean): string | null {
   if (!message) return null;
-  return captureContent ? scrub(message, 300) : errorCode(message);
+  return captureContent ? scrub(message, MAX_ERROR) : errorCode(message);
 }
 
 function messages(role: "user" | "assistant", texts: readonly string[]): string | undefined {

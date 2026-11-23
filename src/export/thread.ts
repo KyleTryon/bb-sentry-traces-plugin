@@ -5,7 +5,7 @@
 
 import type { OtlpSpan, ResourceInfo } from "../core/otlp.js";
 import type { Turn } from "../core/trace/types.js";
-import { costDelta, isEmptyUsage, toSentryUsage, usageDelta } from "../core/usage.js";
+import { costDelta, isEmptyUsage, type RawUsage, toSentryUsage, usageDelta } from "../core/usage.js";
 import {
   BACKGROUND_AGENT_WAIT_MS,
   MAX_CATCH_UP_READS,
@@ -343,6 +343,55 @@ async function sendTurns(ctx: ExportContext, plan: Plan): Promise<Sending> {
   return { done, lastDone, cut, failure, refused, stopped, usageSent, turnsSent, spansSent, traceIds };
 }
 
+/** The usage one export sends, and the thread's totals it was worked out from. */
+interface UsageToSend {
+  /** At most one entry: the newest turn sent carries the usage of every turn it covers. */
+  usage: Map<string, TurnUsage>;
+  current: RawUsage | null;
+  currentCost: number | null;
+  /**
+   * A due turn waits: its tokens so far are in the thread's total too, and the
+   * total cannot be split by turn, so the usage waits with it.
+   */
+  usageWaitsForTurn: boolean;
+}
+
+/**
+ * The tokens used since the last usage sent, put on the newest turn this
+ * export sends. Without tokens, an agent's own running cost stands in for
+ * them. Nothing goes while a turn waits or the starting total is unknown.
+ */
+async function usageToSend(
+  ctx: ExportContext,
+  turns: {
+    thread: ThreadInfo;
+    state: ThreadState | undefined;
+    due: readonly Turn[];
+    pending: readonly Turn[];
+    /** How many turns the usage covers: these, and earlier ones sent without theirs. */
+    covered: number;
+    knownTotal: boolean;
+  },
+): Promise<UsageToSend> {
+  const { thread, state, due, pending, covered, knownTotal } = turns;
+  const usageWaitsForTurn = pending.length < due.length;
+  const current = pending.length > 0 ? await readUsage(ctx, thread.id) : null;
+  const currentCost = pending.length > 0 && !current ? await readCostTotal(ctx, thread.id) : null;
+  const usage = new Map<string, TurnUsage>();
+  const newestPending = pending.at(-1);
+  if (newestPending && !usageWaitsForTurn && current && knownTotal) {
+    const delta = usageDelta(current, state?.usage ?? null);
+    if (delta && !isEmptyUsage(delta)) {
+      // One span of one turn carries it, so cost is never counted twice.
+      usage.set(newestPending.id, { usage: toSentryUsage(delta, thread.providerId), turns: covered });
+    }
+  } else if (newestPending && !usageWaitsForTurn && currentCost !== null && knownTotal) {
+    const delta = costDelta(currentCost, state?.cost ?? null);
+    if (delta) usage.set(newestPending.id, { usage: null, turns: covered, costUsd: delta });
+  }
+  return { usage, current, currentCost, usageWaitsForTurn };
+}
+
 export async function exportThread(ctx: ExportContext, thread: ThreadInfo): Promise<ExportOutcome> {
   const settings = await ctx.settings();
   if (!settings.enabled) return { kind: "disabled" };
@@ -392,26 +441,15 @@ export async function exportThread(ctx: ExportContext, thread: ThreadInfo): Prom
     ({ workflow, trace } = placed);
   }
 
-  // While a turn waits, its tokens so far are in the thread's total too, and
-  // the total cannot be split by turn: the usage waits with it.
-  const usageWaitsForTurn = pending.length < due.length;
   const usageTurns = state?.usageTurns ?? 0;
-  const current = pending.length > 0 ? await readUsage(ctx, thread.id) : null;
-  // Without tokens, an agent's own running cost stands in for them.
-  const currentCost = pending.length > 0 && !current ? await readCostTotal(ctx, thread.id) : null;
-  const usage = new Map<string, TurnUsage>();
-  const newestPending = pending.at(-1);
-  const covered = pending.length + usageTurns + skipped;
-  if (newestPending && !usageWaitsForTurn && current && knownTotal) {
-    const delta = usageDelta(current, state?.usage ?? null);
-    if (delta && !isEmptyUsage(delta)) {
-      // One span of one turn carries it, so cost is never counted twice.
-      usage.set(newestPending.id, { usage: toSentryUsage(delta, thread.providerId), turns: covered });
-    }
-  } else if (newestPending && !usageWaitsForTurn && currentCost !== null && knownTotal) {
-    const delta = costDelta(currentCost, state?.cost ?? null);
-    if (delta) usage.set(newestPending.id, { usage: null, turns: covered, costUsd: delta });
-  }
+  const { usage, current, currentCost, usageWaitsForTurn } = await usageToSend(ctx, {
+    thread,
+    state,
+    due,
+    pending,
+    covered: pending.length + usageTurns + skipped,
+    knownTotal,
+  });
 
   const sending = await sendTurns(ctx, {
     thread,

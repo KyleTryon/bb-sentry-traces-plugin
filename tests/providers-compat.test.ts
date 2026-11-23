@@ -5,7 +5,8 @@
  */
 import { describe, expect, it } from "vitest";
 import type { OtlpSpan } from "../src/core/otlp.js";
-import { TraceBuilder, unwrapCommand } from "../src/core/trace/builder.js";
+import { TraceBuilder } from "../src/core/trace/builder.js";
+import { unwrapCommand } from "../src/core/trace/shell.js";
 import { TRACE_EVENT_TYPES, type Span, type TraceEvent, type Turn } from "../src/core/trace/types.js";
 import { costDelta, parseRawUsage, readCost, toSentryUsage, type RawUsage } from "../src/core/usage.js";
 import { genAiProvider, modelName, turnSpans, type TurnUsage } from "../src/export/spans.js";

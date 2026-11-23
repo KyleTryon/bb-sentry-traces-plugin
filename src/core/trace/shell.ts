@@ -1,7 +1,9 @@
 /**
  * Reads a shell command line the way a shell would split it, so a command span
- * can be named after the program it runs. Pure: no bb, no I/O.
+ * can be named after the program it runs, and takes off the shell a provider
+ * wrapped a command in. Pure: no bb, no I/O.
  */
+import { text } from "../text.js";
 
 export function basename(path: string): string {
   return path.split(/[\\/]/).filter(Boolean).pop() ?? path;
@@ -135,4 +137,54 @@ function commandWords(command: string): string[] {
 export function programOf(command: string): string {
   const [program] = commandWords(command);
   return (program && basename(program)) || "shell";
+}
+
+/** A POSIX shell asked to run a script: `/bin/bash -lc`, `sh -c`, `zsh -c`. */
+const POSIX_SHELL = /^(?:\S*\/)?(?:ba|z|da|k)?sh(?:\.exe)?$/i;
+const POSIX_SCRIPT_FLAG = /^-l?c$/;
+/** PowerShell asked to run a script, with any options before `-Command`. */
+const POWERSHELL = /^(?:\S*[\\/])?(?:powershell|pwsh)(?:\.exe)?$/i;
+const POWERSHELL_SCRIPT_FLAG = /^-(?:command|c)$/i;
+const CMD = /^(?:\S*[\\/])?cmd(?:\.exe)?$/i;
+const CMD_SCRIPT_FLAG = /^\/c$/i;
+const WRAPPED_POSIX = /^(\S+)\s+(-l?c)\s+([\s\S]+)$/;
+const WRAPPED_POWERSHELL = /^(\S+)((?:\s+-\S+(?:\s+[^-\s"']\S*)?)*?)\s+(-(?:command|c))\s+([\s\S]+)$/i;
+const WRAPPED_CMD = /^(\S+)\s+(\/c)\s+([\s\S]+)$/i;
+
+/** Where the script starts in a command given as words, or -1 when no shell wraps it. */
+function scriptStart(words: readonly string[]): number {
+  const [shell = "", flag = ""] = words;
+  if (POSIX_SHELL.test(shell) && POSIX_SCRIPT_FLAG.test(flag)) return 2;
+  if (CMD.test(shell) && CMD_SCRIPT_FLAG.test(flag)) return 2;
+  if (!POWERSHELL.test(shell)) return -1;
+  const at = words.findIndex((word, index) => index > 0 && POWERSHELL_SCRIPT_FLAG.test(word));
+  return at === -1 ? -1 : at + 1;
+}
+
+function unquote(script: string): string {
+  const trimmed = script.trim();
+  const quoted = /^(["'])([\s\S]*)\1$/.exec(trimmed);
+  return quoted?.[2] ?? trimmed;
+}
+
+/**
+ * Providers often wrap a command in the shell that runs it (Codex's
+ * `/bin/bash -lc "…"`, `sh -c`, `pwsh -Command`, `cmd /c`); show what
+ * actually ran. Only the span's content changes, never its tool name.
+ */
+export function unwrapCommand(command: unknown): string {
+  if (Array.isArray(command)) {
+    const words = command.map(text);
+    const start = scriptStart(words);
+    return (start > 0 && start < words.length ? words.slice(start) : words).join(" ");
+  }
+  const raw = text(command);
+  const line = raw.trim();
+  const posix = WRAPPED_POSIX.exec(line);
+  if (posix && POSIX_SHELL.test(posix[1] ?? "")) return unquote(posix[3] ?? "");
+  const powershell = WRAPPED_POWERSHELL.exec(line);
+  if (powershell && POWERSHELL.test(powershell[1] ?? "")) return unquote(powershell[4] ?? "");
+  const cmd = WRAPPED_CMD.exec(line);
+  if (cmd && CMD.test(cmd[1] ?? "")) return unquote(cmd[3] ?? "");
+  return raw;
 }
