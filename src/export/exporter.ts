@@ -14,7 +14,16 @@
 import { errorMessage } from "../core/text.js";
 import { TraceProviders } from "../integrations/providers/client.js";
 import { WorkflowsClient } from "../integrations/workflows/client.js";
-import { STATS_KEY, THREAD_KEY, RETRY_PREFIX } from "./constants.js";
+import {
+  DISPOSE_WAIT_MS,
+  PRUNE_EVERY_MS,
+  PRUNED_AT_KEY,
+  RETRY_PREFIX,
+  SENDING_SINCE_KEY,
+  STATS_KEY,
+  THREAD_KEEP_MS,
+  THREAD_KEY,
+} from "./constants.js";
 import { readUsage } from "./read.js";
 import { clearRetry, retries, scheduleRetry } from "./retries.js";
 import { previewThread, exportThread } from "./thread.js";
@@ -22,14 +31,26 @@ import { sweepTraces, sweepWorkflows, traceEntries, workflowEntries } from "./ru
 import { targetOf } from "./settings.js";
 import {
   emptyStats,
+  fromBeforeGap,
   kv,
   migrate,
   queue,
   recordFailure,
   recordSuccess,
+  sendingSince,
 } from "./store.js";
 import type { ExportContext, ExportOutcome, ExporterDeps, Stats, ThreadState } from "./types.js";
 import { toThreadInfo, type ThreadInfo } from "../thread.js";
+
+/** Waits for `work`, but no longer than `ms`. */
+async function atMost(ms: number, work: Promise<unknown>): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, ms);
+  });
+  await Promise.race([work.then(() => undefined), timeout]);
+  clearTimeout(timer);
+}
 
 export class Exporter {
   readonly providers: TraceProviders;
@@ -37,7 +58,10 @@ export class Exporter {
   private readonly ctx: ExportContext;
   /** One export at a time per thread, so back-to-back events never send a turn twice. */
   private readonly chains = new Map<string, Promise<unknown>>();
-  private disposed = false;
+  /** The periodic work running now, which unloading waits for. */
+  private ticking: Promise<void> = Promise.resolve();
+  /** The noting of when sending was turned on, which an export waits for. */
+  private noting: Promise<void> = Promise.resolve();
 
   constructor(deps: ExporterDeps) {
     const now = deps.now ?? Date.now;
@@ -52,11 +76,34 @@ export class Exporter {
       workflows: this.workflows,
       locks: new Map(),
       migrated: false,
+      disposed: false,
     };
   }
 
-  dispose(): void {
-    this.disposed = true;
+  /**
+   * Stops all work at its next turn or entry, and waits a few seconds for what
+   * is running to save what it sent: the instance that loads next exports the
+   * same threads, and must not send those turns again.
+   */
+  async dispose(): Promise<void> {
+    this.ctx.disposed = true;
+    const running = [...this.chains.values(), this.ticking, this.noting];
+    await atMost(DISPOSE_WAIT_MS, Promise.allSettled(running));
+  }
+
+  /**
+   * Notes that sending just became possible after it was not: export turned
+   * on, or a DSN set. Turning the plugin on sends the turns that finish from
+   * then on, so what was remembered of a thread before is not built on.
+   */
+  noteSendingOn(): Promise<void> {
+    const at = this.ctx.now();
+    this.noting = this.noting
+      .then(() => kv(this.ctx).set(SENDING_SINCE_KEY, at))
+      .catch((cause: unknown) => {
+        this.ctx.bb.log.warn(`Could not note that sending was turned on: ${errorMessage(cause)}`);
+      });
+    return this.noting;
   }
 
   /** Runs `work` after everything already queued for the thread. Never rejects. */
@@ -67,7 +114,8 @@ export class Exporter {
   /** Queues an export of the thread. Safe to call from an event handler. */
   enqueue(thread: ThreadInfo): Promise<ExportOutcome> {
     return this.serialize(thread.id, async (): Promise<ExportOutcome> => {
-      if (this.disposed) return { kind: "nothing" };
+      await this.noting;
+      if (this.ctx.disposed) return { kind: "nothing" };
       try {
         return await exportThread(this.ctx, thread);
       } catch (cause) {
@@ -82,20 +130,23 @@ export class Exporter {
 
   /**
    * Remembers a thread's token total when a turn starts on a thread that has
-   * never been exported, so the first exported turn is not charged with the
-   * whole thread's history.
+   * never been exported, or not since sending was turned on, so the first
+   * exported turn is not charged with the thread's history or the gap's.
    */
   noteActive(threadId: string): Promise<void> {
     return this.serialize(threadId, async () => {
-      if (this.disposed) return;
+      await this.noting;
+      if (this.ctx.disposed) return;
       try {
         const settings = await this.ctx.settings();
         if (!settings.enabled || "reason" in targetOf(settings)) return;
-        if (await kv(this.ctx).get<ThreadState>(THREAD_KEY + threadId)) return;
+        const state = await kv(this.ctx).get<ThreadState>(THREAD_KEY + threadId);
+        if (state && !fromBeforeGap(state, await sendingSince(this.ctx))) return;
+        // Where the read got to still holds: only what was sent is from before.
         await kv(this.ctx).set(THREAD_KEY + threadId, {
           sentTurn: null,
-          resumeSeq: 0,
-          turnsBefore: 0,
+          resumeSeq: state?.resumeSeq ?? 0,
+          turnsBefore: state?.turnsBefore ?? 0,
           usage: await readUsage(this.ctx, threadId),
           usageKnown: true,
           updatedAt: this.ctx.now(),
@@ -126,9 +177,15 @@ export class Exporter {
     return previewThread(this.ctx, thread, options);
   }
 
-  /** Periodic work: retry failed exports that are due, and send runs that ended. */
-  async tick(): Promise<void> {
-    if (this.disposed) return;
+  /** Periodic work: retry failed exports that are due, send runs that ended, and prune. */
+  tick(): Promise<void> {
+    const run = this.ticking.then(() => this.periodic());
+    this.ticking = run;
+    return run;
+  }
+
+  private async periodic(): Promise<void> {
+    if (this.ctx.disposed) return;
     try {
       const settings = await this.ctx.settings();
       if (!settings.enabled) return;
@@ -139,7 +196,7 @@ export class Exporter {
       const queued = await retries(this.ctx);
       const now = this.ctx.now();
       for (const [threadId, entry] of Object.entries(queued)) {
-        if (entry.nextAt > now || this.disposed) continue;
+        if (entry.nextAt > now || this.ctx.disposed) continue;
         const thread = await this.threadInfo(threadId);
         if (!thread) {
           await clearRetry(this.ctx, threadId);
@@ -147,10 +204,37 @@ export class Exporter {
         }
         await this.enqueue(thread);
       }
-      await sweepTraces(this.ctx, settings, resolved.target);
-      await sweepWorkflows(this.ctx, settings, resolved.target);
+      await sweepTraces(this.ctx, resolved.target);
+      await sweepWorkflows(this.ctx, resolved.target);
+      await this.prune();
     } catch (cause) {
       this.ctx.bb.log.warn(`Periodic export work failed: ${errorMessage(cause)}`);
+    }
+  }
+
+  /**
+   * At most once a day, drops what is kept of threads untouched for months
+   * and not waiting on a retry: storage otherwise only grows, since only a
+   * deleted thread is forgotten. Such a thread used again starts afresh.
+   */
+  private async prune(): Promise<void> {
+    const now = this.ctx.now();
+    const last = await kv(this.ctx).get<number>(PRUNED_AT_KEY);
+    if (last !== undefined && now - last < PRUNE_EVERY_MS) return;
+    await kv(this.ctx).set(PRUNED_AT_KEY, now);
+    const retrying = new Set(await kv(this.ctx).list(RETRY_PREFIX));
+    for (const key of await kv(this.ctx).list(THREAD_KEY)) {
+      if (this.ctx.disposed) return;
+      const threadId = key.slice(THREAD_KEY.length);
+      if (retrying.has(RETRY_PREFIX + threadId)) continue;
+      const state = await kv(this.ctx).get<ThreadState>(key);
+      if (!state || now - state.updatedAt <= THREAD_KEEP_MS) continue;
+      // After any export of it still running, which may have just used it.
+      await this.serialize(threadId, async () => {
+        const latest = await kv(this.ctx).get<ThreadState>(key);
+        if (!latest || this.ctx.now() - latest.updatedAt <= THREAD_KEEP_MS) return;
+        if ((await kv(this.ctx).get(RETRY_PREFIX + threadId)) === undefined) await kv(this.ctx).delete(key);
+      });
     }
   }
 

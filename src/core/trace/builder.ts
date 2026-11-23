@@ -55,7 +55,8 @@ const MAX_ERROR = 300;
 
 // Shorter startups are just the provider's own latency.
 const MIN_STARTUP_MS = 300;
-// After this long without a single event, nothing in the thread is still running.
+// After this long without a single event, nothing in the thread is still
+// running; a turn without one of its own for this long is over too.
 const STALE_MS = 6 * 60 * 60 * 1_000;
 const SKIPPED_ITEMS = new Set(["userMessage", "plan", "planSteps"]);
 const ACTIVITY_ITEMS: Record<string, ActivityKind> = {
@@ -312,6 +313,11 @@ export class TraceBuilder {
    * that began before the fold is unknown here, but its end still counts.
    */
   private lastTurnEnd: number | null = null;
+  /**
+   * Subagent turns whose tool call this fold never saw, taken as top-level
+   * turns. One may run beside the real turns, so it is never closed by them.
+   */
+  private readonly detached = new Set<string>();
 
   constructor(options: TraceBuilderOptions) {
     this.content = options.content;
@@ -354,11 +360,14 @@ export class TraceBuilder {
   /**
    * Top-level turns, oldest first. A call cannot outlive its finished turn
    * without saying so, and after hours of silence nothing is still running:
-   * those close as interrupted instead of growing with the clock.
+   * those close as interrupted instead of growing with the clock. So does a
+   * turn with no event of its own for hours, though other events, such as a
+   * background agent of an earlier turn reporting, keep the thread busy.
    */
   snapshot(now?: number): Turn[] {
-    const stale = now !== undefined && now - this.lastEventAt > STALE_MS;
+    const quiet = now !== undefined && now - this.lastEventAt > STALE_MS;
     return [...this.turns.values()].map(({ spanIds, activityIds, lastAt, previousEnd: _previousEnd, ...turn }) => {
+      const stale = quiet || (now !== undefined && turn.end === null && now - lastAt > STALE_MS);
       const end = turn.end ?? (stale ? lastAt : null);
       const close = <T extends { start: number; end: number | null }>(
         item: T,
@@ -534,6 +543,8 @@ export class TraceBuilder {
       return;
     }
     if (this.turns.has(turnId)) return;
+    if (parentToolCallId) this.detached.add(turnId);
+    else this.interruptRunning();
     this.rootTurn.set(turnId, turnId);
     this.activeTurn = turnId;
     this.turns.set(turnId, {
@@ -563,6 +574,20 @@ export class TraceBuilder {
       lastAt: event.createdAt,
       previousEnd: this.lastTurnEnd,
     });
+  }
+
+  /**
+   * bb runs one top-level turn of a thread at a time, so a turn that starts
+   * ends the one before it. One still running then never said it ended (bb
+   * stopped, or its provider was killed): it ends as interrupted at its last
+   * event, instead of running forever and holding every later read back.
+   */
+  private interruptRunning(): void {
+    const running = this.activeTurn ? this.turns.get(this.activeTurn) : undefined;
+    if (!running || running.end !== null || this.detached.has(running.id)) return;
+    running.end = running.lastAt;
+    running.status = "interrupted";
+    this.lastTurnEnd = Math.max(this.lastTurnEnd ?? running.lastAt, running.lastAt);
   }
 
   /**

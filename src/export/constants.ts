@@ -9,6 +9,13 @@ export const RETRY_PREFIX = "retry:";
 export const TRACE_PREFIX = "trace:";
 export const WORKFLOW_PREFIX = "workflow:";
 export const STATS_KEY = "stats";
+/**
+ * When sending last became possible after it was not: export turned on, or a
+ * DSN set. What was remembered of a thread before then is from before the gap.
+ */
+export const SENDING_SINCE_KEY = "sendingSince";
+/** When storage was last pruned of threads long untouched. */
+export const PRUNED_AT_KEY = "prunedAt";
 /** Where 0.1.0 kept the same entries as one map per kind; moved over once. */
 export const LEGACY_KEYS = { retry: RETRY_PREFIX, traces: TRACE_PREFIX, workflows: WORKFLOW_PREFIX } as const;
 
@@ -55,3 +62,13 @@ export const WAIT_CHECK_MIN_MS = 60_000;
 export const WAIT_CHECK_MAX_MS = 15 * 60_000;
 /** At most this many waiting turns are remembered per thread. */
 export const MAX_WAITING_TURNS = 50;
+/**
+ * Bytes of span keys remembered as sent for a provider trace still open.
+ * Storage takes 256KB per value; past this, the rest waits for the trace's end.
+ */
+export const MAX_SENT_KEYS_BYTES = 96 * 1024;
+/** What is kept of a thread untouched for this long, and without a retry, is dropped. */
+export const THREAD_KEEP_MS = 90 * 24 * 60 * 60_000;
+export const PRUNE_EVERY_MS = 24 * 60 * 60_000;
+/** How long unloading waits for exports still running to save what they sent. */
+export const DISPOSE_WAIT_MS = 5_000;

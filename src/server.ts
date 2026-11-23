@@ -10,6 +10,7 @@
 import type { BbPluginApi, StandardSchemaV1 } from "@get-bb/plugin-sdk";
 import { CLI_NAME, registerCli } from "./cli.js";
 import { Exporter } from "./export/exporter.js";
+import { sends } from "./export/settings.js";
 import { type ExportSettings } from "./export/types.js";
 import { parseProviders } from "./integrations/providers/client.js";
 import { parseDsn, type Fetch } from "./sentry.js";
@@ -108,9 +109,6 @@ export function createPlugin(options: PluginOptions = {}) {
       );
     };
     checkDsn((await readSettings()).dsn);
-    settings.onChange((next, previous) => {
-      if (next['dsn'] !== previous['dsn']) checkDsn(typeof next['dsn'] === "string" ? next['dsn'] : undefined);
-    });
 
     const exporter = new Exporter({
       bb,
@@ -118,7 +116,16 @@ export function createPlugin(options: PluginOptions = {}) {
       ...(options.fetch ? { fetch: options.fetch } : {}),
       ...(options.now ? { now: options.now } : {}),
     });
+    // Waits a few seconds for an export still running to save what it sent.
     bb.onDispose(() => exporter.dispose());
+
+    settings.onChange((next, previous) => {
+      if (next['dsn'] !== previous['dsn']) checkDsn(typeof next['dsn'] === "string" ? next['dsn'] : undefined);
+      // Turned on, or given a DSN, after it could not send: what finishes
+      // from now on is sent, not what finished in between. Loading the
+      // plugin, as at a restart, is not turning it on.
+      if (sends(next) && !sends(previous)) void exporter.noteSendingOn();
+    });
 
     // A turn that just finished, or a thread that just failed: send what is new.
     // Handlers return at once and never throw; the export reports its own failures.

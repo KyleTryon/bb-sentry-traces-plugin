@@ -3,11 +3,25 @@
  * runs and stats. Shared records are changed one at a time under a lock, and
  * every other entry is stored under a key of its own.
  */
-import { LEGACY_KEYS, STATS_KEY } from "./constants.js";
-import { type ExportContext, type Stats } from "./types.js";
+import { LEGACY_KEYS, SENDING_SINCE_KEY, STATS_KEY } from "./constants.js";
+import { type ExportContext, type Stats, type ThreadState } from "./types.js";
 
 export function kv(ctx: ExportContext) {
   return ctx.bb.storage.kv;
+}
+
+/** When sending last became possible after it was not, or null if it never did while loaded. */
+export async function sendingSince(ctx: ExportContext): Promise<number | null> {
+  return (await kv(ctx).get<number>(SENDING_SINCE_KEY)) ?? null;
+}
+
+/**
+ * Whether a thread's state is from before sending was last turned on. It then
+ * says nothing about what Sentry has: the turns of the gap were never sent,
+ * and are not owed, and the token total it noted is from before the gap.
+ */
+export function fromBeforeGap(state: ThreadState, since: number | null): boolean {
+  return since !== null && state.updatedAt < since;
 }
 
 /** Changes a shared storage record in place; `change` returns false to leave it as it was. */
@@ -28,11 +42,16 @@ export async function entries<T>(ctx: ExportContext, prefix: string): Promise<Re
   return found;
 }
 
-/** Keeps at most `max` entries under `prefix`, dropping those that sort first by `age`. */
-export async function trim<T>(ctx: ExportContext, prefix: string, max: number, age: (entry: T) => number): Promise<void> {
+/** Keeps at most `max` entries under `prefix`, dropping those that sort first by `dropFirst`. */
+export async function trim<T>(
+  ctx: ExportContext,
+  prefix: string,
+  max: number,
+  dropFirst: (a: T, b: T) => number,
+): Promise<void> {
   const keys = await kv(ctx).list(prefix);
   if (keys.length <= max) return;
-  const all = Object.entries(await entries<T>(ctx, prefix)).sort(([, a], [, b]) => age(a) - age(b));
+  const all = Object.entries(await entries<T>(ctx, prefix)).sort(([, a], [, b]) => dropFirst(a, b));
   for (const [id] of all.slice(0, Math.max(0, all.length - max))) await kv(ctx).delete(prefix + id);
 }
 
